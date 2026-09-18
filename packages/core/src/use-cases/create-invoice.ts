@@ -49,7 +49,18 @@ export async function createInvoice(
   config: Config,
   input: CreateInvoiceInput,
 ): Promise<CreateInvoiceResult> {
-  const baseAmount = Money.toman(input.baseAmount);
+  // A malformed amount is a caller error (400), not an internal fault: Money
+  // throws its own low-level error type, so translate it at the boundary.
+  let baseAmount: Money;
+  try {
+    baseAmount = Money.toman(input.baseAmount);
+  } catch (e) {
+    throw new ValidationError(
+      'INVALID_AMOUNT',
+      'amount must be a whole number of Toman, given as an integer string',
+      { amount: String(input.baseAmount), reason: e instanceof Error ? e.message : undefined },
+    );
+  }
   if (!baseAmount.isPositive()) {
     throw new ValidationError('INVALID_AMOUNT', 'base amount must be greater than zero');
   }

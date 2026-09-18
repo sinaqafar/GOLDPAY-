@@ -26,6 +26,9 @@ export const TEST_ENV: Record<string, string> = {
   TON_SIGNER_REFERENCE: 'kms://test/key-1',
   MIN_PAYOUT_TOMAN: '1000',
   CUBEPAY_SANDBOX: 'true',
+  // Set so webhook signature verification is genuinely exercised in tests
+  // rather than short-circuiting on "no secret configured".
+  CUBEPAY_WEBHOOK_SECRET: 'test-cubepay-webhook-secret',
   TON_MOCK: 'true',
 };
 

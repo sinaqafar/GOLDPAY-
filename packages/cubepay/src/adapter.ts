@@ -117,9 +117,13 @@ export class CubePayAdapter implements PaymentProviderPort {
   parseWebhook(params: { rawBody: string; headers: Record<string, string | undefined> }): ParsedWebhook {
     const secret = this.#config.webhookSecret;
     if (!secret) {
-      throw new IntegrationError('CUBEPAY_NO_WEBHOOK_SECRET', 'webhook secret is not configured', {
-        retryable: false,
-      });
+      // Fail CLOSED. With no secret we cannot authenticate anything, so every
+      // callback must be rejected as unauthenticated rather than reported as a
+      // provider-side fault (which would invite retries of unverifiable data).
+      throw new SecurityError(
+        ErrorCodes.INVALID_SIGNATURE,
+        'webhook signature cannot be verified: no webhook secret is configured',
+      );
     }
 
     const signature = header(params.headers, 'x-cubepay-signature');

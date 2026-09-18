@@ -97,6 +97,11 @@ CREATE TABLE core.invoices (
     description            TEXT,
     customer_reference     TEXT,
 
+    -- Provider checkout, attached after the invoice row exists (no HTTP inside
+    -- the financial transaction).
+    provider_invoice_id    TEXT,
+    provider_payment_url   TEXT,
+
     status                 TEXT NOT NULL,
     expires_at             TIMESTAMPTZ,
     created_at             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
