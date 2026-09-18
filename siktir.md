@@ -1138,8 +1138,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۱ فایل / ۲۱۸ تست سبز**
-· ۶ مهاجرت اعمال‌شده
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۱ فایل / ۲۵۰ تست سبز**
+· ۷ مهاجرت اعمال‌شده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1170,6 +1170,7 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 005_payout_signed_state.sql     signed_at + signing_reference؛ حالت SIGNED
 006_provider_fee_reconciliation.sql  provider_fee_{expected,actual,
                                 diff,status,source}
+007_refunds.sql                 core.refunds + trigger سقف بازپرداخت
 ```
 
 ### اپ‌ها
@@ -1257,8 +1258,28 @@ docs/recovery/README.md
 | **RateAggregator** | `GRAM/USD × USD/TOMAN` با failover، freshness، sanity bounds و سقف انحراف. Production نرخ ثابت را رد می‌کند. |
 | **Provider fee** | expected از config + actual از provider + flag اختلاف (مهاجرت ۰۰۶). |
 
-### 🟢 ۸. باقی‌مانده‌های آگاهانه
-Risk Engine، Refund و Dispute پیاده نشده‌اند (PART 70 — نیاز به تصمیم کسب‌وکاری).
+### ✅ ۸. تکمیل درگاه — **انجام شد**
+
+| مورد | جزئیات |
+|---|---|
+| **صفحهٔ Checkout** | `/checkout/{id}` — برند فروشنده، مبلغ، کارمزد، جمع کل. بدون احراز هویت، بدون اسکریپت، `frame-ancestors 'none'`، escape کامل HTML. |
+| **پنل ادمین** | React 18 + esbuild، ۷ صفحه، `apps/admin/`. پورت ۳۰۰۳. اعتبارنامه در sessionStorage. |
+| **Refund** | مهاجرت ۰۰۷ + `use-cases/refund.ts`. مدل و ماشین حالت کامل؛ **اجرای مالی پشت `REFUND_POLICY_DEFINED` قفل است**. |
+| **Rate limiting** | Token bucket، کلید بر اساس credential نه IP. `packages/core/src/rate-limit.ts`. |
+| **اعلان تلگرام** | `notifications.ts` — شکست اعلان هرگز پول را برنمی‌گرداند (تست دارد). |
+| **API کامل** | `GET /v1/payments`، لغو فاکتور، مدیریت API key، `GET /v1/statements`. |
+| **Mini App** | تب «بیشتر»: پرداخت‌ها، صورت‌حساب، کلیدها، تنظیمات. |
+
+### 🔴 ۹. تنها موضوع باز: سیاست Refund
+
+مدل کامل است ولی **اجرا عمداً غیرفعال**. دلیل: نه مشخصات و نه مستندات CubePay
+نگفته‌اند کارمزد ۱۵٪ هنگام برگشت چه می‌شود. ستون‌های
+`platform_fee_reversal` و `provider_fee_reversal` آمادهٔ پر شدن‌اند.
+وقتی قرارداد CubePay مشخص شد، فقط همان سیاست نوشته می‌شود — دفتر کل و هستهٔ
+پرداخت تغییر نمی‌کنند.
+
+### 🟢 ۱۰. باقی‌مانده
+Risk Engine و Dispute (نیاز به تصمیم کسب‌وکاری: آستانهٔ امتیاز ریسک، مسئول هزینه).
 
 ---
 
