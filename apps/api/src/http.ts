@@ -16,6 +16,12 @@ import type { Logger } from '../../../packages/core/src/logger.ts';
 export interface RequestContext {
   method: string;
   path: string;
+  /**
+   * The full request target: pathname plus query string.
+   * This is what request signatures cover, so query parameters cannot be
+   * altered in flight while a signature still verifies.
+   */
+  target: string;
   query: URLSearchParams;
   params: Record<string, string>;
   headers: Record<string, string | undefined>;
@@ -90,6 +96,30 @@ export class Router {
     }
     return null;
   }
+
+  /**
+   * Which methods this path would accept.
+   * SPEC 97.30: an unknown method on a known path is 405, not 404 — the
+   * resource exists, the verb is wrong, and the caller deserves to know.
+   */
+  allowedMethods(path: string): string[] {
+    const parts = path.split('/').filter(Boolean);
+    const allowed = new Set<string>();
+    for (const route of this.#routes) {
+      if (route.segments.length !== parts.length) continue;
+      let matched = true;
+      for (let i = 0; i < route.segments.length; i++) {
+        const segment = route.segments[i] as string;
+        if (segment.startsWith(':')) continue;
+        if (segment !== parts[i]) {
+          matched = false;
+          break;
+        }
+      }
+      if (matched) allowed.add(route.method);
+    }
+    return [...allowed].sort();
+  }
 }
 
 function readBody(req: IncomingMessage): Promise<string> {
@@ -136,7 +166,10 @@ export function createHttpServer(options: ServerOptions): Server {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
 
     const send = (result: HttpResult) => {
-      const payload = result.body === undefined ? '' : JSON.stringify(result.body);
+      // SPEC 101329/101331 — every response carries its request_id, inside the
+      // envelope as well as in the header, so a caller can quote one id when
+      // reporting a problem.
+      const payload = result.body === undefined ? '' : JSON.stringify(withEnvelope(result.body, requestId));
       res.writeHead(result.status, {
         'content-type': 'application/json; charset=utf-8',
         'x-request-id': requestId,
@@ -159,26 +192,61 @@ export function createHttpServer(options: ServerOptions): Server {
     };
 
     try {
-      const match = router.match(req.method ?? 'GET', url.pathname);
+      const method = (req.method ?? 'GET').toUpperCase();
+      const match = router.match(method, url.pathname);
       if (!match) {
-        send({ status: 404, body: { error: { code: 'NOT_FOUND', message: 'route not found' } } });
+        // Distinguish "no such resource" from "wrong verb" (SPEC 97.30).
+        const allowed = router.allowedMethods(url.pathname);
+        if (allowed.length > 0) {
+          send({
+            status: 405,
+            headers: { allow: allowed.join(', ') },
+            body: {
+              error: {
+                code: 'METHOD_NOT_ALLOWED',
+                message: `${method} is not allowed on this path`,
+                retryable: false,
+              },
+            },
+          });
+          return;
+        }
+        send({
+          status: 404,
+          body: { error: { code: 'NOT_FOUND', message: 'route not found', retryable: false } },
+        });
         return;
       }
 
-      const rawBody = req.method === 'GET' || req.method === 'HEAD' ? '' : await readBody(req);
+      const rawBody = method === 'GET' || method === 'HEAD' ? '' : await readBody(req);
       let body: unknown = undefined;
       if (rawBody) {
         const contentType = headerValue(req, 'content-type') ?? '';
-        if (contentType.includes('application/json')) {
-          try {
-            body = JSON.parse(rawBody);
-          } catch {
-            send({
-              status: 400,
-              body: { error: { code: 'INVALID_JSON', message: 'request body is not valid JSON' } },
-            });
-            return;
-          }
+        // SPEC 97.31 — a JSON API must not silently accept a body it did not
+        // parse. Guessing the type of a financial payload is not acceptable.
+        if (!contentType.includes('application/json')) {
+          send({
+            status: 415,
+            body: {
+              error: {
+                code: 'UNSUPPORTED_MEDIA_TYPE',
+                message: 'content-type must be application/json',
+                retryable: false,
+              },
+            },
+          });
+          return;
+        }
+        try {
+          body = JSON.parse(rawBody);
+        } catch {
+          send({
+            status: 400,
+            body: {
+              error: { code: 'INVALID_JSON', message: 'request body is not valid JSON', retryable: false },
+            },
+          });
+          return;
         }
       }
 
@@ -187,8 +255,9 @@ export function createHttpServer(options: ServerOptions): Server {
         : (req.socket.remoteAddress ?? '');
 
       const ctx: RequestContext = {
-        method: (req.method ?? 'GET').toUpperCase(),
+        method,
         path: url.pathname,
+        target: url.pathname + (url.search || ''),
         query: url.searchParams,
         params: match.params,
         headers: req.headers as Record<string, string | undefined>,
@@ -203,6 +272,36 @@ export function createHttpServer(options: ServerOptions): Server {
       send(toErrorResponse(e, logger, requestId));
     }
   }
+}
+
+/**
+ * Wrap a handler's body in the standard envelope (SPEC 101329/101331).
+ *
+ *   success →  { "data": …, "meta": { "request_id": … } }
+ *   error   →  { "error": { code, message, request_id } }
+ *
+ * A body that already looks like an envelope is passed through with the id
+ * added, so handlers that return `{ data, pagination }` keep their shape.
+ */
+function withEnvelope(body: unknown, requestId: string): unknown {
+  if (body === null || typeof body !== 'object') {
+    return { data: body, meta: { request_id: requestId } };
+  }
+  const record = body as Record<string, unknown>;
+
+  if ('error' in record && typeof record['error'] === 'object' && record['error'] !== null) {
+    return {
+      ...record,
+      error: { ...(record['error'] as Record<string, unknown>), request_id: requestId },
+    };
+  }
+
+  if ('data' in record) {
+    const meta = (record['meta'] as Record<string, unknown> | undefined) ?? {};
+    return { ...record, meta: { ...meta, request_id: requestId } };
+  }
+
+  return { data: record, meta: { request_id: requestId } };
 }
 
 export function toErrorResponse(e: unknown, logger: Logger, requestId: string): HttpResult {

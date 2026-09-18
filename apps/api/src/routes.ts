@@ -14,6 +14,7 @@ import { randomUUID } from 'node:crypto';
 import { Router, type RequestContext, type HttpResult } from './http.ts';
 import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.ts';
 import { registerAdminRoutes } from './admin-routes.ts';
+import { readPageRequest, buildPage } from './pagination.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { createInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
@@ -176,18 +177,20 @@ export function buildRouter(container: Container): Router {
     const auth = await authenticateApiKey(db, config, ctx);
     ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
 
-    const limit = Math.min(Number.parseInt(ctx.query.get('limit') ?? '25', 10) || 25, 100);
+    // Keyset pagination: stable while rows are being inserted (SPEC 77).
+    const page = readPageRequest(ctx.query);
     const r = await db.query<Record<string, unknown>>(
       `SELECT id, merchant_id, invoice_number, base_amount::text, customer_total_amount::text,
               platform_fee_amount::text, merchant_net_amount::text, fee_mode, status,
               expires_at, created_at, provider_payment_url
          FROM core.invoices
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2`,
-      [auth.merchantId, limit],
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [auth.merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
     );
-    return { status: 200, body: { data: r.rows.map(serialiseInvoice) } };
+    return { status: 200, body: buildPage(r.rows, page.limit, serialiseInvoice) };
   });
 
   // --- payments -------------------------------------------------------------
@@ -263,17 +266,18 @@ export function buildRouter(container: Container): Router {
     const auth = await authenticateApiKey(db, config, ctx);
     ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
 
-    const limit = Math.min(Number.parseInt(ctx.query.get('limit') ?? '25', 10) || 25, 100);
+    const page = readPageRequest(ctx.query);
     const r = await db.query<Record<string, unknown>>(
       `SELECT id, status, amount_toman::text, gram_amount_atomic::text, rate::text,
               destination_address, transaction_hash, created_at, confirmed_at, failure_code
          FROM finance.payouts
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2`,
-      [auth.merchantId, limit],
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [auth.merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
     );
-    return { status: 200, body: { data: r.rows.map(serialisePayout) } };
+    return { status: 200, body: buildPage(r.rows, page.limit, serialisePayout) };
   });
 
   router.get('/v1/payouts/:id', async (ctx) => {
@@ -497,18 +501,19 @@ export function buildRouter(container: Container): Router {
 
   router.get('/v1/app/invoices', async (ctx) => {
     const merchantId = await miniAppMerchant(ctx);
-    const limit = Math.min(Number.parseInt(ctx.query.get('limit') ?? '20', 10) || 20, 100);
+    const page = readPageRequest(ctx.query);
     const r = await db.query<Record<string, unknown>>(
       `SELECT id, invoice_number, base_amount::text, customer_total_amount::text,
               platform_fee_amount::text, merchant_net_amount::text, fee_mode, status,
               expires_at, created_at, provider_payment_url
          FROM core.invoices
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2`,
-      [merchantId, limit],
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
     );
-    return { status: 200, body: { data: r.rows.map(serialiseInvoice) } };
+    return { status: 200, body: buildPage(r.rows, page.limit, serialiseInvoice) };
   });
 
   router.post('/v1/app/invoices', async (ctx) => {
@@ -568,16 +573,18 @@ export function buildRouter(container: Container): Router {
 
   router.get('/v1/app/payouts', async (ctx) => {
     const merchantId = await miniAppMerchant(ctx);
+    const page = readPageRequest(ctx.query);
     const r = await db.query<Record<string, unknown>>(
       `SELECT id, status, amount_toman::text, gram_amount_atomic::text, rate::text,
               destination_address, transaction_hash, created_at, confirmed_at, failure_code
          FROM finance.payouts
         WHERE merchant_id = $1
-        ORDER BY created_at DESC
-        LIMIT 25`,
-      [merchantId],
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
     );
-    return { status: 200, body: { data: r.rows.map(serialisePayout) } };
+    return { status: 200, body: buildPage(r.rows, page.limit, serialisePayout) };
   });
 
   router.get('/v1/app/wallets', async (ctx) => {

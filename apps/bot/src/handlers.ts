@@ -84,6 +84,8 @@ async function handleMessage(
       break;
     case '/menu':
     case '/dashboard':
+    // SPEC 1464 lists /panel alongside /dashboard as an entry to the same view.
+    case '/panel':
       await onMenu(deps, chatId, user.id);
       break;
     case '/invoice':
@@ -104,6 +106,9 @@ async function handleMessage(
       break;
     case '/api':
     case '/integrations':
+    // SPEC 1464 / 117.17 — connecting external bots is done with the same
+    // API credentials, so /bots lands on the same handler.
+    case '/bots':
       await onApiKey(deps, chatId, user.id);
       break;
     case '/docs':
@@ -375,14 +380,19 @@ async function onHelp(deps: BotDeps, chatId: number): Promise<void> {
     text:
       `<b>راهنما</b>\n\n` +
       `/menu — منوی اصلی\n` +
+      `/dashboard — داشبورد\n` +
       `/invoice — ساخت فاکتور\n` +
       `/balance — موجودی\n` +
       `/payments — پرداخت‌ها\n` +
       `/payouts — تسویه‌ها\n` +
+      `/settlement — وضعیت تسویه\n` +
       `/wallet — کیف پول TON\n` +
       `/api — کلید API\n` +
+      `/integrations — اتصال‌ها\n` +
+      `/bots — اتصال ربات‌های دیگر\n` +
       `/docs — مستندات\n` +
-      `/settings — تنظیمات`,
+      `/settings — تنظیمات\n` +
+      `/help — همین راهنما`,
   });
 }
 

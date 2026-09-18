@@ -88,10 +88,23 @@ async function call(
     },
     body: rawBody === '' ? undefined : rawBody,
   });
+  const envelope = (await res.json().catch(() => null)) as Record<string, any>;
   return {
     status: res.status,
-    body: (await res.json().catch(() => null)) as Record<string, any>,
+    // Unwrap the standard envelope so assertions read the payload directly.
+    // The envelope's own shape is asserted separately.
+    body: unwrap(envelope),
+    envelope,
   };
+}
+
+/** `{ data, meta }` -> data; an error envelope is returned as-is. */
+function unwrap(envelope: Record<string, any> | null): Record<string, any> {
+  if (envelope && typeof envelope === 'object' && 'data' in envelope && !('error' in envelope)) {
+    const data = envelope['data'];
+    return (data && typeof data === 'object' ? data : envelope) as Record<string, any>;
+  }
+  return (envelope ?? {}) as Record<string, any>;
 }
 
 describe('health', () => {
@@ -102,9 +115,148 @@ describe('health', () => {
 
   it('reports the treasury as manual-only', async () => {
     const res = await fetch(`${baseUrl}/health/dependencies`);
-    const body = (await res.json()) as { checks: Record<string, string> };
+    const envelope = (await res.json()) as { data: { checks: Record<string, string> } };
     expect(res.status).toBe(200);
-    expect(body.checks['treasury_policy']).toBe('MANUAL_ONLY');
+    expect(envelope.data.checks['treasury_policy']).toBe('MANUAL_ONLY');
+  });
+});
+
+describe('response envelope (SPEC 101329/101331)', () => {
+  it('wraps a success in data + meta.request_id', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/balances');
+    expect(res.status).toBe(200);
+    expect(res.envelope['data']).toBeTypeOf('object');
+    expect(res.envelope['meta']['request_id']).toBeTruthy();
+  });
+
+  it('echoes a caller-supplied request id so one id spans both sides', async () => {
+    const requestId = randomUUID();
+    const res = await fetch(`${baseUrl}/health/live`, { headers: { 'x-request-id': requestId } });
+    const envelope = (await res.json()) as { meta: { request_id: string } };
+    expect(res.headers.get('x-request-id')).toBe(requestId);
+    expect(envelope.meta.request_id).toBe(requestId);
+  });
+
+  it('puts request_id inside the error object too', async () => {
+    const res = await fetch(`${baseUrl}/v1/balances`);
+    const envelope = (await res.json()) as { error: { code: string; request_id: string } };
+    expect(res.status).toBe(401);
+    expect(envelope.error.code).toBeTruthy();
+    expect(envelope.error.request_id).toBeTruthy();
+  });
+});
+
+describe('signature covers the query string', () => {
+  it('rejects a request whose query was altered after signing', async () => {
+    // Sign for limit=1, then send limit=100. If the signature only covered the
+    // pathname this would succeed and return records the caller never signed for.
+    const timestamp = String(Math.floor(Date.now() / 1000));
+    const nonce = randomUUID();
+    const secret = keyA.token.slice(keyA.token.indexOf('.') + 1);
+    const signature = signRequest(secret, {
+      method: 'GET',
+      path: '/v1/invoices?limit=1',
+      timestamp,
+      nonce,
+      bodySha256: sha256Hex(''),
+    });
+
+    const res = await fetch(`${baseUrl}/v1/invoices?limit=100`, {
+      headers: {
+        authorization: `Bearer ${keyA.token}`,
+        'x-gateway-timestamp': timestamp,
+        'x-gateway-nonce': nonce,
+        'x-gateway-signature': signature,
+      },
+    });
+    // A bad signature is a security failure (403), not merely unauthenticated.
+    expect(res.status).toBe(403);
+  });
+});
+
+describe('cursor pagination (SPEC 77)', () => {
+  it('walks a list without repeating or skipping a record', async () => {
+    // Five invoices, fetched two at a time.
+    const created: string[] = [];
+    for (let i = 0; i < 5; i++) {
+      const res = await call(keyA.token, 'POST', '/v1/invoices', {
+        amount: String(10_000 + i),
+        invoice_number: `PAGE-${i}`,
+      });
+      expect(res.status).toBe(201);
+      created.push(res.body.invoice_number as string);
+    }
+
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    for (let guard = 0; guard < 10; guard++) {
+      const path: string = cursor
+        ? `/v1/invoices?limit=2&cursor=${encodeURIComponent(cursor)}`
+        : '/v1/invoices?limit=2';
+      const res = await call(keyA.token, 'GET', path);
+      expect(res.status).toBe(200);
+
+      const rows = res.envelope['data'] as { invoice_number: string }[];
+      const pagination = res.envelope['pagination'] as {
+        next_cursor: string | null;
+        has_more: boolean;
+      };
+      expect(rows.length).toBeLessThanOrEqual(2);
+      for (const row of rows) seen.push(row.invoice_number);
+
+      if (!pagination.has_more) {
+        expect(pagination.next_cursor).toBeNull();
+        break;
+      }
+      expect(pagination.next_cursor).toBeTruthy();
+      cursor = pagination.next_cursor;
+    }
+
+    // Every created invoice appears exactly once across the pages.
+    for (const number of created) {
+      expect(seen.filter((n) => n === number)).toHaveLength(1);
+    }
+  });
+
+  it('caps the page size so a caller cannot ask for everything', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/invoices?limit=100000');
+    expect(res.status).toBe(200);
+    expect((res.envelope['data'] as unknown[]).length).toBeLessThanOrEqual(100);
+  });
+
+  it('rejects a malformed cursor instead of ignoring it', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/invoices?cursor=not-a-real-cursor');
+    expect(res.status).toBe(400);
+    expect(res.body['error'].code).toBe('INVALID_CURSOR');
+  });
+});
+
+describe('method and content-type validation (SPEC 97.30/97.31)', () => {
+  it('answers 405 with an Allow header when the verb is wrong', async () => {
+    // /v1/invoices exists for GET and POST, but not DELETE.
+    const res = await fetch(`${baseUrl}/v1/invoices`, { method: 'DELETE' });
+    expect(res.status).toBe(405);
+    expect(res.headers.get('allow')).toContain('POST');
+
+    const envelope = (await res.json()) as { error: { code: string } };
+    expect(envelope.error.code).toBe('METHOD_NOT_ALLOWED');
+  });
+
+  it('still answers 404 when the path itself is unknown', async () => {
+    const res = await fetch(`${baseUrl}/v1/nope`, { method: 'DELETE' });
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses a body that is not application/json', async () => {
+    const res = await fetch(`${baseUrl}/v1/invoices`, {
+      method: 'POST',
+      headers: { 'content-type': 'text/plain' },
+      body: 'amount=1000',
+    });
+    expect(res.status).toBe(415);
+
+    const envelope = (await res.json()) as { error: { code: string } };
+    expect(envelope.error.code).toBe('UNSUPPORTED_MEDIA_TYPE');
   });
 });
 
@@ -207,7 +359,7 @@ describe('tenant isolation over HTTP (SPEC 117.89)', () => {
     const listB = await call(keyB.token, 'GET', '/v1/invoices');
     expect(listB.status).toBe(200);
 
-    const amounts = (listB.body.data as { amount: string }[]).map((i) => i.amount);
+    const amounts = (listB.envelope['data'] as { amount: string }[]).map((i) => i.amount);
     expect(amounts).toContain('123456');
     // None of merchant A's invoices leak in.
     expect(amounts).not.toContain('750000');

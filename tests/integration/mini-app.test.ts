@@ -95,7 +95,15 @@ async function call(method: string, path: string, initData: string | null, body?
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  return { status: res.status, body: (await res.json().catch(() => null)) as Record<string, any> };
+  const envelope = (await res.json().catch(() => null)) as Record<string, any> | null;
+  // Unwrap the standard `{ data, meta }` envelope.
+  const payload =
+    envelope && typeof envelope === 'object' && 'data' in envelope && !('error' in envelope)
+      ? ((envelope['data'] && typeof envelope['data'] === 'object'
+          ? envelope['data']
+          : envelope) as Record<string, any>)
+      : ((envelope ?? {}) as Record<string, any>);
+  return { status: res.status, body: payload, envelope: (envelope ?? {}) as Record<string, any> };
 }
 
 describe('initData authentication', () => {
@@ -177,7 +185,7 @@ describe('mini app resources', () => {
 
     const res = await call('GET', '/v1/app/invoices', buildInitData(ownerTelegramId));
     expect(res.status).toBe(200);
-    const numbers = (res.body['data'] as { invoice_number: string }[]).map((i) => i.invoice_number);
+    const numbers = (res.envelope['data'] as { invoice_number: string }[]).map((i) => i.invoice_number);
     expect(numbers).not.toContain('INV-OTHER');
   });
 
@@ -199,7 +207,7 @@ describe('mini app resources', () => {
   it('returns balances and payouts scoped to the merchant', async () => {
     const payouts = await call('GET', '/v1/app/payouts', buildInitData(ownerTelegramId));
     expect(payouts.status).toBe(200);
-    expect(Array.isArray(payouts.body['data'])).toBe(true);
+    expect(Array.isArray(payouts.envelope['data'])).toBe(true);
   });
 });
 

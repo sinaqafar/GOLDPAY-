@@ -32,6 +32,11 @@ export function hmacSha256Hex(secret: string, data: string): string {
  * SPEC 7321-7323 — the canonical request string.
  * Fields are joined with '\n' in a fixed order so whitespace can never create
  * signature ambiguity.
+ *
+ * `path` is the full request target INCLUDING the query string. Signing only
+ * the pathname would leave filters, limits and cursors unauthenticated, so an
+ * attacker able to modify a request in flight could change which records a
+ * signed GET returns while the signature still verified.
  */
 export function canonicalRequest(parts: {
   method: string;

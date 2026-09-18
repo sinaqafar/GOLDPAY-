@@ -82,7 +82,7 @@ async function call(
   path: string,
   credential: string | null,
   body?: unknown,
-): Promise<{ status: number; body: Record<string, any> }> {
+): Promise<{ status: number; body: Record<string, any>; envelope: Record<string, any> }> {
   const res = await fetch(baseUrl + path, {
     method,
     headers: {
@@ -91,7 +91,15 @@ async function call(
     },
     ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
-  return { status: res.status, body: (await res.json().catch(() => ({}))) as Record<string, any> };
+  const envelope = (await res.json().catch(() => ({}))) as Record<string, any>;
+  // Unwrap the standard `{ data, meta }` envelope so assertions read the payload.
+  const payload =
+    envelope && typeof envelope === 'object' && 'data' in envelope && !('error' in envelope)
+      ? ((envelope['data'] && typeof envelope['data'] === 'object'
+          ? envelope['data']
+          : envelope) as Record<string, any>)
+      : envelope;
+  return { status: res.status, body: payload, envelope };
 }
 
 const as = (role: AdminRole) => creds.get(role) as string;

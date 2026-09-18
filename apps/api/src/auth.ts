@@ -100,7 +100,7 @@ export async function authenticateApiKey(
     verifySignedRequest({
       secret,
       method: ctx.method,
-      path: ctx.path,
+      path: ctx.target,
       timestamp,
       nonce,
       rawBody: ctx.rawBody,
