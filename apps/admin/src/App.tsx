@@ -16,6 +16,9 @@ type Tab =
   | 'payouts'
   | 'treasury'
   | 'approvals'
+  | 'holds'
+  | 'disputes'
+  | 'support'
   | 'exceptions'
   | 'audit';
 
@@ -25,6 +28,9 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'payouts', label: 'تسویه‌ها' },
   { id: 'treasury', label: 'خزانه' },
   { id: 'approvals', label: 'تأییدها' },
+  { id: 'holds', label: 'قفل‌ها' },
+  { id: 'disputes', label: 'اختلافات' },
+  { id: 'support', label: 'پشتیبانی' },
   { id: 'exceptions', label: 'مغایرت‌ها' },
   { id: 'audit', label: 'گزارش ممیزی' },
 ];
@@ -166,6 +172,12 @@ function Panel({ tab }: { tab: Tab }) {
       return <Treasury />;
     case 'approvals':
       return <Approvals />;
+    case 'holds':
+      return <Holds />;
+    case 'disputes':
+      return <Listing path="/internal/admin/disputes" title="اختلافات" columns={DISPUTE_COLS} />;
+    case 'support':
+      return <Listing path="/internal/admin/support/tickets" title="تیکت‌های پشتیبانی" columns={TICKET_COLS} />;
     case 'exceptions':
       return <Listing path="/internal/admin/exceptions" title="مغایرت‌ها" columns={EXCEPTION_COLS} />;
     case 'audit':
@@ -352,6 +364,76 @@ function Approvals() {
   );
 }
 
+/**
+ * Active holds, with the one action that matters: lifting them.
+ *
+ * A hold is money a merchant cannot access, so this screen is the answer to
+ * "why has my settlement not arrived" and must be easy to work through.
+ */
+function Holds() {
+  const [refreshKey, setRefreshKey] = useState(0);
+  const [busy, setBusy] = useState<string | null>(null);
+
+  async function release(id: string) {
+    const reason = prompt('دلیل آزادسازی قفل:');
+    if (!reason) return;
+    setBusy(id);
+    try {
+      await api('POST', `/internal/admin/holds/${id}/release`, { reason });
+      setRefreshKey((n) => n + 1);
+    } catch (e) {
+      alert(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  return (
+    <Resource<Record<string, unknown>[]> path="/internal/admin/holds" refreshKey={refreshKey}>
+      {(rows) => (
+        <>
+          <h1>قفل‌های فعال</h1>
+          <div className="banner">
+            قفل فقط آزادسازی را متوقف می‌کند؛ هیچ پولی جابه‌جا یا برگشت نمی‌خورد.
+          </div>
+          {rows.length === 0 ? (
+            <div className="empty">قفل فعالی وجود ندارد.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>فروشنده</th>
+                  <th>مبلغ</th>
+                  <th>منبع</th>
+                  <th>دلیل</th>
+                  <th>زمان</th>
+                  <th />
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r) => (
+                  <tr key={String(r['id'])}>
+                    <td>{String(r['merchant_name'] ?? '')}</td>
+                    <td>{formatAmount(r['amount'])} تومان</td>
+                    <td>{String(r['source'] ?? '')}</td>
+                    <td>{String(r['reason'] ?? '')}</td>
+                    <td>{formatDate(r['created_at'])}</td>
+                    <td className="actions">
+                      <button disabled={busy === String(r['id'])} onClick={() => release(String(r['id']))}>
+                        آزادسازی
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </Resource>
+  );
+}
+
 interface Column {
   key: string;
   label: string;
@@ -374,6 +456,24 @@ const PAYOUT_COLS: Column[] = [
     render: (r) => formatGram(r['gram_amount_atomic']),
   },
   { key: 'created_at', label: 'تاریخ', render: (r) => formatDate(r['created_at']) },
+];
+
+const DISPUTE_COLS: Column[] = [
+  { key: 'merchant_name', label: 'فروشنده' },
+  { key: 'status', label: 'وضعیت' },
+  { key: 'reason', label: 'دلیل' },
+  { key: 'resolution', label: 'نتیجه' },
+  { key: 'created_at', label: 'تاریخ', render: (r) => formatDate(r['created_at']) },
+];
+
+const TICKET_COLS: Column[] = [
+  { key: 'reference', label: 'کد' },
+  { key: 'merchant_name', label: 'فروشنده' },
+  { key: 'subject', label: 'موضوع' },
+  { key: 'category', label: 'دسته' },
+  { key: 'priority', label: 'اولویت' },
+  { key: 'status', label: 'وضعیت' },
+  { key: 'updated_at', label: 'به‌روزرسانی', render: (r) => formatDate(r['updated_at']) },
 ];
 
 const EXCEPTION_COLS: Column[] = [

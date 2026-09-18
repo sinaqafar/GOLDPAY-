@@ -21,6 +21,13 @@ import {
   requestRefund,
   refundableAmount,
 } from '../../../packages/core/src/use-cases/refund.ts';
+import { openDispute } from '../../../packages/core/src/use-cases/dispute.ts';
+import {
+  openTicket,
+  replyToTicket,
+  getTicket,
+  isTicketCategory,
+} from '../../../packages/core/src/use-cases/support.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { createInvoice, cancelInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
@@ -363,6 +370,165 @@ export function buildRouter(container: Container): Router {
 
     const amount = await refundableAmount(db, ctx.params['id'] as string);
     return { status: 200, body: { payment_id: ctx.params['id'], refundable_amount: amount } };
+  });
+
+  // --- support ------------------------------------------------------------------
+
+  router.post('/v1/support/tickets', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = asObject(ctx.body);
+    const subject = body['subject'];
+    const message = body['message'];
+    const category = body['category'] ?? 'OTHER';
+
+    if (typeof subject !== 'string') {
+      throw new ValidationError('MISSING_SUBJECT', 'subject is required');
+    }
+    if (typeof message !== 'string') {
+      throw new ValidationError('MISSING_BODY', 'message is required');
+    }
+    if (!isTicketCategory(category)) {
+      throw new ValidationError('INVALID_CATEGORY', `unknown category: ${String(category)}`);
+    }
+
+    const entityId = body['entity_id'];
+    if (entityId !== undefined && (typeof entityId !== 'string' || !UUID_RE.test(entityId))) {
+      throw new ValidationError('INVALID_ENTITY_ID', 'entity_id must be a UUID');
+    }
+
+    const ticket = await openTicket(db, {
+      merchantId: auth.merchantId,
+      subject,
+      body: message,
+      category,
+      entityType: body['entity_type'] as never,
+      entityId: entityId as string | undefined,
+      openedByType: 'MERCHANT',
+    });
+
+    return { status: 201, body: { id: ticket.ticketId, reference: ticket.reference } };
+  });
+
+  router.get('/v1/support/tickets', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const page = readPageRequest(ctx.query);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, reference, subject, category, priority, status,
+              entity_type, entity_id, created_at, updated_at
+         FROM core.support_tickets
+        WHERE merchant_id = $1
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [auth.merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
+    );
+    return { status: 200, body: buildPage(r.rows, page.limit, (row) => row) };
+  });
+
+  router.get('/v1/support/tickets/:id', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    // Internal staff notes are never shown to a merchant.
+    const ticket = await getTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      merchantId: auth.merchantId,
+      includeInternal: false,
+    });
+    return { status: 200, body: ticket };
+  });
+
+  router.post('/v1/support/tickets/:id/reply', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = asObject(ctx.body);
+    if (typeof body['message'] !== 'string') {
+      throw new ValidationError('MISSING_BODY', 'message is required');
+    }
+
+    const reply = await replyToTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      body: body['message'],
+      senderType: 'MERCHANT',
+      merchantId: auth.merchantId,
+    });
+    return { status: 201, body: { id: reply.messageId } };
+  });
+
+  // --- disputes -------------------------------------------------------------------
+
+  router.post('/v1/disputes', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = asObject(ctx.body);
+    const paymentId = body['payment_id'];
+    const reason = body['reason'];
+
+    if (typeof paymentId !== 'string' || !UUID_RE.test(paymentId)) {
+      throw new ValidationError('INVALID_PAYMENT_ID', 'payment_id must be a UUID');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new ValidationError('MISSING_REASON', 'a reason is required');
+    }
+
+    const dispute = await openDispute(db, {
+      paymentId,
+      reason,
+      openedByType: 'MERCHANT',
+      merchantId: auth.merchantId,
+    });
+
+    // 202: the case is recorded and the money paused; a human decides next.
+    return {
+      status: 202,
+      body: { id: dispute.disputeId, status: dispute.status, hold_placed: dispute.holdPlaced },
+    };
+  });
+
+  router.get('/v1/disputes', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, payment_id, status, reason, resolution, created_at, resolved_at
+         FROM core.disputes WHERE merchant_id = $1
+        ORDER BY created_at DESC LIMIT 100`,
+      [auth.merchantId],
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  /**
+   * Why a payment is not moving.
+   *
+   * A merchant whose money is paused deserves to know that, and why — an
+   * unexplained delay is worse than a refused payout.
+   */
+  router.get('/v1/payments/:id/holds', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const owner = await db.query<{ merchant_id: string }>(
+      'SELECT merchant_id FROM core.payments WHERE id = $1',
+      [ctx.params['id']],
+    );
+    const row = owner.rows[0];
+    if (!row) throw new NotFoundError('payment', ctx.params['id'] as string);
+    assertTenant(ctx, row.merchant_id);
+
+    const holds = await db.query<Record<string, unknown>>(
+      `SELECT id, source, reason, status, created_at, released_at
+         FROM finance.payment_holds
+        WHERE payment_id = $1 ORDER BY created_at DESC`,
+      [ctx.params['id']],
+    );
+    return { status: 200, body: { data: holds.rows } };
   });
 
   // --- statements -------------------------------------------------------------
@@ -956,6 +1122,44 @@ export function buildRouter(container: Container): Router {
         created_at: merchant['created_at'],
       },
     };
+  });
+
+  router.get('/v1/app/support', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, reference, subject, category, status, created_at, updated_at
+         FROM core.support_tickets WHERE merchant_id = $1
+        ORDER BY created_at DESC LIMIT 25`,
+      [merchantId],
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/v1/app/support', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const body = asObject(ctx.body);
+
+    const subject = body['subject'];
+    const message = body['message'];
+    const category = body['category'] ?? 'OTHER';
+    if (typeof subject !== 'string') {
+      throw new ValidationError('MISSING_SUBJECT', 'subject is required');
+    }
+    if (typeof message !== 'string') {
+      throw new ValidationError('MISSING_BODY', 'message is required');
+    }
+    if (!isTicketCategory(category)) {
+      throw new ValidationError('INVALID_CATEGORY', `unknown category: ${String(category)}`);
+    }
+
+    const ticket = await openTicket(db, {
+      merchantId,
+      subject,
+      body: message,
+      category,
+      openedByType: 'MERCHANT',
+    });
+    return { status: 201, body: { id: ticket.ticketId, reference: ticket.reference } };
   });
 
   router.get('/v1/app/wallets', async (ctx) => {

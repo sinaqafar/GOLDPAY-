@@ -496,3 +496,61 @@ describe('audit trail', () => {
     expect((await call('GET', '/internal/admin/audit', as('SUPPORT_AGENT'))).status).toBe(403);
   });
 });
+
+describe('holds, disputes and risk over the admin API', () => {
+  it('shows the risk queue only to roles that work it', async () => {
+    expect((await call('GET', '/internal/admin/risk', as('RISK_AGENT'))).status).toBe(200);
+    expect((await call('GET', '/internal/admin/holds', as('RISK_AGENT'))).status).toBe(200);
+    // A developer-support seat has no business in the risk queue.
+    expect((await call('GET', '/internal/admin/risk', as('DEVELOPER_SUPPORT'))).status).toBe(403);
+  });
+
+  it('lets the risk role lift a hold but never move money', async () => {
+    const perms = (await call('GET', '/internal/admin/me', as('RISK_AGENT'))).body
+      .permissions as string[];
+    expect(perms).toContain('holds:release');
+    expect(perms).toContain('disputes:resolve');
+    // The role exists to pause and investigate, not to pay.
+    expect(perms).not.toContain('treasury:fund');
+    expect(perms).not.toContain('treasury:approve');
+  });
+
+  it('answers 404 for a hold that does not exist rather than pretending', async () => {
+    const res = await call(
+      'POST',
+      '/internal/admin/holds/00000000-0000-4000-8000-000000000000/release',
+      as('SUPER_ADMIN'),
+      { reason: 'test' },
+    );
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses a resolution it does not recognise', async () => {
+    const res = await call(
+      'POST',
+      '/internal/admin/disputes/00000000-0000-4000-8000-000000000000/resolve',
+      as('SUPER_ADMIN'),
+      { resolution: 'MAKE_IT_GO_AWAY' },
+    );
+    expect(res.status).toBe(400);
+    expect(res.body['error'].code).toBe('INVALID_RESOLUTION');
+  });
+
+  it('keeps support read and respond away from roles that should not have them', async () => {
+    expect((await call('GET', '/internal/admin/support/tickets', as('SUPPORT_AGENT'))).status).toBe(200);
+    // READ_ONLY may read the queue but must not answer on the platform's behalf.
+    const readOnly = (await call('GET', '/internal/admin/me', as('READ_ONLY'))).body
+      .permissions as string[];
+    expect(readOnly).toContain('support:read');
+    expect(readOnly).not.toContain('support:respond');
+  });
+
+  it('a support agent cannot suspend a merchant or touch the treasury', async () => {
+    const perms = (await call('GET', '/internal/admin/me', as('SUPPORT_AGENT'))).body
+      .permissions as string[];
+    // SPEC 123.158 — support can explain and investigate, never alter money.
+    expect(perms).not.toContain('merchants:suspend');
+    expect(perms).not.toContain('treasury:fund');
+    expect(perms).not.toContain('holds:release');
+  });
+});

@@ -34,11 +34,17 @@ export const PERMISSIONS = [
   'ledger:read',
   'audit:read',
   'exceptions:read',
+  'risk:read',
+  'disputes:read',
+  'support:read',
   // write
   'merchants:suspend',
   'merchants:activate',
   'payouts:retry',
   'exceptions:resolve',
+  'holds:release',
+  'disputes:resolve',
+  'support:respond',
   // dangerous — money moves or the platform stops
   'treasury:fund',
   'treasury:approve',
@@ -57,6 +63,9 @@ const READ_ALL: Permission[] = [
   'ledger:read',
   'audit:read',
   'exceptions:read',
+  'risk:read',
+  'disputes:read',
+  'support:read',
 ];
 
 /**
@@ -73,6 +82,9 @@ export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
     'merchants:activate',
     'payouts:retry',
     'exceptions:resolve',
+    'holds:release',
+    'disputes:resolve',
+    'support:respond',
     'treasury:approve',
     'platform:freeze',
     'platform:unfreeze',
@@ -91,10 +103,36 @@ export const ROLE_PERMISSIONS: Record<AdminRole, readonly Permission[]> = {
     'merchants:activate',
     'payouts:retry',
     'exceptions:resolve',
+    'holds:release',
+    'disputes:resolve',
+    'support:respond',
   ],
-  SUPPORT_AGENT: ['merchants:read', 'payments:read', 'payouts:read', 'exceptions:read'],
-  RISK_AGENT: [...READ_ALL, 'merchants:suspend', 'platform:freeze'],
-  DEVELOPER_SUPPORT: ['merchants:read', 'payments:read', 'payouts:read', 'exceptions:read'],
+  SUPPORT_AGENT: [
+    'merchants:read',
+    'payments:read',
+    'payouts:read',
+    'exceptions:read',
+    'support:read',
+    'support:respond',
+    'disputes:read',
+  ],
+  // The role exists to work the risk queue, so it can lift its own holds and
+  // resolve disputes. It still cannot move money.
+  RISK_AGENT: [
+    ...READ_ALL,
+    'merchants:suspend',
+    'platform:freeze',
+    'holds:release',
+    'disputes:resolve',
+  ],
+  DEVELOPER_SUPPORT: [
+    'merchants:read',
+    'payments:read',
+    'payouts:read',
+    'exceptions:read',
+    'support:read',
+    'support:respond',
+  ],
   READ_ONLY: [...READ_ALL],
 };
 

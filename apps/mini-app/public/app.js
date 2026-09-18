@@ -143,6 +143,15 @@ const FEE_MODE_LABEL = {
   SPLIT: 'کارمزد نصف‌نصف',
 };
 
+const TICKET_STATUS = {
+  OPEN: ['باز', 'warn'],
+  IN_PROGRESS: ['در حال بررسی', 'warn'],
+  WAITING_CUSTOMER: ['منتظر پاسخ شما', 'warn'],
+  WAITING_INTERNAL: ['منتظر پشتیبانی', 'warn'],
+  RESOLVED: ['حل شد', 'ok'],
+  CLOSED: ['بسته', 'neutral'],
+};
+
 const WALLET_STATUS = {
   ACTIVE: ['فعال', 'ok'],
   SECURITY_HOLD: ['در دورهٔ امنیتی', 'warn'],
@@ -460,6 +469,13 @@ document.addEventListener('click', (ev) => {
       } else {
         window.open(btn.dataset.url, '_blank');
       }
+      break;
+    case 'new-ticket':
+      app.innerHTML = viewNewTicket();
+      document.getElementById('subject').focus();
+      break;
+    case 'submit-ticket':
+      void submitTicket(btn);
       break;
     case 'back':
     case 'retry':

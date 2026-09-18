@@ -91,13 +91,15 @@ button.ghost {
   font-size: 15px; font-weight: 600; font-family: inherit; cursor: pointer;
 }
 
-input {
+input, select, textarea {
   width: 100%; padding: 13px; margin-bottom: 10px;
   border: none; border-radius: var(--radius);
   background: var(--bg); color: var(--text);
+  /* 16px stops iOS Safari zooming the page on focus. */
   font-size: 16px; font-family: inherit; text-align: right;
 }
-input:focus { outline: 2px solid var(--link); }
+input:focus, select:focus, textarea:focus { outline: 2px solid var(--link); }
+textarea { resize: vertical; min-height: 96px; line-height: 1.7; }
 
 label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 6px; }
 

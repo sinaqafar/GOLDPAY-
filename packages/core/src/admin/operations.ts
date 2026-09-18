@@ -401,3 +401,25 @@ export async function resolveException(
     });
   });
 }
+
+/**
+ * Write an audit row outside a domain transaction.
+ *
+ * The private `audit` above runs inside the transaction that performs the
+ * change, which is correct when there is one. Some admin actions — lifting a
+ * hold, resolving a dispute — complete in their own use case first, so the
+ * audit is written separately here rather than not at all.
+ */
+export async function auditAdminAction(
+  db: Database,
+  params: {
+    actorId: string;
+    action: string;
+    resourceType: string;
+    resourceId?: string | null;
+    reason?: string;
+    metadata?: Record<string, unknown>;
+  },
+): Promise<void> {
+  await db.transaction(async (tx) => audit(tx, params));
+}

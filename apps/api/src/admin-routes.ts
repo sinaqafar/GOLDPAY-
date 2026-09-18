@@ -14,7 +14,12 @@ import { randomUUID } from 'node:crypto';
 import type { Router, RequestContext } from './http.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { verifyApiSecret, parseApiToken } from '../../../packages/crypto/src/index.ts';
-import { AuthError, ValidationError, SecurityError } from '../../../packages/errors/src/index.ts';
+import {
+  AuthError,
+  ValidationError,
+  SecurityError,
+  NotFoundError,
+} from '../../../packages/errors/src/index.ts';
 import {
   assertPermission,
   isAdminRole,
@@ -32,8 +37,16 @@ import {
   resolveException,
   isFinanciallyFrozen,
   type AdminActor,
+  auditAdminAction,
 } from '../../../packages/core/src/admin/operations.ts';
 import { verifyGlobalBalance } from '../../../packages/ledger/src/ledger-service.ts';
+import { releaseHold } from '../../../packages/core/src/risk.ts';
+import { resolveDispute } from '../../../packages/core/src/use-cases/dispute.ts';
+import {
+  getTicket,
+  replyToTicket,
+  setTicketStatus,
+} from '../../../packages/core/src/use-cases/support.ts';
 import type { Database } from '../../../packages/database/src/client.ts';
 
 /**
@@ -307,6 +320,175 @@ export function registerAdminRoutes(router: Router, container: Container): void 
     const actor = await auth(ctx);
     await resolveException(db, actor, ctx.params['id'] as string, str(body(ctx), 'resolution'));
     return { status: 200, body: { status: 'RESOLVED' } };
+  });
+
+  // --- holds, disputes and risk ------------------------------------------------
+
+  router.get('/internal/admin/holds', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'risk:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT h.id, h.payment_id, h.merchant_id, h.source, h.reason, h.created_at,
+              m.name AS merchant_name, p.verified_amount::text AS amount
+         FROM finance.payment_holds h
+         JOIN core.merchants m ON m.id = h.merchant_id
+         JOIN core.payments p ON p.id = h.payment_id
+        WHERE h.status = 'ACTIVE'
+        ORDER BY h.created_at ASC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  /**
+   * Lift a hold.
+   *
+   * The only way money that risk or a dispute paused starts moving again. It is
+   * audited like every other consequential action, and it never itself moves
+   * anything: release simply resumes on the next worker pass.
+   */
+  router.post('/internal/admin/holds/:id/release', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'holds:release');
+
+    const reason = str(body(ctx), 'reason');
+    const released = await releaseHold(db, {
+      holdId: ctx.params['id'] as string,
+      releasedBy: actor.adminId,
+    });
+    if (!released) throw new NotFoundError('hold', ctx.params['id'] as string);
+
+    await auditAdminAction(db, {
+      actorId: actor.adminId,
+      action: 'HOLD_RELEASED',
+      resourceType: 'PAYMENT_HOLD',
+      resourceId: ctx.params['id'] as string,
+      reason,
+    });
+    return { status: 200, body: { status: 'RELEASED' } };
+  });
+
+  router.get('/internal/admin/disputes', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'disputes:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT d.id, d.payment_id, d.merchant_id, d.status, d.reason, d.resolution,
+              d.created_at, d.resolved_at, m.name AS merchant_name
+         FROM core.disputes d
+         JOIN core.merchants m ON m.id = d.merchant_id
+        ORDER BY
+          CASE WHEN d.status IN ('OPEN','UNDER_REVIEW','HOLD','ESCALATED') THEN 0 ELSE 1 END,
+          d.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/disputes/:id/resolve', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'disputes:resolve');
+
+    const payload = body(ctx);
+    const resolution = str(payload, 'resolution');
+    const allowed = ['UPHELD_MERCHANT', 'UPHELD_CUSTOMER', 'REFUND_REQUIRED', 'NO_ACTION'];
+    if (!allowed.includes(resolution)) {
+      throw new ValidationError('INVALID_RESOLUTION', `resolution must be one of ${allowed.join(', ')}`);
+    }
+
+    const result = await resolveDispute(db, {
+      disputeId: ctx.params['id'] as string,
+      resolution: resolution as never,
+      note: typeof payload['note'] === 'string' ? payload['note'] : undefined,
+      resolvedBy: actor.adminId,
+    });
+
+    await auditAdminAction(db, {
+      actorId: actor.adminId,
+      action: 'DISPUTE_RESOLVED',
+      resourceType: 'DISPUTE',
+      resourceId: ctx.params['id'] as string,
+      reason: resolution,
+    });
+    return { status: 200, body: result };
+  });
+
+  router.get('/internal/admin/risk', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'risk:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT a.id, a.entity_type, a.entity_id, a.merchant_id, a.score, a.level,
+              a.decision, a.signals, a.created_at, m.name AS merchant_name
+         FROM risk.assessments a
+         LEFT JOIN core.merchants m ON m.id = a.merchant_id
+        WHERE a.decision = 'REVIEW'
+        ORDER BY a.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  // --- support ------------------------------------------------------------------
+
+  router.get('/internal/admin/support/tickets', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT t.id, t.reference, t.subject, t.category, t.priority, t.status,
+              t.entity_type, t.entity_id, t.created_at, t.updated_at,
+              m.name AS merchant_name
+         FROM core.support_tickets t
+         JOIN core.merchants m ON m.id = t.merchant_id
+        ORDER BY
+          CASE WHEN t.status IN ('OPEN','WAITING_INTERNAL') THEN 0 ELSE 1 END,
+          CASE t.priority WHEN 'URGENT' THEN 0 WHEN 'HIGH' THEN 1
+                          WHEN 'NORMAL' THEN 2 ELSE 3 END,
+          t.created_at ASC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/support/tickets/:id', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:read');
+
+    // Staff see internal notes; merchants never do.
+    const ticket = await getTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      includeInternal: true,
+    });
+    return { status: 200, body: ticket };
+  });
+
+  router.post('/internal/admin/support/tickets/:id/reply', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:respond');
+
+    const payload = body(ctx);
+    const reply = await replyToTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      body: str(payload, 'message'),
+      senderType: 'ADMIN',
+      senderId: actor.adminId,
+      internal: payload['internal'] === true,
+    });
+    return { status: 201, body: { id: reply.messageId } };
+  });
+
+  router.post('/internal/admin/support/tickets/:id/status', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:respond');
+
+    await setTicketStatus(db, {
+      ticketId: ctx.params['id'] as string,
+      status: str(body(ctx), 'status') as never,
+      actorId: actor.adminId,
+    });
+    return { status: 200, body: { status: 'UPDATED' } };
   });
 
   // --- payouts --------------------------------------------------------------

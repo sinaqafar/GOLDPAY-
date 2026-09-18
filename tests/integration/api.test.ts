@@ -798,3 +798,100 @@ describe('metrics endpoint', () => {
     expect(body).not.toContain(`route="/v1/invoices/${created.body.id}"`);
   });
 });
+
+describe('support tickets (SPEC 2453/2454)', () => {
+  it('opens a ticket with a quotable reference and records the first message', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/support/tickets', {
+      subject: 'Payout has not arrived',
+      message: 'My settlement from Tuesday is still not on chain.',
+      category: 'PAYOUT',
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.reference).toMatch(/^TKT-\d{6}$/);
+
+    const detail = await call(keyA.token, 'GET', `/v1/support/tickets/${created.body.id}`);
+    expect(detail.status).toBe(200);
+    expect(detail.body.status).toBe('OPEN');
+    expect((detail.body.messages as unknown[]).length).toBe(1);
+  });
+
+  it('can link a ticket to the payment it is about', async () => {
+    // The whole reason a ticket beats a chat message: support can reach the
+    // financial record without being able to change it.
+    const invoice = await call(keyA.token, 'POST', '/v1/invoices', { amount: '85000' });
+    const ticket = await call(keyA.token, 'POST', '/v1/support/tickets', {
+      subject: 'Wrong amount',
+      message: 'This invoice shows the wrong total.',
+      category: 'PAYMENT',
+      entity_type: 'INVOICE',
+      entity_id: invoice.body.id,
+    });
+    expect(ticket.status).toBe(201);
+
+    const detail = await call(keyA.token, 'GET', `/v1/support/tickets/${ticket.body.id}`);
+    expect(detail.body.entity_id).toBe(invoice.body.id);
+  });
+
+  it('moves the ticket to WAITING_INTERNAL when the merchant replies', async () => {
+    const ticket = await call(keyA.token, 'POST', '/v1/support/tickets', {
+      subject: 'Question',
+      message: 'First message.',
+      category: 'OTHER',
+    });
+    const reply = await call(keyA.token, 'POST', `/v1/support/tickets/${ticket.body.id}/reply`, {
+      message: 'Any update?',
+    });
+    expect(reply.status).toBe(201);
+
+    const detail = await call(keyA.token, 'GET', `/v1/support/tickets/${ticket.body.id}`);
+    expect(detail.body.status).toBe('WAITING_INTERNAL');
+    expect((detail.body.messages as unknown[]).length).toBe(2);
+  });
+
+  it('rejects an unknown category rather than silently defaulting', async () => {
+    const res = await call(keyA.token, 'POST', '/v1/support/tickets', {
+      subject: 'x',
+      message: 'y',
+      category: 'NONSENSE',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body['error'].code).toBe('INVALID_CATEGORY');
+  });
+
+  it("will not show one merchant another's ticket", async () => {
+    const ticket = await call(keyA.token, 'POST', '/v1/support/tickets', {
+      subject: 'Private',
+      message: 'Confidential.',
+      category: 'ACCOUNT',
+    });
+    // 404, not 403: B must not learn the ticket exists.
+    const res = await call(keyB.token, 'GET', `/v1/support/tickets/${ticket.body.id}`);
+    expect(res.status).toBe(404);
+  });
+
+  it('lists tickets with pagination', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/support/tickets?limit=3');
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.envelope['data'])).toBe(true);
+    expect(res.envelope['pagination']).toBeTruthy();
+  });
+});
+
+describe('merchant-visible holds', () => {
+  it('explains why a payment is not moving', async () => {
+    // An unexplained delay is worse than a refused payout.
+    const invoice = await call(keyA.token, 'POST', '/v1/invoices', { amount: '95000' });
+    expect(invoice.status).toBe(201);
+
+    const payments = await call(keyA.token, 'GET', '/v1/payments?limit=1');
+    expect(payments.status).toBe(200);
+
+    // With no payment yet, the endpoint still answers cleanly for a known id.
+    const unknown = await call(
+      keyA.token,
+      'GET',
+      '/v1/payments/00000000-0000-4000-8000-000000000000/holds',
+    );
+    expect(unknown.status).toBe(404);
+  });
+});

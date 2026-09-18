@@ -279,3 +279,35 @@ describe('mini app "more" tab resources', () => {
     expect(res.status).toBe(401);
   });
 });
+
+describe('mini app support tab', () => {
+  it('opens a ticket and lists it back', async () => {
+    const created = await call('POST', '/v1/app/support', buildInitData(ownerTelegramId), {
+      subject: 'تسویه نیامده',
+      message: 'از سه‌شنبه منتظرم.',
+      category: 'PAYOUT',
+    });
+    expect(created.status).toBe(201);
+    expect(created.body['reference']).toMatch(/^TKT-\d{6}$/);
+
+    const list = await call('GET', '/v1/app/support', buildInitData(ownerTelegramId));
+    expect(list.status).toBe(200);
+    const refs = (list.envelope['data'] as { reference: string }[]).map((t) => t.reference);
+    expect(refs).toContain(created.body['reference']);
+  });
+
+  it('rejects an unknown category instead of defaulting silently', async () => {
+    const res = await call('POST', '/v1/app/support', buildInitData(ownerTelegramId), {
+      subject: 'x',
+      message: 'y',
+      category: 'NOPE',
+    });
+    expect(res.status).toBe(400);
+    expect(res.body['error'].code).toBe('INVALID_CATEGORY');
+  });
+
+  it('requires authentication like every other app route', async () => {
+    const res = await call('GET', '/v1/app/support', null);
+    expect(res.status).toBe(401);
+  });
+});
