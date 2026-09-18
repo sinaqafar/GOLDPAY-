@@ -8,7 +8,14 @@
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { api, getCredential, setCredential, clearCredential, formatAmount, formatGram, formatDate } from './api.ts';
+import {
+  api,
+  startSession,
+  endSession,
+  formatAmount,
+  formatGram,
+  formatDate,
+} from './api.ts';
 
 type Tab =
   | 'overview'
@@ -36,14 +43,17 @@ const TABS: { id: Tab; label: string }[] = [
 ];
 
 export function App() {
-  const [authed, setAuthed] = useState(Boolean(getCredential()));
+  const [authed, setAuthed] = useState(false);
   const [me, setMe] = useState<Record<string, unknown> | null>(null);
   const [tab, setTab] = useState<Tab>('overview');
 
+  // An existing cookie means an existing session: no need to log in again.
   useEffect(() => {
-    if (!authed) return;
     api<Record<string, unknown>>('GET', '/internal/admin/me')
-      .then(setMe)
+      .then((data) => {
+        setMe(data);
+        setAuthed(true);
+      })
       .catch(() => {
         setAuthed(false);
         setMe(null);
@@ -73,8 +83,7 @@ export function App() {
           <button
             className="logout"
             onClick={() => {
-              clearCredential();
-              setAuthed(false);
+              void endSession().then(() => setAuthed(false));
             }}
           >
             خروج
@@ -97,12 +106,11 @@ function Login({ onSuccess }: { onSuccess: () => void }) {
     e.preventDefault();
     setBusy(true);
     setError(null);
-    setCredential(value.trim());
     try {
-      await api('GET', '/internal/admin/me');
+      // Trades the credential for an HttpOnly cookie and discards it.
+      await startSession(value.trim());
       onSuccess();
     } catch (err) {
-      clearCredential();
       setError(err instanceof Error ? err.message : 'ورود ناموفق بود');
     } finally {
       setBusy(false);

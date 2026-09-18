@@ -27,6 +27,38 @@ export function clearCredential(): void {
   sessionStorage.removeItem(CREDENTIAL_KEY);
 }
 
+/**
+ * Exchange the credential for an HttpOnly session cookie, then forget it.
+ *
+ * Holding a long-lived credential in sessionStorage leaves it readable by any
+ * script that reaches this origin. The cookie is not.
+ */
+export async function startSession(credential: string): Promise<void> {
+  const res = await fetch('/internal/admin/session', {
+    method: 'POST',
+    credentials: 'same-origin',
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${credential}` },
+  });
+  if (!res.ok) {
+    const envelope = (await res.json().catch(() => null)) as Record<string, unknown> | null;
+    const error = (envelope?.['error'] ?? {}) as Partial<ApiError>;
+    throw Object.assign(new Error(error.message ?? 'login failed'), {
+      code: error.code ?? 'UNKNOWN',
+      status: res.status,
+    });
+  }
+  // The cookie is set; the credential is deliberately not retained.
+  clearCredential();
+}
+
+export async function endSession(): Promise<void> {
+  await fetch('/internal/admin/session/revoke', {
+    method: 'POST',
+    credentials: 'same-origin',
+  }).catch(() => undefined);
+  clearCredential();
+}
+
 export async function api<T = unknown>(
   method: string,
   path: string,
@@ -35,6 +67,9 @@ export async function api<T = unknown>(
   const credential = getCredential();
   const res = await fetch(path, {
     method,
+    // The session cookie travels automatically; the header is only a fallback
+    // for a browser that has not exchanged one yet.
+    credentials: 'same-origin',
     headers: {
       'content-type': 'application/json',
       ...(credential ? { authorization: `Bearer ${credential}` } : {}),

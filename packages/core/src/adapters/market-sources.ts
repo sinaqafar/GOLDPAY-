@@ -20,7 +20,9 @@ interface HttpOptions {
   headers?: Record<string, string>;
 }
 
-async function fetchJson(options: HttpOptions): Promise<Record<string, unknown>> {
+async function fetchJson(
+  options: HttpOptions,
+): Promise<{ body: Record<string, unknown>; rawBody: string }> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? 5000);
   try {
@@ -34,7 +36,8 @@ async function fetchJson(options: HttpOptions): Promise<Record<string, unknown>>
         details: { status: res.status, source: options.name },
       });
     }
-    return (await res.json()) as Record<string, unknown>;
+    const rawBody = await res.text();
+    return { body: JSON.parse(rawBody) as Record<string, unknown>, rawBody };
   } catch (e) {
     if (e instanceof IntegrationError) throw e;
     throw new IntegrationError('MARKET_UNREACHABLE', 'market source request failed', {
@@ -47,17 +50,33 @@ async function fetchJson(options: HttpOptions): Promise<Record<string, unknown>>
   }
 }
 
-/** Numbers arrive as JSON floats; stringify without scientific notation. */
-function numberToDecimalString(value: number): string {
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new IntegrationError('MARKET_INVALID_VALUE', 'market source returned a non-positive value', {
-      retryable: false,
-      details: { value },
-    });
+/**
+ * Read a price as an exact decimal string.
+ *
+ * JSON.parse turns every number into a float, so by the time a value is a
+ * `number` its precision is already fixed. The only way to avoid that is to
+ * take the digits out of the RAW body before parsing — which this does when the
+ * upstream sends a number, falling back to the parsed float only when the shape
+ * is unexpected.
+ *
+ * Market rates are not amounts of money, so a last-digit difference does not
+ * mint or destroy anything. But the rate multiplies into a GRAM amount that IS
+ * money, and the project forbids floats in that path, so the exact digits are
+ * preserved wherever they are available.
+ */
+function readDecimal(raw: unknown, rawBody: string, field: string): string | null {
+  // Preferred: pull the literal digits straight out of the response text.
+  const literal = new RegExp(`"${field}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(rawBody);
+  if (literal?.[1]) return literal[1];
+
+  if (typeof raw === 'string' && /^\d+(\.\d+)?$/.test(raw)) return raw;
+
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw) || raw <= 0) return null;
+    // Scientific notation would be rejected downstream, so render plainly.
+    return raw.toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
   }
-  // toFixed(12) keeps small prices intact and avoids 1e-7 style output, which
-  // the aggregator's decimal parser would reject.
-  return value.toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
+  return null;
 }
 
 /**
@@ -91,7 +110,7 @@ export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
   }
 
   async getGramUsd(): Promise<MarketObservation> {
-    const body = await fetchJson({
+    const { body, rawBody } = await fetchJson({
       url: this.#url,
       timeoutMs: this.#timeoutMs,
       name: this.name,
@@ -99,8 +118,8 @@ export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
     });
 
     const entry = body[this.#coinId] as Record<string, unknown> | undefined;
-    const usd = entry?.['usd'];
-    if (typeof usd !== 'number') {
+    const usd = readDecimal(entry?.['usd'], rawBody, 'usd');
+    if (!usd) {
       throw new IntegrationError('MARKET_INVALID_VALUE', 'no usd price in the response', {
         retryable: false,
         details: { source: this.name, coinId: this.#coinId },
@@ -112,7 +131,7 @@ export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
     const observedAt =
       typeof updatedAt === 'number' ? new Date(updatedAt * 1000) : new Date();
 
-    return { value: numberToDecimalString(usd), source: this.name, observedAt };
+    return { value: usd, source: this.name, observedAt };
   }
 }
 
@@ -136,20 +155,19 @@ export class TindexFxProvider implements FxProvider {
   }
 
   async getUsdToman(): Promise<MarketObservation> {
-    const body = await fetchJson({
+    const { body, rawBody } = await fetchJson({
       url: this.#url,
       timeoutMs: this.#timeoutMs,
       name: this.name,
       headers: this.#apiKey ? { authorization: `Bearer ${this.#apiKey}` } : {},
     });
 
-    const raw = body['price'] ?? body['value'] ?? body['toman'] ?? body['usd_toman'];
-    const value =
-      typeof raw === 'number'
-        ? numberToDecimalString(raw)
-        : typeof raw === 'string' && /^\d+(\.\d+)?$/.test(raw)
-          ? raw
-          : null;
+    let value: string | null = null;
+    for (const field of ['price', 'value', 'toman', 'usd_toman']) {
+      if (body[field] === undefined) continue;
+      value = readDecimal(body[field], rawBody, field);
+      if (value) break;
+    }
 
     if (!value) {
       throw new IntegrationError('MARKET_INVALID_VALUE', 'no usable USD/TOMAN price', {

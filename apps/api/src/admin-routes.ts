@@ -13,7 +13,16 @@
 import { randomUUID } from 'node:crypto';
 import type { Router, RequestContext } from './http.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
-import { verifyApiSecret, parseApiToken } from '../../../packages/crypto/src/index.ts';
+import {
+  verifyApiSecret,
+  parseApiToken,
+  sha256Hex,
+} from '../../../packages/crypto/src/index.ts';
+import { randomBytes } from 'node:crypto';
+
+/** Name of the admin session cookie. */
+const ADMIN_SESSION_COOKIE = 'gram_admin_session';
+const SESSION_TTL_HOURS = 8;
 import {
   AuthError,
   ValidationError,
@@ -56,7 +65,59 @@ import type { Database } from '../../../packages/database/src/client.ts';
  * core.admin_users. A dummy comparison runs when the admin is unknown so the
  * response time does not reveal whether a prefix exists.
  */
+/** Read one cookie from the request header. */
+function cookie(ctx: RequestContext, name: string): string | null {
+  const header = ctx.headers['cookie'];
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key === name) return decodeURIComponent(rest.join('='));
+  }
+  return null;
+}
+
+/**
+ * Resolve an admin from a session cookie.
+ *
+ * Preferred over the bearer credential for the panel: an HttpOnly cookie is
+ * not readable by JavaScript, so a script injected into the admin origin
+ * cannot exfiltrate it the way it could a token held in sessionStorage. Only
+ * the hash is stored, so the database alone cannot be replayed as a login.
+ */
+async function authenticateAdminSession(
+  db: Database,
+  ctx: RequestContext,
+): Promise<AdminActor | null> {
+  const token = cookie(ctx, ADMIN_SESSION_COOKIE);
+  if (!token) return null;
+
+  const r = await db.query<{ admin_id: string; role: string; status: string }>(
+    `SELECT s.admin_id, a.role, a.status
+       FROM core.admin_sessions s
+       JOIN core.admin_users a ON a.id = s.admin_id
+      WHERE s.token_hash = $1
+        AND s.revoked_at IS NULL
+        AND s.expires_at > NOW()`,
+    [sha256Hex(token)],
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+
+  if (row.status !== 'ACTIVE') {
+    throw new AuthError('ADMIN_NOT_ACTIVE', `admin account is ${row.status}`);
+  }
+  if (!isAdminRole(row.role)) {
+    throw new AuthError('INVALID_ADMIN_ROLE', 'admin has an unknown role');
+  }
+  return { adminId: row.admin_id, role: row.role };
+}
+
 async function authenticateAdmin(db: Database, ctx: RequestContext): Promise<AdminActor> {
+  // A session cookie takes precedence; the bearer credential remains for
+  // scripted and break-glass access.
+  const session = await authenticateAdminSession(db, ctx);
+  if (session) return session;
+
   const header = ctx.headers['authorization'];
   if (!header?.startsWith('Bearer ')) {
     throw new AuthError('MISSING_ADMIN_KEY', 'an admin credential is required');
@@ -119,6 +180,66 @@ export function registerAdminRoutes(router: Router, container: Container): void 
   };
 
   // --- who am I -------------------------------------------------------------
+
+  /**
+   * Exchange an admin credential for a session cookie.
+   *
+   * The cookie is HttpOnly, Secure and SameSite=Strict:
+   *  - HttpOnly so injected script cannot read it, unlike sessionStorage;
+   *  - SameSite=Strict so another origin cannot drive the panel's endpoints,
+   *    which is the CSRF exposure cookie auth would otherwise introduce.
+   */
+  router.post('/internal/admin/session', async (ctx) => {
+    // Authenticates with the bearer credential, then issues the cookie.
+    const actor = await authenticateAdmin(db, ctx);
+
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000);
+
+    await db.query(
+      `INSERT INTO core.admin_sessions (id, admin_id, token_hash, ip_address, user_agent, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        randomUUID(),
+        actor.adminId,
+        // Only the hash is stored, so the table cannot be replayed as a login.
+        sha256Hex(token),
+        ctx.ip || null,
+        ctx.headers['user-agent'] ?? null,
+        expiresAt.toISOString(),
+      ],
+    );
+
+    return {
+      status: 200,
+      headers: {
+        'set-cookie':
+          `${ADMIN_SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; ` +
+          `Path=/internal/admin; Max-Age=${SESSION_TTL_HOURS * 3600}`,
+      },
+      body: { role: actor.role, expires_at: expiresAt.toISOString() },
+    };
+  });
+
+  router.post('/internal/admin/session/revoke', async (ctx) => {
+    const token = cookie(ctx, ADMIN_SESSION_COOKIE);
+    if (token) {
+      await db.query(
+        `UPDATE core.admin_sessions SET revoked_at = NOW()
+          WHERE token_hash = $1 AND revoked_at IS NULL`,
+        [sha256Hex(token)],
+      );
+    }
+    return {
+      status: 200,
+      headers: {
+        'set-cookie':
+          `${ADMIN_SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; ` +
+          `Path=/internal/admin; Max-Age=0`,
+      },
+      body: { revoked: true },
+    };
+  });
 
   router.get('/internal/admin/me', async (ctx) => {
     const actor = await auth(ctx);

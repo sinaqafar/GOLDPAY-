@@ -18,6 +18,7 @@ import {
   StaticFxProvider,
 } from '../../packages/core/src/adapters/rate-aggregator.ts';
 import type { CryptoMarketProvider } from '../../packages/core/src/ports/market-data.ts';
+import { CoinGeckoCryptoProvider } from '../../packages/core/src/adapters/market-sources.ts';
 import { AppError, ValidationError, FinancialError } from '../../packages/errors/src/index.ts';
 
 describe('log redaction', () => {
@@ -346,5 +347,47 @@ describe('rate baseline survives a restart', () => {
     const quote = await aggregator.getQuote();
     expect(quote.legs?.cryptoUsd).toMatchObject({ value: '2.5', source: 'CG' });
     expect(quote.legs?.usdToman).toMatchObject({ value: '80000', source: 'FX' });
+  });
+});
+
+describe('market prices keep their exact digits', () => {
+  /** A price whose decimal expansion a float cannot hold exactly. */
+  const EXACT = '2.30000000000000001';
+
+  function stubFetch(body: string) {
+    return async () =>
+      new Response(body, { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+
+  it('reads the literal digits from the response, not the parsed float', async () => {
+    // JSON.parse would round this; taking the digits from the raw body does not.
+    const original = globalThis.fetch;
+    globalThis.fetch = stubFetch(
+      `{"the-open-network":{"usd":${EXACT},"last_updated_at":1800000000}}`,
+    ) as unknown as typeof fetch;
+
+    try {
+      const provider = new CoinGeckoCryptoProvider({});
+      const observation = await provider.getGramUsd();
+      expect(observation.value).toBe(EXACT);
+      // Proof the float path would have lost it.
+      expect(String(Number(EXACT))).not.toBe(EXACT);
+    } finally {
+      globalThis.fetch = original;
+    }
+  });
+
+  it('uses the upstream timestamp so the freshness check means something', async () => {
+    const original = globalThis.fetch;
+    globalThis.fetch = stubFetch(
+      '{"the-open-network":{"usd":2.5,"last_updated_at":1800000000}}',
+    ) as unknown as typeof fetch;
+
+    try {
+      const observation = await new CoinGeckoCryptoProvider({}).getGramUsd();
+      expect(observation.observedAt.getTime()).toBe(1800000000 * 1000);
+    } finally {
+      globalThis.fetch = original;
+    }
   });
 });

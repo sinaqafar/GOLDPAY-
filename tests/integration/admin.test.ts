@@ -554,3 +554,73 @@ describe('holds, disputes and risk over the admin API', () => {
     expect(perms).not.toContain('holds:release');
   });
 });
+
+describe('admin session cookies', () => {
+  it('exchanges a credential for an HttpOnly cookie', async () => {
+    const res = await fetch(`${baseUrl}/internal/admin/session`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${as('SUPER_ADMIN')}` },
+    });
+    expect(res.status).toBe(200);
+
+    const setCookie = res.headers.get('set-cookie') ?? '';
+    // Not readable by script, not sent cross-origin, scoped to the admin API.
+    expect(setCookie).toContain('gram_admin_session=');
+    expect(setCookie).toContain('HttpOnly');
+    expect(setCookie).toContain('Secure');
+    expect(setCookie).toContain('SameSite=Strict');
+    expect(setCookie).toContain('Path=/internal/admin');
+  });
+
+  it('authenticates with the cookie alone, no credential header', async () => {
+    const login = await fetch(`${baseUrl}/internal/admin/session`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${as('FINANCE_ADMIN')}` },
+    });
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
+
+    const me = await fetch(`${baseUrl}/internal/admin/me`, { headers: { cookie } });
+    expect(me.status).toBe(200);
+
+    const envelope = (await me.json()) as { data: { role: string } };
+    expect(envelope.data.role).toBe('FINANCE_ADMIN');
+  });
+
+  it('stops accepting a revoked session', async () => {
+    const login = await fetch(`${baseUrl}/internal/admin/session`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${as('SUPER_ADMIN')}` },
+    });
+    const cookie = (login.headers.get('set-cookie') ?? '').split(';')[0] as string;
+    expect((await fetch(`${baseUrl}/internal/admin/me`, { headers: { cookie } })).status).toBe(200);
+
+    await fetch(`${baseUrl}/internal/admin/session/revoke`, {
+      method: 'POST',
+      headers: { cookie },
+    });
+
+    // Revocation is immediate, which is what makes logout meaningful.
+    expect((await fetch(`${baseUrl}/internal/admin/me`, { headers: { cookie } })).status).toBe(401);
+  });
+
+  it('refuses a forged cookie', async () => {
+    const res = await fetch(`${baseUrl}/internal/admin/me`, {
+      headers: { cookie: 'gram_admin_session=not-a-real-token' },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it('stores only the hash, so the table cannot be replayed as a login', async () => {
+    const login = await fetch(`${baseUrl}/internal/admin/session`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${as('SUPER_ADMIN')}` },
+    });
+    const token = ((login.headers.get('set-cookie') ?? '').split(';')[0] ?? '').split('=')[1] ?? '';
+    expect(token.length).toBeGreaterThan(20);
+
+    const stored = await container.db.query<{ token_hash: string }>(
+      'SELECT token_hash FROM core.admin_sessions ORDER BY created_at DESC LIMIT 1',
+    );
+    expect(stored.rows[0]?.token_hash).not.toBe(token);
+  });
+});
