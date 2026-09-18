@@ -16,6 +16,10 @@ import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.t
 import { registerAdminRoutes } from './admin-routes.ts';
 import { readPageRequest, buildPage } from './pagination.ts';
 import { renderCheckout } from './checkout.ts';
+import {
+  requestRefund,
+  refundableAmount,
+} from '../../../packages/core/src/use-cases/refund.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { createInvoice, cancelInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
@@ -289,6 +293,62 @@ export function buildRouter(container: Container): Router {
       ],
     );
     return { status: 200, body: buildPage(r.rows, page.limit, serialisePayment) };
+  });
+
+  // --- refunds ------------------------------------------------------------------
+
+  router.post('/v1/refunds', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = asObject(ctx.body);
+    const paymentId = body['payment_id'];
+    const amount = body['amount'];
+    const reason = body['reason'];
+
+    if (typeof paymentId !== 'string' || !UUID_RE.test(paymentId)) {
+      throw new ValidationError('INVALID_PAYMENT_ID', 'payment_id must be a UUID');
+    }
+    if (typeof amount !== 'string') {
+      throw new ValidationError('INVALID_AMOUNT', 'amount must be an integer string');
+    }
+    if (typeof reason !== 'string' || !reason.trim()) {
+      throw new ValidationError('MISSING_REASON', 'a reason is required for a refund');
+    }
+
+    const result = await requestRefund(db, {
+      paymentId,
+      merchantId: auth.merchantId,
+      amount,
+      reason,
+      requestedByType: 'MERCHANT',
+    });
+
+    // 202: the request is recorded and will be decided, not completed inline.
+    return {
+      status: 202,
+      body: {
+        id: result.refundId,
+        status: result.status,
+        ...(result.blockedReason ? { blocked_reason: result.blockedReason } : {}),
+      },
+    };
+  });
+
+  router.get('/v1/payments/:id/refundable', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const owner = await db.query<{ merchant_id: string }>(
+      'SELECT merchant_id FROM core.payments WHERE id = $1',
+      [ctx.params['id']],
+    );
+    const row = owner.rows[0];
+    if (!row) throw new NotFoundError('payment', ctx.params['id'] as string);
+    assertTenant(ctx, row.merchant_id);
+
+    const amount = await refundableAmount(db, ctx.params['id'] as string);
+    return { status: 200, body: { payment_id: ctx.params['id'], refundable_amount: amount } };
   });
 
   // --- statements -------------------------------------------------------------

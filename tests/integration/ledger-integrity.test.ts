@@ -27,6 +27,7 @@ import {
   expireStaleReservations,
 } from '../../packages/core/src/use-cases/payout.ts';
 import { post, verifyGlobalBalance, verifyProjection } from '../../packages/ledger/src/ledger-service.ts';
+import { requestRefund, refundableAmount } from '../../packages/core/src/use-cases/refund.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../packages/ledger/src/accounts.ts';
 import { Money } from '../../packages/money/src/index.ts';
 
@@ -850,5 +851,154 @@ describe('provider fee: expected vs actual (SPEC 71.13)', () => {
         WHERE a.account_code = 'PROVIDER_CLEARING_TOMAN'`,
     );
     expect(clearing.rows[0]?.balance).toBe('913000');
+  });
+});
+
+describe('refunds (PART 70)', () => {
+  async function verifiedPayment(h: Harness) {
+    const merchant = await createMerchant(h.db, { feeMode: 'CUSTOMER' });
+    const invoice = await createInvoice(h.db, h.config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    const payment = await finalizePayment(h.db, h.config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    return { merchant, invoice, payment };
+  }
+
+  it('records the request but refuses to execute while the policy is undefined', async () => {
+    harness = await createHarness();
+    const { merchant, payment } = await verifiedPayment(harness);
+
+    const result = await requestRefund(harness.db, {
+      paymentId: payment.paymentId,
+      merchantId: merchant.merchantId,
+      amount: '100000',
+      reason: 'customer changed their mind',
+      requestedByType: 'MERCHANT',
+    });
+
+    // Recorded and audited, but explicitly not executed: the provider contract
+    // does not yet say how the fees behave on a reversal.
+    expect(result.status).toBe('BLOCKED_POLICY_UNDEFINED');
+    expect(result.blockedReason).toContain('policy');
+
+    // No money moved.
+    const outbox = await harness.db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM system.outbox_events
+        WHERE event_type = 'payment.refunded'`,
+    );
+    expect(outbox.rows[0]?.count).toBe('0');
+  });
+
+  it('stores the fee components separately so a policy can be applied later', async () => {
+    harness = await createHarness();
+    const { merchant, payment } = await verifiedPayment(harness);
+
+    await requestRefund(harness.db, {
+      paymentId: payment.paymentId,
+      merchantId: merchant.merchantId,
+      amount: '500000',
+      reason: 'partial',
+      requestedByType: 'MERCHANT',
+    });
+
+    const row = await harness.db.query<{
+      original_amount: string;
+      original_platform_fee: string;
+      original_provider_fee: string | null;
+      platform_fee_reversal: string | null;
+    }>(
+      `SELECT original_amount::text, original_platform_fee::text,
+              original_provider_fee::text, platform_fee_reversal::text
+         FROM core.refunds WHERE payment_id = $1`,
+      [payment.paymentId],
+    );
+    expect(row.rows[0]?.original_amount).toBe('1150000');
+    expect(row.rows[0]?.original_platform_fee).toBe('150000');
+    expect(row.rows[0]?.original_provider_fee).toBe('103500');
+    // Undecided, which is exactly why execution is blocked.
+    expect(row.rows[0]?.platform_fee_reversal).toBeNull();
+  });
+
+  it('never lets the total refunded exceed what was collected', async () => {
+    harness = await createHarness();
+    const { merchant, payment } = await verifiedPayment(harness);
+
+    await requestRefund(harness.db, {
+      paymentId: payment.paymentId,
+      merchantId: merchant.merchantId,
+      amount: '1000000',
+      reason: 'first',
+      requestedByType: 'MERCHANT',
+    });
+
+    // 1,000,000 + 200,000 > 1,150,000 collected.
+    await expect(
+      requestRefund(harness.db, {
+        paymentId: payment.paymentId,
+        merchantId: merchant.merchantId,
+        amount: '200000',
+        reason: 'second',
+        requestedByType: 'MERCHANT',
+      }),
+    ).rejects.toMatchObject({ code: 'REFUND_EXCEEDS_PAYMENT' });
+  });
+
+  it('is defended by the database even if the application check is bypassed', async () => {
+    harness = await createHarness();
+    const { merchant, payment } = await verifiedPayment(harness);
+
+    // Insert straight past the use case, as a buggy code path would.
+    await expect(
+      harness.db.query(
+        `INSERT INTO core.refunds
+           (id, payment_id, merchant_id, original_amount, original_platform_fee,
+            requested_amount, status, reason, requested_by_type)
+         VALUES ($1,$2,$3,'1150000','150000','9999999','REQUESTED','bypass','ADMIN')`,
+        [randomUUID(), payment.paymentId, merchant.merchantId],
+      ),
+    ).rejects.toThrow(/exceeds the collected amount/);
+  });
+
+  it('reports how much is still refundable', async () => {
+    harness = await createHarness();
+    const { merchant, payment } = await verifiedPayment(harness);
+
+    expect(await refundableAmount(harness.db, payment.paymentId)).toBe('1150000');
+
+    await requestRefund(harness.db, {
+      paymentId: payment.paymentId,
+      merchantId: merchant.merchantId,
+      amount: '150000',
+      reason: 'partial',
+      requestedByType: 'MERCHANT',
+    });
+    expect(await refundableAmount(harness.db, payment.paymentId)).toBe('1000000');
+  });
+
+  it("will not let one merchant refund another's payment", async () => {
+    harness = await createHarness();
+    const { payment } = await verifiedPayment(harness);
+    const other = await createMerchant(harness.db, { name: 'Other' });
+
+    await expect(
+      requestRefund(harness.db, {
+        paymentId: payment.paymentId,
+        merchantId: other.merchantId,
+        amount: '1000',
+        reason: 'not mine',
+        requestedByType: 'MERCHANT',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 });
