@@ -1,0 +1,925 @@
+/**
+ * The payout pipeline — SPEC 117.51 to 117.55.
+ *
+ *   QueuePayoutUseCase            AVAILABLE -> SETTLING, payout row created
+ *   LockPayoutRateUseCase         immutable rate snapshot + GRAM amount
+ *   ReservePayoutLiquidityUseCase full-amount reservation or WAITING_LIQUIDITY
+ *   BroadcastPayoutUseCase        send on TON, persist tx hash
+ *   ReconcilePayoutUseCase        resolve UNKNOWN from the chain, never blindly
+ *
+ * SPEC 124.168/124.169:
+ *   NO FULL LIQUIDITY   -> NO PAYOUT (wait, never auto-buy)
+ *   NO CHAIN CONFIRMATION -> NO SETTLED
+ * SPEC 124.170: UNKNOWN -> RECONCILE, never blind retry.
+ */
+
+import { randomUUID } from 'node:crypto';
+import type { Database, TransactionContext } from '../../../database/src/client.ts';
+import { Money, Rate } from '../../../money/src/index.ts';
+import { post } from '../../../ledger/src/ledger-service.ts';
+import { getOrCreateMerchantAccount, getSystemAccountId } from '../../../ledger/src/accounts.ts';
+import { enqueue } from '../outbox.ts';
+import { recordTransition, transitionState } from '../transitions.ts';
+import { sha256Hex } from '../../../crypto/src/index.ts';
+import type { Config } from '../../../config/src/index.ts';
+import type { RateProvider } from '../ports/rate-provider.ts';
+import type { BlockchainPayoutPort, BroadcastResult } from '../ports/blockchain.ts';
+import {
+  PayoutError,
+  FinancialError,
+  NotFoundError,
+  ErrorCodes,
+  ValidationError,
+} from '../../../errors/src/index.ts';
+
+// ---------------------------------------------------------------------------
+// 1. Queue a payout
+// ---------------------------------------------------------------------------
+
+export interface QueuePayoutResult {
+  payoutId: string | null;
+  amountToman: string | null;
+  reason?: string;
+}
+
+/**
+ * Move a merchant's AVAILABLE liability into SETTLING and create the payout.
+ *
+ * The partial unique index `ux_payouts_merchant_in_flight` guarantees a merchant
+ * can only have one in-flight payout, which is what closes the double-spend
+ * race described in SPEC 117.89.
+ */
+export async function queuePayoutForMerchant(
+  db: Database,
+  config: Config,
+  merchantId: string,
+): Promise<QueuePayoutResult> {
+  return db.transaction(
+    async (tx) => {
+      const merchantRes = await tx.query<{ id: string; status: string; auto_payout: boolean }>(
+        'SELECT id, status, auto_payout FROM core.merchants WHERE id = $1 FOR UPDATE',
+        [merchantId],
+      );
+      const merchant = merchantRes.rows[0];
+      if (!merchant) throw new NotFoundError('merchant', merchantId);
+      if (merchant.status !== 'ACTIVE') {
+        return { payoutId: null, amountToman: null, reason: 'MERCHANT_NOT_ACTIVE' };
+      }
+      if (!merchant.auto_payout || !config.settlement.autoPayoutEnabled) {
+        return { payoutId: null, amountToman: null, reason: 'AUTO_PAYOUT_DISABLED' };
+      }
+
+      // Already has a payout in flight — nothing to do.
+      const inFlight = await tx.query(
+        `SELECT 1 FROM finance.payouts
+          WHERE merchant_id = $1
+            AND status IN ('CREATED','QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','BROADCASTED','UNKNOWN')
+          LIMIT 1`,
+        [merchantId],
+      );
+      if (inFlight.rowCount > 0) {
+        return { payoutId: null, amountToman: null, reason: 'PAYOUT_ALREADY_IN_FLIGHT' };
+      }
+
+      // SPEC 1256 — wallet must be verified and ACTIVE before any payout.
+      const walletRes = await tx.query<{
+        id: string;
+        address: string;
+        network: string;
+        status: string;
+        hold_until: string | null;
+      }>(
+        `SELECT id, address, network, status, hold_until
+           FROM core.wallets
+          WHERE merchant_id = $1 AND status = 'ACTIVE'
+          FOR UPDATE`,
+        [merchantId],
+      );
+      const wallet = walletRes.rows[0];
+      if (!wallet) {
+        return { payoutId: null, amountToman: null, reason: ErrorCodes.WALLET_NOT_ACTIVE };
+      }
+      if (wallet.hold_until && new Date(wallet.hold_until) > new Date()) {
+        return { payoutId: null, amountToman: null, reason: 'WALLET_SECURITY_HOLD' };
+      }
+
+      const merchantAccount = await getOrCreateMerchantAccount(tx, merchantId);
+      const balanceRes = await tx.query<{ available: string }>(
+        `SELECT COALESCE(available,0)::text AS available
+           FROM finance.balances WHERE account_id = $1 FOR UPDATE`,
+        [merchantAccount],
+      );
+      const available = Money.toman(balanceRes.rows[0]?.available ?? '0');
+
+      if (available.atomic < config.settlement.minPayoutToman) {
+        return { payoutId: null, amountToman: null, reason: 'BELOW_MINIMUM' };
+      }
+      // Cap a single payout so one huge settlement cannot drain the treasury.
+      const amount =
+        available.atomic > config.settlement.maxPayoutToman
+          ? Money.toman(config.settlement.maxPayoutToman)
+          : available;
+
+      const payoutId = randomUUID();
+      await tx.query(
+        `INSERT INTO finance.payouts
+            (id, merchant_id, wallet_id, amount_toman, status,
+             destination_address, destination_network)
+         VALUES ($1,$2,$3,$4,'CREATED',$5,$6)`,
+        [payoutId, merchantId, wallet.id, amount.toAtomicString(), wallet.address, wallet.network],
+      );
+
+      // Which released payments this payout settles, oldest first.
+      //
+      // The per-payment figure must be scoped to the MERCHANT'S OWN liability
+      // account: a payment journal also touches the provider clearing asset and
+      // platform revenue, and summing those in would net to zero.
+      await tx.query(
+        `INSERT INTO finance.payout_items(payout_id, payment_id, amount_toman)
+         SELECT $1, src.payment_id, src.amount
+           FROM (
+             SELECT p.id AS payment_id,
+                    p.released_at,
+                    COALESCE((SELECT SUM(e.credit - e.debit)
+                                FROM finance.journal_entries e
+                                JOIN finance.journals j ON j.id = e.journal_id
+                               WHERE j.reference_type = 'PAYMENT'
+                                 AND j.reference_id = p.id
+                                 AND e.account_id = $3
+                                 AND e.bucket = 'AVAILABLE'), 0) AS amount
+               FROM core.payments p
+              WHERE p.merchant_id = $2
+                AND p.status = 'RELEASED'
+                AND NOT EXISTS (
+                      SELECT 1 FROM finance.payout_items pi WHERE pi.payment_id = p.id)
+           ) src
+          WHERE src.amount > 0
+          ORDER BY src.released_at ASC
+         ON CONFLICT DO NOTHING`,
+        [payoutId, merchantId, merchantAccount],
+      );
+
+      // AVAILABLE -> SETTLING on the merchant's liability account.
+      const posting = await post(tx, {
+        referenceType: 'PAYOUT',
+        referenceId: payoutId,
+        operationId: `payout:queued:${payoutId}`,
+        description: 'available liability moved to settling',
+        lines: [
+          { accountId: merchantAccount, debit: amount, bucket: 'AVAILABLE' },
+          { accountId: merchantAccount, credit: amount, bucket: 'SETTLING' },
+        ],
+      });
+      if (!posting.created) {
+        throw new FinancialError(ErrorCodes.DUPLICATE_OPERATION, 'payout queue posting already exists');
+      }
+
+      await transitionState(tx, {
+        table: 'finance.payouts',
+        entityType: 'PAYOUT',
+        entityId: payoutId,
+        fromState: 'CREATED',
+        toState: 'QUEUED',
+        event: 'QUEUE',
+        actorType: 'WORKER',
+      });
+
+      await enqueue(tx, {
+        eventType: 'payout.queued',
+        aggregateType: 'PAYOUT',
+        aggregateId: payoutId,
+        payload: {
+          payout_id: payoutId,
+          merchant_id: merchantId,
+          amount_toman: amount.toAtomicString(),
+        },
+      });
+
+      return { payoutId, amountToman: amount.toAtomicString() };
+    },
+    { isolation: 'SERIALIZABLE', retries: 3 },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 2. Lock the rate
+// ---------------------------------------------------------------------------
+
+export async function lockPayoutRate(
+  db: Database,
+  config: Config,
+  rateProvider: RateProvider,
+  payoutId: string,
+): Promise<{ gramAmount: string; rate: string }> {
+  // The quote is fetched OUTSIDE the transaction: no HTTP inside a financial
+  // transaction (SPEC 4347).
+  const quote = await rateProvider.getQuote('TOMAN', 'GRAM');
+
+  return db.transaction(async (tx) => {
+    const r = await tx.query<{ id: string; status: string; amount_toman: string }>(
+      `SELECT id, status, amount_toman::text FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+      [payoutId],
+    );
+    const payout = r.rows[0];
+    if (!payout) throw new NotFoundError('payout', payoutId);
+    if (payout.status !== 'QUEUED' && payout.status !== 'WAITING_LIQUIDITY') {
+      throw new PayoutError('PAYOUT_NOT_LOCKABLE', `payout is ${payout.status}`);
+    }
+
+    if (quote.expiresAt <= new Date()) {
+      throw new PayoutError(ErrorCodes.RATE_QUOTE_EXPIRED, 'rate quote expired before it could be locked', {
+        retryable: true,
+      });
+    }
+
+    const rate = Rate.of(quote.tomanPerGram, quote.source);
+    const amountToman = Money.toman(payout.amount_toman);
+    // FLOOR: never pay out more GRAM than the Toman liability covers.
+    const gramAmount = rate.tomanToGram(amountToman, 'FLOOR');
+
+    if (!gramAmount.isPositive()) {
+      throw new PayoutError('PAYOUT_AMOUNT_TOO_SMALL', 'payout converts to zero GRAM');
+    }
+
+    // Persist the quote so the snapshot is auditable.
+    await tx.query(
+      `INSERT INTO finance.rate_quotes(id, base_currency, quote_asset, rate, source, expires_at)
+       VALUES ($1,'TOMAN','GRAM',$2,$3,$4) ON CONFLICT DO NOTHING`,
+      [quote.id, rate.toDbString(), quote.source, quote.expiresAt.toISOString()],
+    );
+
+    await transitionState(tx, {
+      table: 'finance.payouts',
+      entityType: 'PAYOUT',
+      entityId: payoutId,
+      fromState: ['QUEUED', 'WAITING_LIQUIDITY'],
+      toState: 'RATE_LOCKED',
+      event: 'LOCK_RATE',
+      extraSet: {
+        rate: rate.toDbString(),
+        rate_source: quote.source,
+        quote_id: quote.id,
+        gram_amount_atomic: gramAmount.toAtomicString(),
+        rate_locked_at: new Date().toISOString(),
+        quote_expires_at: quote.expiresAt.toISOString(),
+      },
+      actorType: 'WORKER',
+    });
+
+    return { gramAmount: gramAmount.toAtomicString(), rate: rate.toDbString() };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 3. Reserve liquidity
+// ---------------------------------------------------------------------------
+
+export interface ReserveResult {
+  reserved: boolean;
+  reservationId?: string;
+  required?: string;
+  spendable?: string;
+}
+
+/**
+ * Reserve the full GRAM amount, or park the payout in WAITING_LIQUIDITY.
+ *
+ * SPEC 118.59: Spendable = confirmed balance - active reservations - safety reserve.
+ * SPEC 119.25 / 124.169: a shortage means WAIT, never auto-buy.
+ * Partial reservation is not permitted — either the whole amount is available or
+ * the payout waits.
+ */
+export async function reservePayoutLiquidity(
+  db: Database,
+  config: Config,
+  payoutId: string,
+): Promise<ReserveResult> {
+  return db.transaction(
+    async (tx) => {
+      const r = await tx.query<{
+        id: string;
+        status: string;
+        gram_amount_atomic: string | null;
+        merchant_id: string;
+      }>(
+        `SELECT id, status, gram_amount_atomic::text, merchant_id
+           FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      const payout = r.rows[0];
+      if (!payout) throw new NotFoundError('payout', payoutId);
+      if (payout.status !== 'RATE_LOCKED') {
+        throw new PayoutError('PAYOUT_NOT_RESERVABLE', `payout is ${payout.status}`);
+      }
+      if (!payout.gram_amount_atomic) {
+        throw new PayoutError('PAYOUT_RATE_NOT_LOCKED', 'payout has no locked GRAM amount');
+      }
+
+      const required = Money.gram(payout.gram_amount_atomic);
+
+      // Lock the treasury row so a concurrent reservation cannot double-spend it.
+      const treasuryRes = await tx.query<{
+        id: string;
+        confirmed_balance_atomic: string;
+        safety_reserve_atomic: string;
+        status: string;
+      }>(
+        `SELECT id, confirmed_balance_atomic::text, safety_reserve_atomic::text, status
+           FROM finance.treasury_accounts
+          WHERE asset = 'GRAM' AND network = $1 AND status = 'ACTIVE'
+          ORDER BY created_at ASC
+          LIMIT 1
+          FOR UPDATE`,
+        [config.treasury.network],
+      );
+      const treasury = treasuryRes.rows[0];
+      if (!treasury) {
+        throw new PayoutError('TREASURY_UNAVAILABLE', 'no active GRAM treasury account is configured');
+      }
+
+      const activeRes = await tx.query<{ total: string }>(
+        `SELECT COALESCE(SUM(amount_atomic),0)::text AS total
+           FROM finance.liquidity_reservations
+          WHERE treasury_account_id = $1 AND status = 'ACTIVE'`,
+        [treasury.id],
+      );
+
+      const confirmed = Money.gram(treasury.confirmed_balance_atomic);
+      const reservedAlready = Money.gram(activeRes.rows[0]?.total ?? '0');
+      const safety = Money.gram(treasury.safety_reserve_atomic);
+      const spendable = confirmed.subtract(reservedAlready).subtract(safety);
+
+      if (spendable.lt(required)) {
+        // SPEC 124.169 — wait, do not buy.
+        await transitionState(tx, {
+          table: 'finance.payouts',
+          entityType: 'PAYOUT',
+          entityId: payoutId,
+          fromState: 'RATE_LOCKED',
+          toState: 'WAITING_LIQUIDITY',
+          event: 'INSUFFICIENT_LIQUIDITY',
+          actorType: 'WORKER',
+          metadata: {
+            required: required.toAtomicString(),
+            spendable: spendable.toAtomicString(),
+          },
+        });
+        await enqueue(tx, {
+          eventType: 'payout.waiting_liquidity',
+          aggregateType: 'PAYOUT',
+          aggregateId: payoutId,
+          payload: {
+            payout_id: payoutId,
+            merchant_id: payout.merchant_id,
+            required_gram: required.toAtomicString(),
+            spendable_gram: spendable.toAtomicString(),
+          },
+        });
+        return {
+          reserved: false,
+          required: required.toAtomicString(),
+          spendable: spendable.toAtomicString(),
+        };
+      }
+
+      const reservationId = randomUUID();
+      const expiresAt = new Date(Date.now() + config.settlement.reservationTtlSeconds * 1000);
+      const inserted = await tx.query<{ id: string }>(
+        `INSERT INTO finance.liquidity_reservations
+            (id, payout_id, treasury_account_id, amount_atomic, status, expires_at)
+         VALUES ($1,$2,$3,$4,'ACTIVE',$5)
+         ON CONFLICT (payout_id) WHERE status = 'ACTIVE' DO NOTHING
+         RETURNING id`,
+        [reservationId, payoutId, treasury.id, required.toAtomicString(), expiresAt.toISOString()],
+      );
+      if (inserted.rows.length === 0) {
+        throw new PayoutError('RESERVATION_EXISTS', 'an active reservation already exists for this payout');
+      }
+
+      await transitionState(tx, {
+        table: 'finance.payouts',
+        entityType: 'PAYOUT',
+        entityId: payoutId,
+        fromState: 'RATE_LOCKED',
+        toState: 'RESERVED',
+        event: 'RESERVE_LIQUIDITY',
+        extraSet: { reserved_at: new Date().toISOString() },
+        actorType: 'WORKER',
+      });
+
+      return { reserved: true, reservationId, required: required.toAtomicString() };
+    },
+    { isolation: 'SERIALIZABLE', retries: 3 },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 4. Broadcast
+// ---------------------------------------------------------------------------
+
+/**
+ * Broadcast the payout on TON.
+ *
+ * The chain call happens outside the transaction. If the RPC result is
+ * ambiguous the payout goes to UNKNOWN and is left for reconciliation — it is
+ * never re-broadcast blindly (SPEC 124.154 / 124.170).
+ */
+export async function broadcastPayout(
+  db: Database,
+  chain: BlockchainPayoutPort,
+  payoutId: string,
+): Promise<{ status: 'BROADCASTED' | 'UNKNOWN' | 'FAILED'; txHash?: string }> {
+  const prepared = await db.transaction(async (tx) => {
+    const r = await tx.query<{
+      id: string;
+      status: string;
+      gram_amount_atomic: string | null;
+      destination_address: string;
+      destination_network: string;
+      merchant_id: string;
+      attempt_count: number;
+    }>(
+      `SELECT id, status, gram_amount_atomic::text, destination_address,
+              destination_network, merchant_id, attempt_count
+         FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+      [payoutId],
+    );
+    const payout = r.rows[0];
+    if (!payout) throw new NotFoundError('payout', payoutId);
+    if (payout.status !== 'RESERVED') {
+      throw new PayoutError('PAYOUT_NOT_BROADCASTABLE', `payout is ${payout.status}`);
+    }
+
+    const reservation = await tx.query<{ id: string }>(
+      `SELECT id FROM finance.liquidity_reservations
+        WHERE payout_id = $1 AND status = 'ACTIVE' AND expires_at > NOW()`,
+      [payoutId],
+    );
+    if (reservation.rows.length === 0) {
+      throw new PayoutError('RESERVATION_MISSING_OR_EXPIRED', 'no valid liquidity reservation');
+    }
+
+    await tx.query(
+      'UPDATE finance.payouts SET attempt_count = attempt_count + 1, updated_at = NOW() WHERE id = $1',
+      [payoutId],
+    );
+
+    return {
+      amount: Money.gram(payout.gram_amount_atomic as string),
+      destination: payout.destination_address,
+      network: payout.destination_network,
+      merchantId: payout.merchant_id,
+    };
+  });
+
+  let result: BroadcastResult;
+  try {
+    result = await chain.send({
+      // A deterministic idempotency key so a retry at the adapter level cannot
+      // produce a second on-chain transfer.
+      idempotencyKey: `payout:${payoutId}`,
+      to: prepared.destination,
+      amountAtomic: prepared.amount.atomic,
+      network: prepared.network,
+    });
+  } catch (e) {
+    // The send may or may not have reached the network: treat as UNKNOWN.
+    await markUnknown(db, payoutId, e instanceof Error ? e.message : String(e));
+    return { status: 'UNKNOWN' };
+  }
+
+  if (result.status === 'UNKNOWN') {
+    await markUnknown(db, payoutId, result.error ?? 'adapter reported UNKNOWN');
+    return { status: 'UNKNOWN' };
+  }
+
+  if (result.status === 'REJECTED') {
+    // Definitively not sent: release the reservation and return the money.
+    await failPayout(db, payoutId, result.error ?? 'REJECTED_BY_NETWORK');
+    return { status: 'FAILED' };
+  }
+
+  await db.transaction(async (tx) => {
+    await transitionState(tx, {
+      table: 'finance.payouts',
+      entityType: 'PAYOUT',
+      entityId: payoutId,
+      fromState: 'RESERVED',
+      toState: 'BROADCASTED',
+      event: 'BROADCAST',
+      extraSet: {
+        transaction_hash: result.txHash ?? null,
+        broadcasted_at: new Date().toISOString(),
+      },
+      actorType: 'WORKER',
+    });
+    const raw = JSON.stringify(result.raw ?? {});
+    await tx.query(
+      `INSERT INTO integration.provider_evidence
+          (id, payout_id, provider, kind, raw_payload, payload_hash)
+       VALUES ($1,$2,'TON','BROADCAST',$3::jsonb,$4)`,
+      [randomUUID(), payoutId, raw, sha256Hex(raw)],
+    );
+    await enqueue(tx, {
+      eventType: 'payout.broadcasted',
+      aggregateType: 'PAYOUT',
+      aggregateId: payoutId,
+      payload: {
+        payout_id: payoutId,
+        merchant_id: prepared.merchantId,
+        tx_hash: result.txHash,
+        gram_amount: prepared.amount.toAtomicString(),
+      },
+    });
+  });
+
+  return { status: 'BROADCASTED', txHash: result.txHash };
+}
+
+async function markUnknown(db: Database, payoutId: string, reason: string): Promise<void> {
+  await db.transaction(async (tx) => {
+    await transitionState(tx, {
+      table: 'finance.payouts',
+      entityType: 'PAYOUT',
+      entityId: payoutId,
+      fromState: ['RESERVED', 'BROADCASTED'],
+      toState: 'UNKNOWN',
+      event: 'BROADCAST_UNKNOWN',
+      extraSet: { failure_code: reason.slice(0, 200) },
+      actorType: 'WORKER',
+    });
+    await tx.query(
+      `INSERT INTO system.reconciliation_exceptions
+         (id, kind, severity, entity_type, entity_id, details)
+       VALUES ($1,'UNKNOWN','HIGH','PAYOUT',$2,$3::jsonb)`,
+      [randomUUID(), payoutId, JSON.stringify({ reason })],
+    );
+    await enqueue(tx, {
+      eventType: 'payout.unknown',
+      aggregateType: 'PAYOUT',
+      aggregateId: payoutId,
+      payload: { payout_id: payoutId, reason },
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 5. Settle / fail
+// ---------------------------------------------------------------------------
+
+/**
+ * Finalise a confirmed payout.
+ * SPEC 119.47: close the merchant liability and reduce the treasury.
+ * SPEC 119.42: a second confirmation is idempotent and creates no new settlement.
+ */
+export async function settlePayout(
+  db: Database,
+  payoutId: string,
+  confirmation: { txHash: string; networkFeeAtomic?: bigint },
+): Promise<{ settled: boolean }> {
+  return db.transaction(
+    async (tx) => {
+      const r = await tx.query<{
+        id: string;
+        status: string;
+        merchant_id: string;
+        amount_toman: string;
+        gram_amount_atomic: string | null;
+      }>(
+        `SELECT id, status, merchant_id, amount_toman::text, gram_amount_atomic::text
+           FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      const payout = r.rows[0];
+      if (!payout) throw new NotFoundError('payout', payoutId);
+
+      if (payout.status === 'SETTLED') return { settled: false }; // idempotent replay
+      if (payout.status !== 'BROADCASTED' && payout.status !== 'UNKNOWN') {
+        throw new PayoutError('PAYOUT_NOT_SETTLEABLE', `payout is ${payout.status}`);
+      }
+
+      const amountToman = Money.toman(payout.amount_toman);
+      const gramAmount = Money.gram(payout.gram_amount_atomic ?? '0');
+
+      const merchantAccount = await getOrCreateMerchantAccount(tx, payout.merchant_id);
+      const treasuryAccount = await getSystemAccountId(tx, 'TREASURY_GRAM');
+      const settlementAccount = await getSystemAccountId(tx, 'SETTLEMENT_CLEARING_TOMAN');
+      const feeExpenseAccount = await getSystemAccountId(tx, 'NETWORK_FEE_EXPENSE_GRAM');
+
+      // Two balanced currency legs in one journal:
+      //   TOMAN: DR merchant liability (SETTLING)  CR settlement clearing
+      //   GRAM : DR settlement expense             CR treasury asset
+      const lines = [
+        { accountId: merchantAccount, debit: amountToman, bucket: 'SETTLING' as const },
+        { accountId: settlementAccount, credit: amountToman, bucket: 'AVAILABLE' as const },
+        { accountId: feeExpenseAccount, debit: gramAmount, bucket: 'AVAILABLE' as const },
+        { accountId: treasuryAccount, credit: gramAmount, bucket: 'AVAILABLE' as const },
+      ];
+
+      const posting = await post(tx, {
+        referenceType: 'PAYOUT',
+        referenceId: payoutId,
+        operationId: `payout:settled:${payoutId}`,
+        description: `payout settled via ${confirmation.txHash}`,
+        lines,
+      });
+      if (!posting.created) return { settled: false };
+
+      // Consume the reservation and reduce the treasury's confirmed balance.
+      await tx.query(
+        `UPDATE finance.liquidity_reservations
+            SET status = 'CONSUMED', released_at = NOW()
+          WHERE payout_id = $1 AND status = 'ACTIVE'`,
+        [payoutId],
+      );
+      await tx.query(
+        `UPDATE finance.treasury_accounts t
+            SET confirmed_balance_atomic = confirmed_balance_atomic - $2,
+                updated_at = NOW()
+           FROM finance.liquidity_reservations r
+          WHERE r.payout_id = $1 AND r.treasury_account_id = t.id`,
+        [payoutId, gramAmount.toAtomicString()],
+      );
+      await tx.query(
+        `INSERT INTO finance.treasury_transactions
+            (id, treasury_account_id, direction, asset, amount_atomic,
+             external_tx_hash, status, source, payout_id, confirmed_at)
+         SELECT $1, r.treasury_account_id, 'OUT', 'GRAM', $2, $3, 'CONFIRMED', 'PAYOUT', $4, NOW()
+           FROM finance.liquidity_reservations r
+          WHERE r.payout_id = $4
+          LIMIT 1
+         ON CONFLICT DO NOTHING`,
+        [randomUUID(), gramAmount.toAtomicString(), confirmation.txHash, payoutId],
+      );
+
+      await transitionState(tx, {
+        table: 'finance.payouts',
+        entityType: 'PAYOUT',
+        entityId: payoutId,
+        fromState: ['BROADCASTED', 'UNKNOWN'],
+        toState: 'SETTLED',
+        event: 'CONFIRM',
+        extraSet: {
+          confirmed_at: new Date().toISOString(),
+          transaction_hash: confirmation.txHash,
+          failure_code: null,
+        },
+        actorType: 'WORKER',
+      });
+
+      await enqueue(tx, {
+        eventType: 'payout.confirmed',
+        aggregateType: 'PAYOUT',
+        aggregateId: payoutId,
+        payload: {
+          payout_id: payoutId,
+          merchant_id: payout.merchant_id,
+          amount_toman: amountToman.toAtomicString(),
+          gram_amount: gramAmount.toAtomicString(),
+          tx_hash: confirmation.txHash,
+        },
+      });
+
+      return { settled: true };
+    },
+    { isolation: 'SERIALIZABLE', retries: 3 },
+  );
+}
+
+/**
+ * Fail a payout and return the money to AVAILABLE.
+ * SPEC 119.48: SETTLING -> AVAILABLE, reservation ACTIVE -> RELEASED.
+ * Only legal when we know the transfer definitively did NOT happen.
+ */
+export async function failPayout(
+  db: Database,
+  payoutId: string,
+  reason: string,
+): Promise<{ failed: boolean }> {
+  return db.transaction(
+    async (tx) => {
+      const r = await tx.query<{
+        id: string;
+        status: string;
+        merchant_id: string;
+        amount_toman: string;
+      }>(
+        `SELECT id, status, merchant_id, amount_toman::text
+           FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+        [payoutId],
+      );
+      const payout = r.rows[0];
+      if (!payout) throw new NotFoundError('payout', payoutId);
+      if (payout.status === 'FAILED') return { failed: false };
+      if (payout.status === 'SETTLED') {
+        throw new PayoutError('PAYOUT_ALREADY_SETTLED', 'a settled payout cannot be failed');
+      }
+      if (payout.status === 'UNKNOWN') {
+        // SPEC 124.170: an UNKNOWN payout must be resolved by reconciliation.
+        throw new PayoutError(
+          ErrorCodes.PAYOUT_UNKNOWN_NO_BLIND_RETRY,
+          'an UNKNOWN payout must be resolved by chain reconciliation, not failed blindly',
+        );
+      }
+
+      const amount = Money.toman(payout.amount_toman);
+      const merchantAccount = await getOrCreateMerchantAccount(tx, payout.merchant_id);
+
+      const posting = await post(tx, {
+        referenceType: 'PAYOUT',
+        referenceId: payoutId,
+        operationId: `payout:failed:${payoutId}`,
+        description: `payout failed: ${reason}`,
+        lines: [
+          { accountId: merchantAccount, debit: amount, bucket: 'SETTLING' },
+          { accountId: merchantAccount, credit: amount, bucket: 'AVAILABLE' },
+        ],
+      });
+      if (!posting.created) return { failed: false };
+
+      await tx.query(
+        `UPDATE finance.liquidity_reservations
+            SET status = 'RELEASED', released_at = NOW()
+          WHERE payout_id = $1 AND status = 'ACTIVE'`,
+        [payoutId],
+      );
+
+      await transitionState(tx, {
+        table: 'finance.payouts',
+        entityType: 'PAYOUT',
+        entityId: payoutId,
+        fromState: ['CREATED', 'QUEUED', 'RATE_LOCKED', 'WAITING_LIQUIDITY', 'RESERVED', 'BROADCASTED'],
+        toState: 'FAILED',
+        event: 'FAIL',
+        extraSet: { failure_code: reason.slice(0, 200) },
+        actorType: 'WORKER',
+      });
+
+      await enqueue(tx, {
+        eventType: 'payout.failed',
+        aggregateType: 'PAYOUT',
+        aggregateId: payoutId,
+        payload: { payout_id: payoutId, merchant_id: payout.merchant_id, reason },
+      });
+
+      return { failed: true };
+    },
+    { isolation: 'SERIALIZABLE', retries: 3 },
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Reconcile
+// ---------------------------------------------------------------------------
+
+/**
+ * ReconcilePayoutUseCase — SPEC 117.55 / 124.154.
+ * Query the chain for the real outcome of an UNKNOWN or BROADCASTED payout and
+ * resolve it. This is the ONLY path out of UNKNOWN.
+ */
+export async function reconcilePayout(
+  db: Database,
+  chain: BlockchainPayoutPort,
+  payoutId: string,
+): Promise<{ resolution: 'SETTLED' | 'FAILED' | 'STILL_UNKNOWN' }> {
+  const r = await db.query<{
+    id: string;
+    status: string;
+    transaction_hash: string | null;
+    destination_address: string;
+    gram_amount_atomic: string | null;
+  }>(
+    `SELECT id, status, transaction_hash, destination_address, gram_amount_atomic::text
+       FROM finance.payouts WHERE id = $1`,
+    [payoutId],
+  );
+  const payout = r.rows[0];
+  if (!payout) throw new NotFoundError('payout', payoutId);
+  if (payout.status !== 'UNKNOWN' && payout.status !== 'BROADCASTED') {
+    return { resolution: 'STILL_UNKNOWN' };
+  }
+
+  const status = await chain.getTransferStatus({
+    idempotencyKey: `payout:${payoutId}`,
+    txHash: payout.transaction_hash,
+    to: payout.destination_address,
+    amountAtomic: BigInt(payout.gram_amount_atomic ?? '0'),
+  });
+
+  if (status.state === 'CONFIRMED' && status.txHash) {
+    await settlePayout(db, payoutId, { txHash: status.txHash });
+    await resolveExceptions(db, payoutId);
+    return { resolution: 'SETTLED' };
+  }
+
+  if (status.state === 'NOT_FOUND') {
+    // The chain has no record of it: safe to return the funds.
+    await db.transaction(async (tx) => {
+      await tx.query(
+        `UPDATE finance.payouts SET status = 'RESERVED', updated_at = NOW()
+          WHERE id = $1 AND status = 'UNKNOWN'`,
+        [payoutId],
+      );
+    });
+    await failPayout(db, payoutId, 'RECONCILED_NOT_FOUND_ON_CHAIN');
+    await resolveExceptions(db, payoutId);
+    return { resolution: 'FAILED' };
+  }
+
+  return { resolution: 'STILL_UNKNOWN' };
+}
+
+async function resolveExceptions(db: Database, payoutId: string): Promise<void> {
+  await db.query(
+    `UPDATE system.reconciliation_exceptions
+        SET status = 'RESOLVED', resolved_at = NOW()
+      WHERE entity_type = 'PAYOUT' AND entity_id = $1 AND status <> 'RESOLVED'`,
+    [payoutId],
+  );
+}
+
+/** SPEC 118.60 — expire stale reservations so liquidity is not locked forever. */
+export async function expireStaleReservations(db: Database): Promise<number> {
+  return db.transaction(async (tx) => {
+    const expired = await tx.query<{ payout_id: string }>(
+      `UPDATE finance.liquidity_reservations
+          SET status = 'EXPIRED', released_at = NOW()
+        WHERE status = 'ACTIVE' AND expires_at < NOW()
+        RETURNING payout_id`,
+    );
+    for (const row of expired.rows) {
+      // A payout whose reservation lapsed before broadcast goes back to the queue.
+      await tx.query(
+        `UPDATE finance.payouts
+            SET status = 'RATE_LOCKED', reserved_at = NULL, updated_at = NOW()
+          WHERE id = $1 AND status = 'RESERVED'`,
+        [row.payout_id],
+      );
+    }
+    return expired.rowCount;
+  });
+}
+
+/** Manual, owner-only treasury funding (SPEC 119.22 / 104009). */
+export async function recordManualTreasuryFunding(
+  db: Database,
+  params: { treasuryAccountId: string; amountAtomic: bigint; txHash: string; actorId?: string },
+): Promise<{ recorded: boolean }> {
+  if (params.amountAtomic <= 0n) {
+    throw new ValidationError('INVALID_FUNDING_AMOUNT', 'funding amount must be positive');
+  }
+  return db.transaction(async (tx) => {
+    const amount = Money.gram(params.amountAtomic);
+
+    const inserted = await tx.query<{ id: string }>(
+      `INSERT INTO finance.treasury_transactions
+          (id, treasury_account_id, direction, asset, amount_atomic,
+           external_tx_hash, status, source, detected_at, confirmed_at)
+       VALUES ($1,$2,'IN','GRAM',$3,$4,'CONFIRMED','MANUAL',NOW(),NOW())
+       ON CONFLICT (external_tx_hash) WHERE external_tx_hash IS NOT NULL DO NOTHING
+       RETURNING id`,
+      [randomUUID(), params.treasuryAccountId, amount.toAtomicString(), params.txHash],
+    );
+    if (inserted.rows.length === 0) return { recorded: false };
+
+    await tx.query(
+      `UPDATE finance.treasury_accounts
+          SET confirmed_balance_atomic = confirmed_balance_atomic + $2, updated_at = NOW()
+        WHERE id = $1`,
+      [params.treasuryAccountId, amount.toAtomicString()],
+    );
+
+    const treasuryAccount = await getSystemAccountId(tx, 'TREASURY_GRAM');
+    const equityAccount = await getSystemAccountId(tx, 'TREASURY_FUNDING_EQUITY');
+    await post(tx, {
+      referenceType: 'TREASURY',
+      referenceId: params.treasuryAccountId,
+      operationId: `treasury:funded:${params.txHash}`,
+      description: 'manual owner treasury funding',
+      lines: [
+        { accountId: treasuryAccount, debit: amount },
+        { accountId: equityAccount, credit: amount },
+      ],
+    });
+
+    await tx.query(
+      `INSERT INTO audit.audit_logs(id, actor_type, actor_id, action, resource_type, resource_id, reason, metadata)
+       VALUES ($1,'ADMIN',$2,'TREASURY_FUNDED','TREASURY',$3,'manual funding',$4::jsonb)`,
+      [
+        randomUUID(),
+        params.actorId ?? null,
+        params.treasuryAccountId,
+        JSON.stringify({ amount: amount.toAtomicString(), tx_hash: params.txHash }),
+      ],
+    );
+
+    await enqueue(tx, {
+      eventType: 'treasury.funded',
+      aggregateType: 'TREASURY',
+      aggregateId: params.treasuryAccountId,
+      payload: { amount: amount.toAtomicString(), tx_hash: params.txHash },
+    });
+
+    return { recorded: true };
+  });
+}
