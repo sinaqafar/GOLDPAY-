@@ -234,3 +234,16 @@ CREATE TABLE core.webhook_endpoints (
 );
 
 CREATE INDEX ix_webhook_endpoints_merchant ON core.webhook_endpoints(merchant_id);
+
+-- SPEC 03: bot conversation state is persisted, never held in process memory,
+-- so a restart or a second bot instance cannot lose or corrupt it.
+CREATE TABLE core.bot_conversations (
+    user_id     UUID PRIMARY KEY REFERENCES core.users(id) ON DELETE RESTRICT,
+    state       TEXT NOT NULL,
+    data        JSONB NOT NULL DEFAULT '{}'::jsonb,
+    expires_at  TIMESTAMPTZ NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX ix_bot_conversations_expiry ON core.bot_conversations(expires_at);
