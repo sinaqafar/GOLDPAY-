@@ -21,6 +21,9 @@ import type { PaymentProviderPort } from './ports/payment-provider.ts';
 import type { BlockchainPayoutPort } from './ports/blockchain.ts';
 import type { RateProvider } from './ports/rate-provider.ts';
 import type { SignerPort } from './ports/signer.ts';
+import type { QueuePort } from './ports/queue.ts';
+import { InMemoryQueue } from '../../queue/src/in-memory-queue.ts';
+import { BullMqQueue } from '../../queue/src/bullmq-queue.ts';
 
 export interface Container {
   config: Config;
@@ -30,6 +33,7 @@ export interface Container {
   chain: BlockchainPayoutPort;
   rates: RateProvider;
   signer: SignerPort;
+  queue: QueuePort;
   shutdown(): Promise<void>;
 }
 
@@ -66,6 +70,7 @@ export async function createContainer(
 
   const rates = buildRateProvider(config, options.env ?? process.env);
   const signer = buildSigner(config, options.env ?? process.env);
+  const queue = buildQueue(config, options.env ?? process.env);
 
   logger.info('container.ready', {
     env: config.app.env,
@@ -83,7 +88,9 @@ export async function createContainer(
     chain,
     rates,
     signer,
+    queue,
     async shutdown() {
+      await queue.close();
       await db.close();
     },
   };
@@ -174,4 +181,37 @@ function buildSigner(config: Config, env: NodeJS.ProcessEnv): SignerPort {
   }
 
   return new StubSigner(config.ton, { isProduction: false });
+}
+
+/**
+ * Choose the queue.
+ *
+ * BullMQ over Redis is the production implementation; the in-memory queue is
+ * for tests and single-process development and cannot survive a restart, so
+ * production refuses it.
+ *
+ * Either way the queue only ever carries identifiers. PostgreSQL remains the
+ * financial source of truth, so a lost or replayed job cannot corrupt state
+ * (SPEC 121.67).
+ */
+function buildQueue(config: Config, env: NodeJS.ProcessEnv): QueuePort {
+  const redisUrl = env['REDIS_URL'];
+
+  if (redisUrl) {
+    return new BullMqQueue({
+      redisUrl,
+      prefix: env['QUEUE_PREFIX'] ?? `gram:${config.app.env}`,
+      defaultAttempts: Number(env['QUEUE_MAX_ATTEMPTS'] ?? 5),
+      defaultBackoffMs: Number(env['QUEUE_BACKOFF_MS'] ?? 10_000),
+    });
+  }
+
+  if (config.app.isProduction) {
+    throw new ConfigError(
+      'REDIS_REQUIRED',
+      'production requires REDIS_URL; an in-memory queue does not survive a restart',
+    );
+  }
+
+  return new InMemoryQueue();
 }

@@ -1,0 +1,7 @@
+{
+  "name": "@gram/queue",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/in-memory-queue.ts"
+}

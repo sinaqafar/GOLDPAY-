@@ -30,6 +30,7 @@ function container(h: Harness) {
     chain: h.chain,
     rates: h.rates,
     signer: h.signer,
+    queue: h.queue,
     shutdown: async () => {},
   };
 }
