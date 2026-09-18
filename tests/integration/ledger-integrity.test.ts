@@ -712,3 +712,143 @@ describe('per-merchant fee mode (SPEC 2386)', () => {
     expect(stored.rows[0]?.customer_total_amount).toBe('1150000');
   });
 });
+
+describe('provider fee: expected vs actual (SPEC 71.13)', () => {
+  it('records the config estimate when the provider reports no fee', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'MERCHANT' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: '1000000',
+        providerFeeAmount: null,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+
+    const row = await db.query<{
+      provider_fee_expected: string;
+      provider_fee_actual: string | null;
+      provider_fee_status: string;
+      provider_fee_source: string;
+    }>(
+      `SELECT provider_fee_expected::text, provider_fee_actual::text,
+              provider_fee_status, provider_fee_source
+         FROM core.payments WHERE invoice_id = $1`,
+      [invoice.invoiceId],
+    );
+    // 9% of 1,000,000, CEIL.
+    expect(row.rows[0]?.provider_fee_expected).toBe('90000');
+    expect(row.rows[0]?.provider_fee_actual).toBeNull();
+    expect(row.rows[0]?.provider_fee_status).toBe('CONFIG_ESTIMATED');
+    expect(row.rows[0]?.provider_fee_source).toBe('CONFIG');
+  });
+
+  it('marks the fee confirmed when the provider agrees', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'MERCHANT' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: '1000000',
+        providerFeeAmount: '90000',
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+
+    const row = await db.query<{ provider_fee_status: string; provider_fee_difference: string }>(
+      `SELECT provider_fee_status, provider_fee_difference::text
+         FROM core.payments WHERE invoice_id = $1`,
+      [invoice.invoiceId],
+    );
+    expect(row.rows[0]?.provider_fee_status).toBe('PROVIDER_CONFIRMED');
+    expect(row.rows[0]?.provider_fee_difference).toBe('0');
+  });
+
+  it('flags a divergence and raises a reconciliation exception', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'MERCHANT' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    // The provider actually took 8.7%, not the 9% we expected.
+    const result = await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: '1000000',
+        providerFeeAmount: '87000',
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    // The payment itself still succeeds — the money moved correctly.
+    expect(result.status).toBe('VERIFIED');
+
+    const row = await db.query<{
+      provider_fee_expected: string;
+      provider_fee_actual: string;
+      provider_fee_difference: string;
+      provider_fee_status: string;
+    }>(
+      `SELECT provider_fee_expected::text, provider_fee_actual::text,
+              provider_fee_difference::text, provider_fee_status
+         FROM core.payments WHERE invoice_id = $1`,
+      [invoice.invoiceId],
+    );
+    expect(row.rows[0]?.provider_fee_expected).toBe('90000');
+    expect(row.rows[0]?.provider_fee_actual).toBe('87000');
+    expect(row.rows[0]?.provider_fee_difference).toBe('-3000');
+    expect(row.rows[0]?.provider_fee_status).toBe('MISMATCH');
+
+    const exception = await db.query<{ details: Record<string, unknown> }>(
+      `SELECT details FROM system.reconciliation_exceptions
+        WHERE entity_type = 'PAYMENT' AND status = 'OPEN'`,
+    );
+    expect(exception.rows[0]?.details['reason']).toBe('PROVIDER_FEE_MISMATCH');
+
+    // The ledger books the ACTUAL cost, so margin is not overstated. Expense
+    // accounts carry no projection row by design — they are reported by
+    // aggregating the journal — so read the entries directly.
+    const expense = await db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(e.debit - e.credit), 0)::text AS total
+         FROM finance.journal_entries e
+         JOIN finance.ledger_accounts a ON a.id = e.account_id
+        WHERE a.account_code = 'PLATFORM_EXPENSE_TOMAN'`,
+    );
+    expect(expense.rows[0]?.total).toBe('87000');
+
+    // And the clearing asset keeps the rest: 1,000,000 − 87,000.
+    const clearing = await db.query<{ balance: string }>(
+      `SELECT b.available::text AS balance FROM finance.balances b
+         JOIN finance.ledger_accounts a ON a.id = b.account_id
+        WHERE a.account_code = 'PROVIDER_CLEARING_TOMAN'`,
+    );
+    expect(clearing.rows[0]?.balance).toBe('913000');
+  });
+});

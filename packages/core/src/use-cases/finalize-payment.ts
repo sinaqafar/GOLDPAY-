@@ -34,6 +34,11 @@ export interface ProviderEvidence {
   externalPaymentId: string;
   /** Amount the provider says was actually collected, in TOMAN atomic units. */
   paidAmount: string;
+  /**
+   * Fee the provider reports it deducted, in TOMAN atomic units, or null when
+   * the provider does not report one. Null means unknown, never zero.
+   */
+  providerFeeAmount?: string | null;
   /** Provider-side status, already normalised by the adapter. */
   status: 'PAID' | 'FAILED' | 'PENDING' | 'UNKNOWN';
   paidAt: string;
@@ -252,6 +257,29 @@ export async function finalizePayment(
 
       const releaseAt = new Date(paidAt.getTime() + config.settlement.holdHours * 3600 * 1000);
 
+      // Expected comes from config; actual comes from the provider, when it
+      // reports one at all. Booking our own estimate as though it were fact
+      // would let a silent provider rate change go unnoticed while the ledger
+      // kept reporting a margin that was never earned.
+      const providerCost = calculateProviderCost(
+        breakdown.customerTotal,
+        config.fees.providerFeePercent,
+      );
+      const expectedFee = providerCost.providerFee;
+      const reportedFee =
+        typeof evidence.providerFeeAmount === 'string' && /^\d+$/.test(evidence.providerFeeAmount)
+          ? Money.toman(evidence.providerFeeAmount)
+          : null;
+
+      // Book whichever figure we can defend: the reported one if we have it.
+      const bookedFee = reportedFee ?? expectedFee;
+      const providerFeeStatus =
+        reportedFee === null
+          ? ('CONFIG_ESTIMATED' as const)
+          : reportedFee.equals(expectedFee)
+            ? ('PROVIDER_CONFIRMED' as const)
+            : ('MISMATCH' as const);
+
       await insertPayment(tx, {
         paymentId,
         invoice,
@@ -262,7 +290,35 @@ export async function finalizePayment(
         releaseAt: releaseAt.toISOString(),
         mismatchCode: null,
         failureCode: null,
+        providerFee: {
+          expected: expectedFee.toAtomicString(),
+          actual: reportedFee?.toAtomicString() ?? null,
+          difference: reportedFee ? reportedFee.subtract(expectedFee).toAtomicString() : null,
+          status: providerFeeStatus,
+          source: reportedFee ? `${evidence.provider}_API` : 'CONFIG',
+        },
       });
+
+      // A divergence is a finance question, not a payment failure: the money
+      // moved correctly, but our cost model disagrees with the provider.
+      if (providerFeeStatus === 'MISMATCH' && reportedFee) {
+        await tx.query(
+          `INSERT INTO system.reconciliation_exceptions
+              (id, kind, severity, entity_type, entity_id, status, details)
+           VALUES ($1,'AMOUNT_MISMATCH','MEDIUM','PAYMENT',$2,'OPEN',$3::jsonb)`,
+          [
+            randomUUID(),
+            paymentId,
+            JSON.stringify({
+              reason: 'PROVIDER_FEE_MISMATCH',
+              expected: expectedFee.toAtomicString(),
+              actual: reportedFee.toAtomicString(),
+              difference: reportedFee.subtract(expectedFee).toAtomicString(),
+              provider: evidence.provider,
+            }),
+          ],
+        );
+      }
 
       // 7. Post the ledger (SPEC 119.44 — Payment Posting Matrix).
       //    DR provider clearing asset (money owed to us by the provider)
@@ -292,15 +348,11 @@ export async function finalizePayment(
       // the fee snapshot. Gross platform margin is therefore
       //   platformFee − providerFee
       // and both halves are visible in the ledger rather than netted silently.
-      const providerCost = calculateProviderCost(
-        breakdown.customerTotal,
-        config.fees.providerFeePercent,
-      );
-      if (providerCost.providerFee.isPositive()) {
+      if (bookedFee.isPositive()) {
         const expenseAccount = await getSystemAccountId(tx, 'PLATFORM_EXPENSE_TOMAN');
         lines.push(
-          { accountId: expenseAccount, debit: providerCost.providerFee, bucket: 'AVAILABLE' },
-          { accountId: clearingAccount, credit: providerCost.providerFee, bucket: 'AVAILABLE' },
+          { accountId: expenseAccount, debit: bookedFee, bucket: 'AVAILABLE' },
+          { accountId: clearingAccount, credit: bookedFee, bucket: 'AVAILABLE' },
         );
       }
 
@@ -389,14 +441,24 @@ async function insertPayment(
     releaseAt: string | null;
     mismatchCode: string | null;
     failureCode: string | null;
+    providerFee?: {
+      expected: string;
+      actual: string | null;
+      difference: string | null;
+      status: 'CONFIG_ESTIMATED' | 'PROVIDER_CONFIRMED' | 'MISMATCH' | 'UNAVAILABLE';
+      source: string;
+    };
   },
 ): Promise<void> {
   await tx.query(
     `INSERT INTO core.payments (
        id, invoice_id, merchant_id, provider, external_payment_id,
        expected_amount, verified_amount, currency, status,
-       verified_paid_at, release_at, finalized_at, mismatch_code, failure_code
-     ) VALUES ($1,$2,$3,$4,$5,$6,$7,'TOMAN',$8,$9,$10,NOW(),$11,$12)`,
+       verified_paid_at, release_at, finalized_at, mismatch_code, failure_code,
+       provider_fee_expected, provider_fee_actual, provider_fee_difference,
+       provider_fee_status, provider_fee_source, provider_fee_verified_at
+     ) VALUES ($1,$2,$3,$4,$5,$6,$7,'TOMAN',$8,$9,$10,NOW(),$11,$12,
+       $13,$14,$15,$16,$17,CASE WHEN $14::numeric IS NULL THEN NULL ELSE NOW() END)`,
     [
       params.paymentId,
       params.invoice.id,
@@ -410,6 +472,11 @@ async function insertPayment(
       params.releaseAt,
       params.mismatchCode,
       params.failureCode,
+      params.providerFee?.expected ?? null,
+      params.providerFee?.actual ?? null,
+      params.providerFee?.difference ?? null,
+      params.providerFee?.status ?? null,
+      params.providerFee?.source ?? null,
     ],
   );
 }

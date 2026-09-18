@@ -27,6 +27,8 @@ interface SandboxRecord {
   amount: string;
   status: 'PAID' | 'FAILED' | 'PENDING';
   paidAt: string | null;
+  /** Only set when a test explicitly simulates a provider-reported fee. */
+  providerFee?: string | null;
 }
 
 export class CubePayAdapter implements PaymentProviderPort {
@@ -91,6 +93,7 @@ export class CubePayAdapter implements PaymentProviderPort {
           externalPaymentId,
           status: 'UNKNOWN',
           paidAmount: null,
+          providerFeeAmount: null,
           paidAt: null,
           raw: { sandbox: true, found: false },
         };
@@ -99,6 +102,7 @@ export class CubePayAdapter implements PaymentProviderPort {
         externalPaymentId,
         status: record.status,
         paidAmount: record.status === 'PAID' ? record.amount : null,
+        providerFeeAmount: record.status === 'PAID' ? (record.providerFee ?? null) : null,
         paidAt: record.paidAt,
         raw: { sandbox: true, ...record },
       };
@@ -109,6 +113,9 @@ export class CubePayAdapter implements PaymentProviderPort {
       externalPaymentId,
       status: normaliseStatus(res['status']),
       paidAmount: typeof res['paid_amount'] === 'string' ? res['paid_amount'] : null,
+      // CubePay's documented API has no guaranteed fee field. Read it only if
+      // present; never synthesise it from our configured rate.
+      providerFeeAmount: readProviderFee(res),
       paidAt: typeof res['paid_at'] === 'string' ? res['paid_at'] : null,
       raw: res,
     };
@@ -167,6 +174,7 @@ export class CubePayAdapter implements PaymentProviderPort {
             // Deliberately UNKNOWN: the caller must re-verify via the API.
             status: 'UNKNOWN',
             paidAmount: null,
+            providerFeeAmount: null,
             paidAt: null,
             raw: body,
           }
@@ -247,6 +255,34 @@ export class CubePayAdapter implements PaymentProviderPort {
     if (!record) throw new Error(`unknown sandbox payment ${externalPaymentId}`);
     record.amount = amount;
   }
+
+  /**
+   * Simulate the provider reporting the fee it actually took, so the
+   * expected-vs-actual reconciliation path can be exercised.
+   */
+  sandboxSetProviderFee(externalPaymentId: string, fee: string | null): void {
+    const record = this.#sandbox.get(externalPaymentId);
+    if (!record) throw new Error(`unknown sandbox payment ${externalPaymentId}`);
+    record.providerFee = fee;
+  }
+}
+
+/**
+ * Read a provider-reported fee if one is present.
+ *
+ * Several plausible field names are accepted because the provider's contract
+ * is not pinned down here; anything unrecognised yields null, which means
+ * "the provider did not tell us" rather than "the fee was zero".
+ */
+function readProviderFee(res: Record<string, unknown>): string | null {
+  for (const key of ['fee', 'fee_amount', 'provider_fee', 'commission', 'commission_amount']) {
+    const value = res[key];
+    if (typeof value === 'string' && /^\d+$/.test(value)) return value;
+    if (typeof value === 'number' && Number.isSafeInteger(value) && value >= 0) {
+      return String(value);
+    }
+  }
+  return null;
 }
 
 function header(headers: Record<string, string | undefined>, name: string): string | undefined {

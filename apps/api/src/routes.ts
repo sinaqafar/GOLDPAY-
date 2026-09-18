@@ -434,6 +434,9 @@ export function buildRouter(container: Container): Router {
         provider: provider.name,
         externalPaymentId: verified.externalPaymentId,
         paidAmount: verified.paidAmount ?? '0',
+        // null when the provider does not report a fee — that is recorded as
+        // "estimated from config", never silently treated as zero.
+        providerFeeAmount: verified.providerFeeAmount,
         status: verified.status,
         paidAt: verified.paidAt ?? new Date().toISOString(),
         raw: verified.raw,
