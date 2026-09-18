@@ -12,6 +12,12 @@ import { toErrorResponse } from '../../apps/api/src/http.ts';
 import { silentLogger } from '../../packages/core/src/logger.ts';
 import { transitionState } from '../../packages/core/src/transitions.ts';
 import { StaticRateProvider } from '../../packages/core/src/adapters/rate-provider.ts';
+import {
+  RateAggregator,
+  StaticCryptoMarketProvider,
+  StaticFxProvider,
+} from '../../packages/core/src/adapters/rate-aggregator.ts';
+import type { CryptoMarketProvider } from '../../packages/core/src/ports/market-data.ts';
 import { AppError, ValidationError, FinancialError } from '../../packages/errors/src/index.ts';
 
 describe('log redaction', () => {
@@ -179,5 +185,111 @@ describe('amount ceiling', () => {
         baseAmount: '9'.repeat(40),
       }),
     ).rejects.toMatchObject({ code: 'AMOUNT_TOO_LARGE' });
+  });
+});
+
+describe('RateAggregator (GRAM/USD × USD/TOMAN)', () => {
+  const at = (iso: string) => () => new Date(iso);
+  const NOW = '2026-01-01T12:00:00.000Z';
+
+  it('derives TOMAN/GRAM from the two legs', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('2.5', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('80000', { now: at(NOW) })],
+      now: at(NOW),
+    });
+
+    const quote = await aggregator.getQuote();
+    // 2.5 USD per GRAM × 80,000 Toman per USD = 200,000 Toman per GRAM.
+    expect(quote.tomanPerGram).toBe('200000');
+    // Both legs are named, so a payout can be traced back to what priced it.
+    expect(quote.source).toBe('STATIC_CRYPTO*STATIC_FX');
+  });
+
+  it('keeps fractional precision without floating point', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('0.1', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('91234.567', { now: at(NOW) })],
+      now: at(NOW),
+    });
+    const quote = await aggregator.getQuote();
+    expect(quote.tomanPerGram).toBe('9123.4567');
+  });
+
+  it('falls over to the next source when the first fails', async () => {
+    const broken: CryptoMarketProvider = {
+      name: 'BROKEN',
+      async getGramUsd() {
+        throw new Error('upstream down');
+      },
+    };
+    const aggregator = new RateAggregator({
+      cryptoSources: [broken, new StaticCryptoMarketProvider('3', { name: 'BACKUP', now: at(NOW) })],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      now: at(NOW),
+    });
+
+    const quote = await aggregator.getQuote();
+    expect(quote.tomanPerGram).toBe('300000');
+    expect(quote.source).toContain('BACKUP');
+  });
+
+  it('refuses a stale observation rather than pricing off it', async () => {
+    // The upstream last updated an hour ago; the limit is 15 minutes.
+    const aggregator = new RateAggregator({
+      cryptoSources: [
+        new StaticCryptoMarketProvider('2', { now: at('2026-01-01T11:00:00.000Z') }),
+      ],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      maxObservationAgeSeconds: 900,
+      now: at(NOW),
+    });
+
+    // No fallback exists, so this surfaces as unavailable — which becomes
+    // WAITING_RATE upstream, never a silent stale price.
+    await expect(aggregator.getQuote()).rejects.toThrow(/no usable GRAM\/USD source/);
+  });
+
+  it('refuses a rate outside sane bounds', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('0.0000001', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('2', { now: at(NOW) })],
+      minTomanPerGram: '1000',
+      maxTomanPerGram: '10000000',
+      now: at(NOW),
+    });
+    await expect(aggregator.getQuote()).rejects.toThrow(/outside sane bounds/);
+  });
+
+  it('refuses an implausible jump from the previous quote', async () => {
+    let usd = '2';
+    const crypto: CryptoMarketProvider = {
+      name: 'MOVING',
+      async getGramUsd() {
+        return { value: usd, source: 'MOVING', observedAt: new Date(NOW) };
+      },
+    };
+    const aggregator = new RateAggregator({
+      cryptoSources: [crypto],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      maxDeviationPercent: 25,
+      now: at(NOW),
+    });
+
+    expect((await aggregator.getQuote()).tomanPerGram).toBe('200000');
+
+    // The feed suddenly halves: far more likely broken than a real move.
+    usd = '1';
+    await expect(aggregator.getQuote()).rejects.toThrow(/moved implausibly far/);
+  });
+
+  it('needs at least one source per leg', () => {
+    expect(
+      () =>
+        new RateAggregator({
+          cryptoSources: [],
+          fxSources: [new StaticFxProvider('100000')],
+        }),
+    ).toThrow(/at least one crypto source/);
   });
 });

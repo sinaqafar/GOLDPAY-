@@ -9,9 +9,12 @@
 import { createDatabase, type ConcreteDatabase } from '../../database/src/client.ts';
 import { migrate } from '../../database/src/migrator.ts';
 import { loadConfig, assertTreasuryManualOnly, type Config } from '../../config/src/index.ts';
+import { ConfigError } from '../../errors/src/index.ts';
 import { CubePayAdapter } from '../../cubepay/src/adapter.ts';
 import { TonAdapter, InMemoryTonAdapter } from '../../ton/src/adapter.ts';
 import { StaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
+import { RateAggregator } from './adapters/rate-aggregator.ts';
+import { CoinGeckoCryptoProvider, TindexFxProvider } from './adapters/market-sources.ts';
 import { createLogger, type Logger } from './logger.ts';
 import type { PaymentProviderPort } from './ports/payment-provider.ts';
 import type { BlockchainPayoutPort } from './ports/blockchain.ts';
@@ -58,13 +61,7 @@ export async function createContainer(
     ? new InMemoryTonAdapter({ autoConfirm: true })
     : new TonAdapter(config.ton);
 
-  const rateUrl = (options.env ?? process.env)['RATE_SOURCE_URL'];
-  const rates: RateProvider = rateUrl
-    ? new HttpRateProvider({ url: rateUrl, ttlSeconds: config.settlement.quoteTtlSeconds })
-    : new StaticRateProvider((options.env ?? process.env)['STATIC_TOMAN_PER_GRAM'] ?? '100000', {
-        ttlSeconds: config.settlement.quoteTtlSeconds,
-        source: 'STATIC',
-      });
+  const rates = buildRateProvider(config, options.env ?? process.env);
 
   logger.info('container.ready', {
     env: config.app.env,
@@ -85,4 +82,59 @@ export async function createContainer(
       await db.close();
     },
   };
+}
+
+/**
+ * Choose how TOMAN/GRAM is priced.
+ *
+ * Preference order:
+ *   1. RateAggregator — GRAM/USD × USD/TOMAN from real market sources. This is
+ *      the production path: two independent legs, each with failover.
+ *   2. HttpRateProvider — a single pre-computed TOMAN/GRAM endpoint.
+ *   3. StaticRateProvider — a fixed number, for tests and local development.
+ *
+ * Production refuses the static provider outright: settling real GRAM against
+ * a hardcoded rate would send the wrong amount the moment the market moved.
+ */
+function buildRateProvider(config: Config, env: NodeJS.ProcessEnv): RateProvider {
+  const fxUrl = env['FX_USD_TOMAN_URL'];
+  const ttlSeconds = config.settlement.quoteTtlSeconds;
+
+  if (fxUrl) {
+    const cryptoSources = [
+      new CoinGeckoCryptoProvider({
+        baseUrl: env['COINGECKO_BASE_URL'],
+        coinId: env['GRAM_COIN_ID'] ?? 'the-open-network',
+        apiKey: env['COINGECKO_API_KEY'] ?? null,
+      }),
+    ];
+    const fxSources = [new TindexFxProvider({ url: fxUrl, apiKey: env['FX_API_KEY'] ?? null })];
+
+    return new RateAggregator({
+      cryptoSources,
+      fxSources,
+      ttlSeconds,
+      maxObservationAgeSeconds: Number(env['RATE_MAX_AGE_SECONDS'] ?? 900),
+      minTomanPerGram: env['RATE_MIN_TOMAN_PER_GRAM'] ?? '1',
+      maxTomanPerGram: env['RATE_MAX_TOMAN_PER_GRAM'] ?? '1000000000',
+      maxDeviationPercent: Number(env['RATE_MAX_DEVIATION_PERCENT'] ?? 25),
+    });
+  }
+
+  const rateUrl = env['RATE_SOURCE_URL'];
+  if (rateUrl) {
+    return new HttpRateProvider({ url: rateUrl, ttlSeconds });
+  }
+
+  if (config.app.isProduction) {
+    throw new ConfigError(
+      'RATE_SOURCE_REQUIRED',
+      'production needs FX_USD_TOMAN_URL (aggregator) or RATE_SOURCE_URL; a static rate is not acceptable',
+    );
+  }
+
+  return new StaticRateProvider(env['STATIC_TOMAN_PER_GRAM'] ?? '100000', {
+    ttlSeconds,
+    source: 'STATIC',
+  });
 }
