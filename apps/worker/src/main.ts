@@ -88,7 +88,9 @@ export async function startWorker(container: Container, intervalMs = 5000): Prom
     }
 
     // 5. Publish domain events, then deliver merchant webhooks.
-    await safely('outbox.dispatch', () => dispatchOutbox(db, logger));
+    await safely('outbox.dispatch', () =>
+      dispatchOutbox(db, logger, { telegram: container.telegram }),
+    );
     await safely('webhook.delivery', () =>
       dispatchWebhooks(db, {
         timeoutMs: config.security.webhookTimeoutMs,

@@ -22,6 +22,8 @@ import type { BlockchainPayoutPort } from './ports/blockchain.ts';
 import type { RateProvider } from './ports/rate-provider.ts';
 import type { SignerPort } from './ports/signer.ts';
 import type { QueuePort } from './ports/queue.ts';
+import { TelegramClient, NullTelegramClient } from '../../telegram/src/client.ts';
+import type { TelegramSender } from './notifications.ts';
 import { InMemoryQueue } from '../../queue/src/in-memory-queue.ts';
 import { BullMqQueue } from '../../queue/src/bullmq-queue.ts';
 
@@ -34,6 +36,7 @@ export interface Container {
   rates: RateProvider;
   signer: SignerPort;
   queue: QueuePort;
+  telegram: TelegramSender;
   shutdown(): Promise<void>;
 }
 
@@ -71,6 +74,11 @@ export async function createContainer(
   const rates = buildRateProvider(config, options.env ?? process.env);
   const signer = buildSigner(config, options.env ?? process.env);
   const queue = buildQueue(config, options.env ?? process.env);
+  // A missing bot token degrades to a no-op sender rather than failing: the
+  // gateway must keep settling money even when Telegram is not configured.
+  const telegram: TelegramSender = config.telegram.botToken
+    ? new TelegramClient(config.telegram.botToken)
+    : new NullTelegramClient();
 
   logger.info('container.ready', {
     env: config.app.env,
@@ -89,6 +97,7 @@ export async function createContainer(
     rates,
     signer,
     queue,
+    telegram,
     async shutdown() {
       await queue.close();
       await db.close();

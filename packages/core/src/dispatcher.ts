@@ -10,18 +10,20 @@ import type { Database } from '../../database/src/client.ts';
 import { claimBatch, markSent, markFailed } from './outbox.ts';
 import { scheduleMerchantDeliveries } from './webhooks.ts';
 import type { Logger } from './logger.ts';
+import { notifyMerchant, type TelegramSender } from './notifications.ts';
 
 export interface DispatchSummary {
   claimed: number;
   sent: number;
   failed: number;
   deliveriesScheduled: number;
+  notificationsSent: number;
 }
 
 export async function dispatchOutbox(
   db: Database,
   logger: Logger,
-  options: { batchSize?: number } = {},
+  options: { batchSize?: number; telegram?: TelegramSender } = {},
 ): Promise<DispatchSummary> {
   const events = await claimBatch(db, { limit: options.batchSize ?? 50 });
   const summary: DispatchSummary = {
@@ -29,11 +31,21 @@ export async function dispatchOutbox(
     sent: 0,
     failed: 0,
     deliveriesScheduled: 0,
+    notificationsSent: 0,
   };
 
   for (const event of events) {
     try {
       summary.deliveriesScheduled += await scheduleMerchantDeliveries(db, event.envelope);
+
+      // Notifications come after the webhook is scheduled and are best-effort
+      // by design: notifyMerchant swallows its own failures, so a Telegram
+      // outage cannot strand an event in the outbox (SPEC 5565).
+      if (options.telegram) {
+        const notified = await notifyMerchant(db, options.telegram, logger, event.envelope);
+        if (notified) summary.notificationsSent += 1;
+      }
+
       await markSent(db, event.id);
       summary.sent += 1;
     } catch (e) {

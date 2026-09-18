@@ -31,6 +31,7 @@ function container(h: Harness) {
     rates: h.rates,
     signer: h.signer,
     queue: h.queue,
+    telegram: h.telegram,
     shutdown: async () => {},
   };
 }
@@ -365,5 +366,89 @@ describe('financial freeze halts the pipeline', () => {
       [merchant.merchantId],
     );
     expect(payout.rows[0]?.status).toBe('SETTLED');
+  });
+});
+
+describe('merchant notifications (SPEC 5564-5570)', () => {
+  it('notifies the merchant as the payout progresses', async () => {
+    harness = await createHarness();
+    const { db, config, cubepay, telegram } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 50_000_000_000n);
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    void cubepay;
+
+    const payment = await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    await fastForwardRelease(db, payment.paymentId);
+
+    const worker = await startWorker(container(harness), 1_000_000);
+    for (let i = 0; i < 8; i++) await worker.runOnce();
+    await worker.stop();
+
+    const texts = telegram.sent.map((m) => m.text).join('\n');
+    // The merchant hears about the money at each meaningful step.
+    expect(texts).toContain('پرداخت تأیید شد');
+    expect(texts).toContain('تسویه انجام شد');
+    // And every message went to the owner's Telegram id.
+    expect(telegram.sent.every((m) => Number.isFinite(m.chatId))).toBe(true);
+  });
+
+  it('settles the payout even when Telegram is completely down', async () => {
+    // The whole point of SPEC 5565: a notification failure is not a financial
+    // failure. The money must still move.
+    harness = await createHarness();
+    const { db, config, telegram } = harness;
+    telegram.failing = true;
+
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 50_000_000_000n);
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    const payment = await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    await fastForwardRelease(db, payment.paymentId);
+
+    const worker = await startWorker(container(harness), 1_000_000);
+    for (let i = 0; i < 8; i++) await worker.runOnce();
+    await worker.stop();
+
+    const payout = await db.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE merchant_id = $1',
+      [merchant.merchantId],
+    );
+    expect(payout.rows[0]?.status).toBe('SETTLED');
+    expect(telegram.sent).toHaveLength(0);
+
+    // Nor may the outbox be stuck: the events were still published.
+    const stuck = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM system.outbox_events WHERE status <> 'SENT'`,
+    );
+    expect(stuck.rows[0]?.count).toBe('0');
   });
 });

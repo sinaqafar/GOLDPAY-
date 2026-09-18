@@ -14,6 +14,19 @@ import { StaticRateProvider } from '../../packages/core/src/adapters/rate-provid
 import { StubSigner } from '../../packages/ton/src/signer.ts';
 import { InMemoryQueue } from '../../packages/queue/src/in-memory-queue.ts';
 
+/** Captures outgoing Telegram messages so tests can assert on them. */
+export class RecordingTelegram {
+  readonly sent: { chatId: number; text: string }[] = [];
+  /** When set, every send throws — to prove a failure cannot affect money. */
+  failing = false;
+
+  async sendMessage(params: { chatId: number; text: string }): Promise<unknown> {
+    if (this.failing) throw new Error('telegram unavailable');
+    this.sent.push(params);
+    return { ok: true };
+  }
+}
+
 export const TEST_ENV: Record<string, string> = {
   APP_ENV: 'test',
   DATABASE_URL: 'pglite:memory',
@@ -42,6 +55,7 @@ export interface Harness {
   rates: StaticRateProvider;
   signer: StubSigner;
   queue: InMemoryQueue;
+  telegram: RecordingTelegram;
   close(): Promise<void>;
 }
 
@@ -60,6 +74,7 @@ export async function createHarness(overrides: Record<string, string> = {}): Pro
     rates: new StaticRateProvider('100000', { ttlSeconds: 300, source: 'TEST' }),
     signer: new StubSigner(config.ton),
     queue: new InMemoryQueue(),
+    telegram: new RecordingTelegram(),
     close: () => db.close(),
   };
 }
