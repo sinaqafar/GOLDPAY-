@@ -24,6 +24,7 @@ import { TEST_ENV } from '../helpers/harness.ts';
 import { StubSigner } from '../../packages/ton/src/signer.ts';
 import {
   TokenBucketRateLimiter,
+  RedisRateLimiter,
   ruleFor,
 } from '../../packages/core/src/rate-limit.ts';
 
@@ -352,5 +353,90 @@ describe('rate limiting (SPEC 253)', () => {
     // The provider retries legitimately, so its budget is generous.
     expect(ruleFor('POST', '/v1/webhooks/cubepay').name).toBe('WEBHOOK');
     expect(ruleFor('GET', '/health/live').name).toBe('PUBLIC');
+  });
+});
+
+describe('distributed rate limiting', () => {
+  /** Minimal in-memory stand-in that executes the Lua contract faithfully. */
+  function fakeRedis() {
+    const store = new Map<string, { tokens: number; ts: number }>();
+    let failing = false;
+    return {
+      setFailing(v: boolean) {
+        failing = v;
+      },
+      async eval(_script: string, keys: string[], args: string[]): Promise<unknown> {
+        if (failing) throw new Error('redis unreachable');
+        const key = keys[0] as string;
+        const [capacity, refillPerMs, now] = args.map(Number) as [number, number, number];
+
+        const state = store.get(key) ?? { tokens: capacity, ts: now };
+        const elapsed = Math.max(0, now - state.ts);
+        let tokens = Math.min(capacity, state.tokens + elapsed * refillPerMs);
+
+        let allowed = 0;
+        if (tokens >= 1) {
+          tokens -= 1;
+          allowed = 1;
+        }
+        store.set(key, { tokens, ts: now });
+        return [allowed, Math.floor(tokens)];
+      },
+    };
+  }
+
+  it('shares one budget across instances instead of multiplying it', async () => {
+    // Two API instances, one Redis. The whole point: five requests total, not
+    // five per instance.
+    const redis = fakeRedis();
+    let clock = 0;
+    const rule = { limit: 5, windowSeconds: 60 };
+    const a = new RedisRateLimiter({ redis, now: () => clock });
+    const b = new RedisRateLimiter({ redis, now: () => clock });
+
+    const results: boolean[] = [];
+    for (let i = 0; i < 6; i++) {
+      const limiter = i % 2 === 0 ? a : b;
+      results.push((await limiter.check('merchant-1', rule)).allowed);
+    }
+
+    expect(results.filter(Boolean)).toHaveLength(5);
+    expect(results[5]).toBe(false);
+  });
+
+  it('refills over time, not on a window edge', async () => {
+    const redis = fakeRedis();
+    let clock = 0;
+    const limiter = new RedisRateLimiter({ redis, now: () => clock });
+    const rule = { limit: 60, windowSeconds: 60 };
+
+    for (let i = 0; i < 60; i++) await limiter.check('caller', rule);
+    expect((await limiter.check('caller', rule)).allowed).toBe(false);
+
+    clock += 1000;
+    expect((await limiter.check('caller', rule)).allowed).toBe(true);
+    expect((await limiter.check('caller', rule)).allowed).toBe(false);
+  });
+
+  it('keeps serving traffic when Redis is down', async () => {
+    // Rate limiting is a courtesy control, not a security boundary
+    // (SPEC 7245). Turning a Redis blip into a full outage would be worse than
+    // briefly not limiting.
+    const redis = fakeRedis();
+    const limiter = new RedisRateLimiter({ redis, now: () => 0 });
+    redis.setFailing(true);
+
+    const decision = await limiter.check('caller', { limit: 1, windowSeconds: 60 });
+    expect(decision.allowed).toBe(true);
+  });
+
+  it('can be configured to fail closed instead', async () => {
+    const redis = fakeRedis();
+    const limiter = new RedisRateLimiter({ redis, now: () => 0, failOpen: false });
+    redis.setFailing(true);
+
+    const decision = await limiter.check('caller', { limit: 1, windowSeconds: 60 });
+    expect(decision.allowed).toBe(false);
+    expect(decision.retryAfterSeconds).toBeGreaterThan(0);
   });
 });

@@ -2,7 +2,7 @@
   "name": "goldpay-gateway",
   "private": true,
   "version": "1.0.0",
-  "description": "GRAM Gateway \u2014 Toman-in / GRAM-on-TON-out payment gateway (CubePay VIP provider, Telegram Bot + Mini App)",
+  "description": "GRAM Gateway — Toman-in / GRAM-on-TON-out payment gateway (CubePay VIP provider, Telegram Bot + Mini App)",
   "type": "module",
   "engines": {
     "node": ">=20.11"
@@ -36,6 +36,7 @@
     "@types/react-dom": "^18.3.7",
     "bullmq": "^6.3.7",
     "esbuild": "^0.28.2",
+    "ioredis": "^6.0.0",
     "pg": "^8.16.3",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"

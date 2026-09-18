@@ -11,10 +11,7 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../../packages/errors/src/index.ts';
-import {
-  ruleFor,
-  type TokenBucketRateLimiter,
-} from '../../../packages/core/src/rate-limit.ts';
+import { ruleFor, type RateLimiter } from '../../../packages/core/src/rate-limit.ts';
 import { createHash } from 'node:crypto';
 import { metrics, routeLabel } from '../../../packages/core/src/observability.ts';
 import type { Logger } from '../../../packages/core/src/logger.ts';
@@ -152,7 +149,7 @@ export interface ServerOptions {
   /** Trust `x-forwarded-for` only behind a known proxy. */
   trustProxy?: boolean;
   /** Omit to disable rate limiting (tests, single-user development). */
-  rateLimiter?: TokenBucketRateLimiter;
+  rateLimiter?: RateLimiter;
 }
 
 export function createHttpServer(options: ServerOptions): Server {
@@ -288,7 +285,7 @@ export function createHttpServer(options: ServerOptions): Server {
         const credential = headerValue(req, 'authorization');
         const identity = credential ? `key:${sha256Short(credential)}` : `ip:${ip}`;
         const { name, rule } = ruleFor(method, url.pathname);
-        const decision = rateLimiter.check(`${identity}:${name}`, rule);
+        const decision = await rateLimiter.check(`${identity}:${name}`, rule);
 
         if (!decision.allowed) {
           metrics.rateLimited.inc({ bucket: name });
