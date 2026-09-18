@@ -132,7 +132,7 @@ export async function startWorker(container: Container, intervalMs = 5000): Prom
  * a single stuck payout cannot block the others.
  */
 async function advancePayouts(container: Container): Promise<void> {
-  const { db, config, logger, chain, rates } = container;
+  const { db, config, logger, chain, rates, signer } = container;
 
   const pending = await db.query<{ id: string; status: string }>(
     `SELECT id, status FROM finance.payouts
@@ -156,7 +156,7 @@ async function advancePayouts(container: Container): Promise<void> {
         // SPEC 90.10 — sign and broadcast are separate stages, so a crash
         // between them leaves a state that describes what actually happened.
         case 'RESERVED':
-          await signPayout(db, chain, config, payout.id);
+          await signPayout(db, chain, config, payout.id, signer);
           break;
 
         case 'SIGNED':

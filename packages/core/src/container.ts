@@ -12,6 +12,7 @@ import { loadConfig, assertTreasuryManualOnly, type Config } from '../../config/
 import { ConfigError } from '../../errors/src/index.ts';
 import { CubePayAdapter } from '../../cubepay/src/adapter.ts';
 import { TonAdapter, InMemoryTonAdapter } from '../../ton/src/adapter.ts';
+import { StubSigner, KmsSigner } from '../../ton/src/signer.ts';
 import { StaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
 import { RateAggregator } from './adapters/rate-aggregator.ts';
 import { CoinGeckoCryptoProvider, TindexFxProvider } from './adapters/market-sources.ts';
@@ -19,6 +20,7 @@ import { createLogger, type Logger } from './logger.ts';
 import type { PaymentProviderPort } from './ports/payment-provider.ts';
 import type { BlockchainPayoutPort } from './ports/blockchain.ts';
 import type { RateProvider } from './ports/rate-provider.ts';
+import type { SignerPort } from './ports/signer.ts';
 
 export interface Container {
   config: Config;
@@ -27,6 +29,7 @@ export interface Container {
   provider: PaymentProviderPort;
   chain: BlockchainPayoutPort;
   rates: RateProvider;
+  signer: SignerPort;
   shutdown(): Promise<void>;
 }
 
@@ -62,6 +65,7 @@ export async function createContainer(
     : new TonAdapter(config.ton);
 
   const rates = buildRateProvider(config, options.env ?? process.env);
+  const signer = buildSigner(config, options.env ?? process.env);
 
   logger.info('container.ready', {
     env: config.app.env,
@@ -78,6 +82,7 @@ export async function createContainer(
     provider,
     chain,
     rates,
+    signer,
     async shutdown() {
       await db.close();
     },
@@ -137,4 +142,36 @@ function buildRateProvider(config: Config, env: NodeJS.ProcessEnv): RateProvider
     ttlSeconds,
     source: 'STATIC',
   });
+}
+
+/**
+ * Choose the signer.
+ *
+ * The port is a permanent boundary (see ports/signer.ts): production must put a
+ * KMS or HSM behind it. The stub exists only so development and tests can drive
+ * the full RESERVED -> SIGNED -> BROADCASTED pipeline, and it refuses to
+ * construct in production.
+ */
+function buildSigner(config: Config, env: NodeJS.ProcessEnv): SignerPort {
+  const endpoint = env['SIGNER_ENDPOINT'];
+  const keyReference = config.ton.signerReference;
+
+  if (endpoint && keyReference) {
+    return new KmsSigner({
+      config: config.ton,
+      endpoint,
+      keyReference,
+      apiKey: env['SIGNER_API_KEY'] ?? null,
+      timeoutMs: Number(env['SIGNER_TIMEOUT_MS'] ?? 10_000),
+    });
+  }
+
+  if (config.app.isProduction) {
+    throw new ConfigError(
+      'SIGNER_REQUIRED',
+      'production requires SIGNER_ENDPOINT and TON_SIGNER_REFERENCE; a local or stub signer is not acceptable',
+    );
+  }
+
+  return new StubSigner(config.ton, { isProduction: false });
 }

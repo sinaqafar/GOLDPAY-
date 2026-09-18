@@ -11,6 +11,7 @@ import { seed } from '../../scripts/seed.ts';
 import { CubePayAdapter } from '../../packages/cubepay/src/adapter.ts';
 import { InMemoryTonAdapter } from '../../packages/ton/src/adapter.ts';
 import { StaticRateProvider } from '../../packages/core/src/adapters/rate-provider.ts';
+import { StubSigner } from '../../packages/ton/src/signer.ts';
 
 export const TEST_ENV: Record<string, string> = {
   APP_ENV: 'test',
@@ -38,6 +39,7 @@ export interface Harness {
   cubepay: CubePayAdapter;
   chain: InMemoryTonAdapter;
   rates: StaticRateProvider;
+  signer: StubSigner;
   close(): Promise<void>;
 }
 
@@ -54,6 +56,7 @@ export async function createHarness(overrides: Record<string, string> = {}): Pro
     chain: new InMemoryTonAdapter({ autoConfirm: true }),
     // 1 GRAM = 100,000 Toman.
     rates: new StaticRateProvider('100000', { ttlSeconds: 300, source: 'TEST' }),
+    signer: new StubSigner(config.ton),
     close: () => db.close(),
   };
 }

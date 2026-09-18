@@ -29,6 +29,7 @@ function container(h: Harness) {
     provider: h.cubepay,
     chain: h.chain,
     rates: h.rates,
+    signer: h.signer,
     shutdown: async () => {},
   };
 }

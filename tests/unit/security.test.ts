@@ -21,6 +21,7 @@ import { loadConfig, assertTreasuryManualOnly } from '../../packages/config/src/
 import { SecurityError, ConfigError } from '../../packages/errors/src/index.ts';
 import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/webhooks.ts';
 import { TEST_ENV } from '../helpers/harness.ts';
+import { StubSigner } from '../../packages/ton/src/signer.ts';
 
 const SECRET = 'test-secret-value';
 
@@ -216,5 +217,78 @@ describe('outbound webhook SSRF protection', () => {
     await expect(
       assertSafeWebhookUrl('https://user:pass@example.com/hook', ['https']),
     ).rejects.toThrow();
+  });
+});
+
+describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
+  const tonConfig = {
+    network: 'TON_TESTNET',
+    endpoint: 'https://example.invalid',
+    apiKey: null,
+    minConfirmations: 1,
+    timeoutMs: 1000,
+    gramAsset: 'GRAM',
+    gramDecimals: 9,
+    payoutWalletAddress: 'EQD__________________________________________0vo',
+    signerReference: 'kms://test/key-1',
+    mock: true,
+  } as const;
+
+  const request = {
+    signRequestId: 'payout:abc',
+    payoutId: 'abc',
+    asset: 'GRAM',
+    network: 'TON_TESTNET',
+    destinationAddress: 'EQD__________________________________________1vo',
+    amountAtomic: '10000000000',
+    fromAddress: 'EQD__________________________________________0vo',
+  };
+
+  it('signs a well-formed request', async () => {
+    const signer = new StubSigner(tonConfig);
+    const signed = await signer.sign(request);
+    expect(signed.signingReference).toMatch(/^stub:/);
+    expect(signed.signer).toBe('STUB_SIGNER');
+  });
+
+  it('never produces a second signature for the same request id', async () => {
+    // Otherwise a retry could authorise the same funds twice.
+    const signer = new StubSigner(tonConfig);
+    await signer.sign(request);
+    await expect(signer.sign(request)).rejects.toThrow(/already produced a signature/);
+  });
+
+  it('refuses the wrong asset even when the caller insists', async () => {
+    const signer = new StubSigner(tonConfig);
+    await expect(signer.sign({ ...request, asset: 'USDT' })).rejects.toThrow(
+      /refusing to sign asset/,
+    );
+  });
+
+  it('refuses the wrong network', async () => {
+    const signer = new StubSigner(tonConfig);
+    await expect(signer.sign({ ...request, network: 'TON_MAINNET' })).rejects.toThrow(
+      /refusing to sign for network/,
+    );
+  });
+
+  it('refuses to send from a wallet it does not control', async () => {
+    const signer = new StubSigner(tonConfig);
+    await expect(signer.sign({ ...request, fromAddress: 'EQsomeoneElse' })).rejects.toThrow(
+      /does not control/,
+    );
+  });
+
+  it('refuses a non-positive amount', async () => {
+    const signer = new StubSigner(tonConfig);
+    await expect(signer.sign({ ...request, amountAtomic: '0' })).rejects.toThrow(
+      /non-positive amount/,
+    );
+  });
+
+  it('cannot be constructed in production at all', async () => {
+    expect(() => new StubSigner(tonConfig, { isProduction: true })).toThrow(
+      /never be used in production/,
+    );
   });
 });

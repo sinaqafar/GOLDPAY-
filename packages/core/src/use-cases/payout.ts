@@ -24,6 +24,7 @@ import { sha256Hex } from '../../../crypto/src/index.ts';
 import type { Config } from '../../../config/src/index.ts';
 import type { RateProvider } from '../ports/rate-provider.ts';
 import type { BlockchainPayoutPort, BroadcastResult } from '../ports/blockchain.ts';
+import type { SignerPort } from '../ports/signer.ts';
 import { assertGramWithinBounds, assertTomanWithinBounds } from '../limits.ts';
 import {
   PayoutError,
@@ -437,6 +438,7 @@ export async function signPayout(
   chain: BlockchainPayoutPort,
   config: Config,
   payoutId: string,
+  signer?: SignerPort,
 ): Promise<{ status: 'SIGNED'; signingReference: string }> {
   return db.transaction(async (tx) => {
     const r = await tx.query<{
@@ -496,7 +498,27 @@ export async function signPayout(
 
     // The signer holds the key; we only ever store a handle to the result.
     // SPEC 5485-5487 / 118.37: no key material touches this process.
-    const signingReference = `sign:${payoutId}`;
+    //
+    // The sign request id is derived from the payout so a retry presents the
+    // SAME id, letting the signer refuse to produce a second signature for
+    // money that may already be committed (SPEC 5569/5570).
+    let signingReference: string;
+    if (signer) {
+      const signed = await signer.sign({
+        signRequestId: `payout:${payoutId}`,
+        payoutId,
+        asset: config.ton.gramAsset,
+        network: payout.destination_network,
+        destinationAddress: payout.destination_address,
+        amountAtomic: payout.gram_amount_atomic,
+        fromAddress: config.ton.payoutWalletAddress ?? '',
+      });
+      signingReference = signed.signingReference;
+    } else {
+      // No signer wired up (development). The state machine still records that
+      // signing happened, so the SIGNED stage cannot be skipped by accident.
+      signingReference = `unsigned:${payoutId}`;
+    }
 
     await transitionState(tx, {
       table: 'finance.payouts',
