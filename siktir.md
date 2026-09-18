@@ -1138,8 +1138,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۲ فایل / ۲۷۹ تست سبز**
-· ۸ مهاجرت اعمال‌شده
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۲ فایل / ۲۹۵ تست سبز**
+· ۹ مهاجرت اعمال‌شده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1173,6 +1173,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 007_refunds.sql                 core.refunds + trigger سقف بازپرداخت
 008_risk_and_disputes.sql       risk.assessments · core.disputes
                                 finance.payment_holds
+009_support.sql                 core.support_tickets · support_messages
+                                (پیام‌ها immutable)
 ```
 
 ### اپ‌ها
@@ -1285,7 +1287,17 @@ docs/recovery/README.md
 | **Docker + Compose** | یک image چندنقشه، Redis با `noeviction`، پنل ادمین روی loopback. |
 | **CI** | `infra/ci/github-actions-ci.yml` — کیفیت + **چهار گارد ثابت مالی** (هرکدام تست شد که واقعاً fail می‌کند). |
 
-### 🔴 ۱۰. تنها موضوع باز: سیاست Refund
+### ✅ ۱۰. لایهٔ عملیاتی — **انجام شد**
+
+| مورد | جزئیات |
+|---|---|
+| **API قفل‌ها** | `GET /v1/payments/:id/holds` برای فروشنده (چرا پولم متوقف است)، `GET/POST /internal/admin/holds` برای ادمین. |
+| **API اختلافات** | `POST/GET /v1/disputes` + `/internal/admin/disputes/:id/resolve`. |
+| **صف ریسک** | `GET /internal/admin/risk` — فقط موارد REVIEW. |
+| **تیکت پشتیبانی** | مهاجرت ۰۰۹ + `use-cases/support.ts` + API فروشنده + Mini App + پنل ادمین. کد `TKT-nnnnnn`، اتصال به payment/payout، پیام‌ها **append-only** با trigger، یادداشت داخلی فقط برای کارکنان. |
+| **مجوزهای جدید** | `risk:read`، `disputes:read/resolve`، `holds:release`، `support:read/respond`. `RISK_AGENT` حالا صف خودش را کار می‌کند ولی همچنان به خزانه دسترسی ندارد. |
+
+### 🔴 ۱۱. تنها موضوع باز: سیاست Refund
 
 مدل کامل است ولی **اجرا عمداً غیرفعال**. دلیل: نه مشخصات و نه مستندات CubePay
 نگفته‌اند کارمزد ۱۵٪ هنگام برگشت چه می‌شود. ستون‌های
@@ -1293,12 +1305,18 @@ docs/recovery/README.md
 وقتی قرارداد CubePay مشخص شد، فقط همان سیاست نوشته می‌شود — دفتر کل و هستهٔ
 پرداخت تغییر نمی‌کنند.
 
-### 🟢 ۱۱. یادداشت‌های عملیاتی
+### 🟢 ۱۲. یادداشت‌های عملیاتی
 - **Rate limiting** در حافظهٔ پروسه است؛ با N نمونه سقف N برابر می‌شود. برای
   production چندنمونه‌ای باید به Redis منتقل شود (در خود کد نوشته شده).
 - **CI** به‌خاطر نبود مجوز `workflows` در `infra/ci/` است؛ روش فعال‌سازی در
   `infra/ci/README.md`.
 - **آستانه‌های Risk** قابل پیکربندی‌اند؛ پیش‌فرض‌ها نقطهٔ شروع‌اند نه یافته.
+- **تغییر کیف پول**: ۲۴ ساعت `SECURITY_HOLD` — بدون KYC، بدون OTP، بدون 2FA
+  (تصمیم صریح شما). امنیت از طریق binding تلگرام + Risk Engine + audit.
+- ⚠️ **دام مهم**: `node --experimental-strip-types` فقط تایپ‌ها را **پاک** می‌کند
+  و کد تولید نمی‌کند. پس `constructor(readonly x: string)` کار نمی‌کند، همچنین
+  `enum` و `namespace`. `tsc` و `vitest` این را نمی‌گیرند چون transpile می‌کنند.
+  گارد CI اضافه شد که هر شش سرویس را با Node خام load می‌کند.
 
 ---
 
