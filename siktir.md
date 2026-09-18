@@ -1143,8 +1143,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۲ فایل / ۲۹۵ تست سبز**
-· ۹ مهاجرت اعمال‌شده
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۳ فایل / ۳۲۷ تست سبز**
+· ۱۲ مهاجرت · build کامپایل‌شده تأییدشده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1180,6 +1180,9 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
                                 finance.payment_holds
 009_support.sql                 core.support_tickets · support_messages
                                 (پیام‌ها immutable)
+010_payout_items_retry.sql      ایندکس یکتا فقط روی payout زنده
+011_confirming_state.sql        حالت CONFIRMING
+012_rate_observations.sql       هر دو leg نرخ روی quote
 ```
 
 ### اپ‌ها
@@ -1302,7 +1305,29 @@ docs/recovery/README.md
 | **تیکت پشتیبانی** | مهاجرت ۰۰۹ + `use-cases/support.ts` + API فروشنده + Mini App + پنل ادمین. کد `TKT-nnnnnn`، اتصال به payment/payout، پیام‌ها **append-only** با trigger، یادداشت داخلی فقط برای کارکنان. |
 | **مجوزهای جدید** | `risk:read`، `disputes:read/resolve`، `holds:release`، `support:read/respond`. `RISK_AGENT` حالا صف خودش را کار می‌کند ولی همچنان به خزانه دسترسی ندارد. |
 
-### 🔴 ۱۱. تنها موضوع باز: سیاست Refund
+### ✅ ۱۱. بازبینی PR — همهٔ ایرادها رفع شد
+
+**چهار مورد CRITICAL (هیچ‌کدام را ۲۹۵ تست سبز نگرفته بود):**
+
+| # | مشکل | رفع |
+|---|---|---|
+| ۱ | **کل مبلغ payout به‌عنوان کارمزد شبکه ثبت می‌شد** و `networkFeeAtomic` نادیده گرفته می‌شد | حساب جدید `SETTLEMENT_CLEARING_GRAM` برای اصل مبلغ؛ خزانه به اندازهٔ **اصل + کارمزد** کم می‌شود |
+| ۲ | **SETTLED فقط با txHash** ممکن بود | `ChainSettlementEvidence` — مبلغ، مقصد، asset، شبکه و confirmations از زنجیره خوانده و دوباره اعتبارسنجی می‌شود |
+| ۳ | `payout_items` می‌توانست **بیش از مبلغ payout** باشد | سقف با running total، قدیمی‌ترین اول |
+| ۴ | payout ناموفق پرداخت را **برای همیشه بلوکه** می‌کرد | ایندکس یکتا فقط روی payoutهای زنده (مهاجرت ۰۱۰) |
+
+**بقیه:** امضای KMS از داخل تراکنش خارج شد · `CONFIRMING` حالت واقعی شد ·
+`NOT_FOUND` پنجرهٔ مشاهده لازم دارد · rate limiting توزیع‌شده با Redis ·
+`PROVIDER_FEE_PERCENT` در production اجباری · CI با PostgreSQL و Redis واقعی ·
+build کامپایل‌شده به‌جای strip-types · baseline نرخ پس از restart حفظ می‌شود ·
+هر دو leg نرخ ذخیره می‌شود · انتخاب liquidity-fit سراسری با anti-starvation ·
+کوکی HttpOnly برای ادمین · شش صفحهٔ جدید پنل · دقت اعشار از raw body.
+
+> ⚠️ **درسی که باید بماند:** آن چهار باگ وقتی پیدا شدند که **کد واقعاً اجرا شد**،
+> نه از روی تست. یک باگ بسته‌بندی هم فقط بعد از کامپایل واقعی معلوم شد
+> (migrations زیر `dist/` پیدا نمی‌شدند). **تست سبز اثبات درستی نیست.**
+
+### 🔴 ۱۲. تنها موضوع باز: سیاست Refund
 
 مدل کامل است ولی **اجرا عمداً غیرفعال**. دلیل: نه مشخصات و نه مستندات CubePay
 نگفته‌اند کارمزد ۱۵٪ هنگام برگشت چه می‌شود. ستون‌های
@@ -1310,7 +1335,7 @@ docs/recovery/README.md
 وقتی قرارداد CubePay مشخص شد، فقط همان سیاست نوشته می‌شود — دفتر کل و هستهٔ
 پرداخت تغییر نمی‌کنند.
 
-### 🟢 ۱۲. یادداشت‌های عملیاتی
+### 🟢 ۱۳. یادداشت‌های عملیاتی
 - **Rate limiting** در حافظهٔ پروسه است؛ با N نمونه سقف N برابر می‌شود. برای
   production چندنمونه‌ای باید به Redis منتقل شود (در خود کد نوشته شده).
 - **CI** به‌خاطر نبود مجوز `workflows` در `infra/ci/` است؛ روش فعال‌سازی در
