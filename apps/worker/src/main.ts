@@ -23,6 +23,7 @@ import {
 } from '../../../packages/core/src/use-cases/payout.ts';
 import { expireStaleInvoices } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { purgeExpired } from '../../../packages/core/src/idempotency.ts';
+import { isFinanciallyFrozen } from '../../../packages/core/src/admin/operations.ts';
 
 export interface WorkerHandle {
   stop(): Promise<void>;
@@ -46,32 +47,44 @@ export async function startWorker(container: Container, intervalMs = 5000): Prom
   }
 
   async function runOnce(): Promise<void> {
-    // 1. Release payments whose 48h hold has elapsed.
-    await safely('payment.release', async () => {
-      const result = await releaseEligiblePayments(db, { limit: 100 });
-      if (result.released > 0) {
-        logger.info('payments.released', { count: result.released });
-        // 2. A release makes a merchant payable: queue their payout.
-        for (const merchantId of result.merchantIds) {
-          await safely('payout.selection', () => queuePayoutForMerchant(db, config, merchantId));
+    // A financial freeze halts everything that moves money, but leaves the
+    // read-only and delivery work running so operators keep their visibility
+    // while they investigate (SPEC 119.58).
+    const frozen = await isFinanciallyFrozen(db);
+    if (frozen) {
+      logger.warn('worker.financial_freeze_active', {
+        message: 'skipping release, payout and reconciliation stages',
+      });
+    }
+
+    if (!frozen) {
+      // 1. Release payments whose 48h hold has elapsed.
+      await safely('payment.release', async () => {
+        const result = await releaseEligiblePayments(db, { limit: 100 });
+        if (result.released > 0) {
+          logger.info('payments.released', { count: result.released });
+          // 2. A release makes a merchant payable: queue their payout.
+          for (const merchantId of result.merchantIds) {
+            await safely('payout.selection', () => queuePayoutForMerchant(db, config, merchantId));
+          }
         }
-      }
-    });
+      });
 
-    // 3. Advance every payout through its pipeline stage.
-    await safely('payout.pipeline', () => advancePayouts(container));
+      // 3. Advance every payout through its pipeline stage.
+      await safely('payout.pipeline', () => advancePayouts(container));
 
-    // 4. Resolve anything ambiguous against the chain.
-    await safely('payout.reconciliation', async () => {
-      const unknown = await db.query<{ id: string }>(
-        `SELECT id FROM finance.payouts
-          WHERE status = 'UNKNOWN' AND updated_at < NOW() - INTERVAL '30 seconds'
-          ORDER BY updated_at ASC LIMIT 20`,
-      );
-      for (const row of unknown.rows) {
-        await safely('reconcile', () => reconcilePayout(db, chain, row.id));
-      }
-    });
+      // 4. Resolve anything ambiguous against the chain.
+      await safely('payout.reconciliation', async () => {
+        const unknown = await db.query<{ id: string }>(
+          `SELECT id FROM finance.payouts
+            WHERE status = 'UNKNOWN' AND updated_at < NOW() - INTERVAL '30 seconds'
+            ORDER BY updated_at ASC LIMIT 20`,
+        );
+        for (const row of unknown.rows) {
+          await safely('reconcile', () => reconcilePayout(db, chain, row.id));
+        }
+      });
+    }
 
     // 5. Publish domain events, then deliver merchant webhooks.
     await safely('outbox.dispatch', () => dispatchOutbox(db, logger));

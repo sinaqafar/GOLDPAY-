@@ -310,3 +310,58 @@ describe('scheduler integrity sweep', () => {
     expect(status.rows[0]?.status).toBe('EXPIRED');
   });
 });
+
+describe('financial freeze halts the pipeline', () => {
+  it('stops a releasable payment from being paid out while frozen', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db);
+    await fundTreasury(db, 50_000_000_000n);
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+      feeMode: 'CUSTOMER',
+    });
+    const payment = await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: 'cp_freeze_1',
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    await fastForwardRelease(db, payment.paymentId);
+
+    // Freeze, then run the worker hard.
+    await db.query(
+      `UPDATE system.platform_state
+          SET financial_freeze = TRUE, freeze_reason = 'test', frozen_at = NOW() WHERE id = TRUE`,
+    );
+
+    const worker = await startWorker(container(harness), 1_000_000);
+    for (let i = 0; i < 6; i++) await worker.runOnce();
+
+    // Nothing moved: no payout exists and the payment is still held.
+    expect((await db.query('SELECT 1 FROM finance.payouts')).rowCount).toBe(0);
+    const held = await db.query<{ status: string }>(
+      'SELECT status FROM core.payments WHERE id = $1',
+      [payment.paymentId],
+    );
+    expect(held.rows[0]?.status).toBe('VERIFIED');
+
+    // Lift the freeze and the same worker settles it.
+    await db.query(`UPDATE system.platform_state SET financial_freeze = FALSE, freeze_reason = NULL, frozen_at = NULL`);
+    for (let i = 0; i < 6; i++) await worker.runOnce();
+    await worker.stop();
+
+    const payout = await db.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE merchant_id = $1',
+      [merchant.merchantId],
+    );
+    expect(payout.rows[0]?.status).toBe('SETTLED');
+  });
+});

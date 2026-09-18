@@ -13,6 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import { Router, type RequestContext, type HttpResult } from './http.ts';
 import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.ts';
+import { registerAdminRoutes } from './admin-routes.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { createInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
@@ -636,6 +637,9 @@ export function buildRouter(container: Container): Router {
       },
     };
   });
+
+  // Internal administration lives on its own prefix with its own credential.
+  registerAdminRoutes(router, container);
 
   return router;
 }

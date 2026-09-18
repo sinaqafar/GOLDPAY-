@@ -25,7 +25,8 @@
     "scheduler": "node --experimental-strip-types apps/scheduler/src/main.ts",
     "bot": "node --experimental-strip-types apps/bot/src/main.ts",
     "mini-app": "node --experimental-strip-types apps/mini-app/src/main.ts",
-    "health-check": "node --experimental-strip-types scripts/health-check.ts"
+    "health-check": "node --experimental-strip-types scripts/health-check.ts",
+    "create-admin": "node --experimental-strip-types scripts/create-admin.ts"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.11",

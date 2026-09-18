@@ -99,7 +99,7 @@ npm run scheduler      # integrity sweeps
 npm run bot            # Telegram bot
 npm run mini-app       # Mini App → http://localhost:3002
 
-npm test               # 133 tests
+npm test               # 167 tests
 npm run typecheck
 ```
 
@@ -135,6 +135,32 @@ carry a valid signature.
 | `POST /v1/integrations/webhooks` | Register a webhook endpoint |
 | `POST /v1/webhooks/cubepay` | Inbound provider callback |
 | `GET /health/{live,ready,dependencies}` | Health |
+
+### Administration
+
+`/internal/admin/*` uses a separate credential resolved against
+`core.admin_users`, so a merchant key can never reach it. Seven roles
+(SUPER_ADMIN, FINANCE_ADMIN, OPERATIONS_ADMIN, SUPPORT_AGENT, RISK_AGENT,
+DEVELOPER_SUPPORT, READ_ONLY) map to an explicit permission list in
+`packages/core/src/admin/rbac.ts` — there is no wildcard and no inheritance.
+
+Two properties are enforced by that matrix and asserted by tests:
+
+- **No role can both request and approve treasury funding.** FINANCE_ADMIN
+  requests, SUPER_ADMIN approves, and the database rejects an approval whose
+  approver equals the requester. Money moves only on approval.
+- **Unfreezing is narrower than freezing.** Several roles can stop the platform
+  in an emergency; only SUPER_ADMIN can start it again, and only once every
+  CRITICAL reconciliation exception is resolved.
+
+A ledger imbalance engages the freeze automatically, and the worker skips every
+money-moving stage while it is on.
+
+Create the first admin with:
+
+```bash
+npm run create-admin -- --name "Owner" --email owner@example.com --role SUPER_ADMIN
+```
 
 ### Mini App
 

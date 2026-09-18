@@ -37,13 +37,27 @@ export async function runIntegritySweep(container: Container): Promise<Scheduler
 
   if (!balance.balanced) {
     logger.error('ledger.IMBALANCE_DETECTED', { byCurrency: balance.byCurrency });
-    // CRITICAL: record it so operations can freeze financial activity.
     await db.query(
       `INSERT INTO system.reconciliation_exceptions
           (id, kind, severity, entity_type, entity_id, details)
        VALUES ($1,'LEDGER_IMBALANCE','CRITICAL','SYSTEM',NULL,$2::jsonb)`,
       [randomUUID(), JSON.stringify({ byCurrency: balance.byCurrency })],
     );
+
+    // SPEC 119.58: an imbalance is CRITICAL and freezes financial movement.
+    // This is automatic and deliberately not permission-checked — when the
+    // books do not balance, the system stops paying out first and asks
+    // questions afterwards. Only a SUPER_ADMIN can lift it, and only once the
+    // CRITICAL exception has been resolved.
+    await db.query(
+      `UPDATE system.platform_state
+          SET financial_freeze = TRUE,
+              freeze_reason = COALESCE(freeze_reason, 'automatic: ledger imbalance detected'),
+              frozen_at = COALESCE(frozen_at, NOW()),
+              updated_at = NOW()
+        WHERE id = TRUE AND financial_freeze = FALSE`,
+    );
+    logger.error('platform.financial_freeze_engaged', { reason: 'ledger imbalance' });
   }
 
   // Payouts that have been UNKNOWN for too long need a human.
