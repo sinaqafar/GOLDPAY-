@@ -121,6 +121,7 @@ const PAYOUT_STATUS = {
   RESERVED: ['رزرو شد', 'warn'],
   SIGNED: ['امضا شد', 'warn'],
   BROADCASTED: ['ارسال شد به شبکه', 'warn'],
+  CONFIRMING: ['در انتظار تأیید شبکه', 'warn'],
   SETTLED: ['تسویه شد', 'ok'],
   FAILED: ['ناموفق', 'bad'],
   UNKNOWN: ['در حال بررسی', 'warn'],

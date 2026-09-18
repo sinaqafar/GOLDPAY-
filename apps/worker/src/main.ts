@@ -18,6 +18,7 @@ import {
   reservePayoutLiquidity,
   signPayout,
   broadcastPayout,
+  markConfirming,
   settlePayout,
   reconcilePayout,
   expireStaleReservations,
@@ -138,7 +139,7 @@ async function advancePayouts(container: Container): Promise<void> {
 
   const pending = await db.query<{ id: string; status: string }>(
     `SELECT id, status FROM finance.payouts
-      WHERE status IN ('QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','SIGNED','BROADCASTED')
+      WHERE status IN ('QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','SIGNED','BROADCASTED','CONFIRMING')
       ORDER BY created_at ASC
       LIMIT 25`,
   );
@@ -165,7 +166,8 @@ async function advancePayouts(container: Container): Promise<void> {
           await broadcastPayout(db, chain, payout.id);
           break;
 
-        case 'BROADCASTED': {
+        case 'BROADCASTED':
+        case 'CONFIRMING': {
           // Only settle once the chain actually confirms (SPEC 124.168).
           const row = await db.query<{
             transaction_hash: string | null;
@@ -191,6 +193,19 @@ async function advancePayouts(container: Container): Promise<void> {
           // Settle only on evidence read back FROM the chain. settlePayout
           // re-checks every field itself; passing them through unchanged keeps
           // the worker from being the component that decides what is true.
+          // Seen on chain but not yet final: record the distinction so a
+          // stalled transfer is visible rather than looking freshly sent.
+          if (
+            status.state === 'PENDING' &&
+            status.txHash &&
+            payout.status === 'BROADCASTED'
+          ) {
+            await markConfirming(db, payout.id, {
+              txHash: status.txHash,
+              confirmations: status.confirmations ?? 0,
+            });
+          }
+
           if (
             status.state === 'CONFIRMED' &&
             status.txHash &&

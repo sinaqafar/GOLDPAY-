@@ -39,6 +39,7 @@ export type PayoutStatus =
   | 'RESERVED'
   | 'SIGNED'
   | 'BROADCASTED'
+  | 'CONFIRMING'
   | 'SETTLED'
   | 'FAILED'
   | 'UNKNOWN';
@@ -99,7 +100,12 @@ export const PAYOUT_TRANSITIONS: Transitions<PayoutStatus> = {
   // definitive (FAILED), but once signed we must never build a second
   // transaction; the only ways forward are broadcast or reconciliation.
   SIGNED: ['BROADCASTED', 'FAILED', 'UNKNOWN'],
-  BROADCASTED: ['SETTLED', 'FAILED', 'UNKNOWN'],
+  // Accepted by the network, not yet final.
+  BROADCASTED: ['CONFIRMING', 'SETTLED', 'FAILED', 'UNKNOWN'],
+  // Seen on chain but short of the required confirmations. Distinguishing this
+  // from BROADCASTED is what lets an operator see a transaction that is stuck
+  // rather than merely new.
+  CONFIRMING: ['SETTLED', 'FAILED', 'UNKNOWN'],
   SETTLED: [],
   FAILED: [],
   // Only reconciliation may move a payout out of UNKNOWN.
@@ -154,6 +160,7 @@ export const PAYOUT_IN_FLIGHT: readonly PayoutStatus[] = [
   'RESERVED',
   'SIGNED',
   'BROADCASTED',
+  'CONFIRMING',
   'UNKNOWN',
 ];
 

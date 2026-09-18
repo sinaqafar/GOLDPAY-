@@ -765,7 +765,7 @@ async function markUnknown(db: Database, payoutId: string, reason: string): Prom
       table: 'finance.payouts',
       entityType: 'PAYOUT',
       entityId: payoutId,
-      fromState: ['RESERVED', 'SIGNED', 'BROADCASTED'],
+      fromState: ['RESERVED', 'SIGNED', 'BROADCASTED', 'CONFIRMING'],
       toState: 'UNKNOWN',
       event: 'BROADCAST_UNKNOWN',
       extraSet: { failure_code: reason.slice(0, 200) },
@@ -783,6 +783,41 @@ async function markUnknown(db: Database, payoutId: string, reason: string): Prom
       aggregateId: payoutId,
       payload: { payout_id: payoutId, reason },
     });
+  });
+}
+
+/**
+ * Record that the chain has seen the transaction but has not yet buried it
+ * deep enough to be final.
+ *
+ * Separating this from BROADCASTED is what makes a stuck transfer visible: one
+ * sitting at a single confirmation for an hour looks exactly like one just
+ * sent unless the states differ.
+ */
+export async function markConfirming(
+  db: Database,
+  payoutId: string,
+  observed: { txHash: string; confirmations: number },
+): Promise<{ moved: boolean }> {
+  return db.transaction(async (tx) => {
+    const r = await tx.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE id = $1 FOR UPDATE',
+      [payoutId],
+    );
+    const status = r.rows[0]?.status;
+    if (status !== 'BROADCASTED') return { moved: false };
+
+    await transitionState(tx, {
+      table: 'finance.payouts',
+      entityType: 'PAYOUT',
+      entityId: payoutId,
+      fromState: 'BROADCASTED',
+      toState: 'CONFIRMING',
+      event: 'CONFIRMING',
+      extraSet: { transaction_hash: observed.txHash },
+      actorType: 'WORKER',
+    });
+    return { moved: true };
   });
 }
 
@@ -848,7 +883,7 @@ export async function settlePayout(
       if (!payout) throw new NotFoundError('payout', payoutId);
 
       if (payout.status === 'SETTLED') return { settled: false }; // idempotent replay
-      if (payout.status !== 'BROADCASTED' && payout.status !== 'UNKNOWN') {
+      if (!['BROADCASTED', 'CONFIRMING', 'UNKNOWN'].includes(payout.status)) {
         throw new PayoutError('PAYOUT_NOT_SETTLEABLE', `payout is ${payout.status}`);
       }
 
@@ -981,7 +1016,7 @@ export async function settlePayout(
         table: 'finance.payouts',
         entityType: 'PAYOUT',
         entityId: payoutId,
-        fromState: ['BROADCASTED', 'UNKNOWN'],
+        fromState: ['BROADCASTED', 'CONFIRMING', 'UNKNOWN'],
         toState: 'SETTLED',
         event: 'CONFIRM',
         extraSet: {
@@ -1081,6 +1116,7 @@ export async function failPayout(
           'RESERVED',
           'SIGNED',
           'BROADCASTED',
+          'CONFIRMING',
         ],
         toState: 'FAILED',
         event: 'FAIL',
@@ -1132,7 +1168,7 @@ export async function reconcilePayout(
   );
   const payout = r.rows[0];
   if (!payout) throw new NotFoundError('payout', payoutId);
-  if (payout.status !== 'UNKNOWN' && payout.status !== 'BROADCASTED') {
+  if (!['UNKNOWN', 'BROADCASTED', 'CONFIRMING'].includes(payout.status)) {
     return { resolution: 'STILL_UNKNOWN' };
   }
 

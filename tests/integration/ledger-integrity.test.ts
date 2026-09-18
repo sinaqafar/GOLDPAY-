@@ -29,6 +29,7 @@ import {
 import { post, verifyGlobalBalance, verifyProjection } from '../../packages/ledger/src/ledger-service.ts';
 import { requestRefund, refundableAmount } from '../../packages/core/src/use-cases/refund.ts';
 import { placeHold, releaseHold } from '../../packages/core/src/risk.ts';
+import { markConfirming } from '../../packages/core/src/use-cases/payout.ts';
 import { openDispute, resolveDispute } from '../../packages/core/src/use-cases/dispute.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../packages/ledger/src/accounts.ts';
 import { Money } from '../../packages/money/src/index.ts';
@@ -1378,5 +1379,59 @@ describe('payout allocation and settlement evidence', () => {
     );
     // Funds stay committed while the outcome is genuinely unknown.
     expect(['UNKNOWN', 'SETTLED']).toContain(row.rows[0]?.status);
+  });
+});
+
+describe('CONFIRMING state', () => {
+  it('distinguishes "sent" from "seen but not final"', async () => {
+    harness = await createHarness();
+    const { db, config, chain } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 500_000_000_000n);
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '220000',
+    });
+    const payment = await finalizePayment(db, config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    await fastForwardRelease(db, payment.paymentId);
+    await releaseEligiblePayments(db);
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, harness.rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId, harness.signer);
+    const broadcast = await broadcastPayout(db, chain, payoutId);
+
+    const moved = await markConfirming(db, payoutId, {
+      txHash: broadcast.txHash as string,
+      confirmations: 1,
+    });
+    expect(moved.moved).toBe(true);
+
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE id = $1',
+      [payoutId],
+    );
+    expect(row.rows[0]?.status).toBe('CONFIRMING');
+
+    // And a payout in CONFIRMING still settles on full evidence.
+    const settled = await settlePayout(
+      db,
+      payoutId,
+      await chainEvidenceFor(db, payoutId, broadcast.txHash as string),
+    );
+    expect(settled.settled).toBe(true);
   });
 });
