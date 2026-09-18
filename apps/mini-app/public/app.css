@@ -1,0 +1,125 @@
+/* Telegram supplies the palette; we only consume it so the Mini App matches
+   whatever theme the user has chosen. */
+:root {
+  --bg: var(--tg-theme-bg-color, #ffffff);
+  --text: var(--tg-theme-text-color, #000000);
+  --hint: var(--tg-theme-hint-color, #8e8e93);
+  --link: var(--tg-theme-link-color, #2481cc);
+  --button: var(--tg-theme-button-color, #2481cc);
+  --button-text: var(--tg-theme-button-text-color, #ffffff);
+  --secondary-bg: var(--tg-theme-secondary-bg-color, #f1f1f4);
+  --ok: #34c759;
+  --warn: #ff9500;
+  --bad: #ff3b30;
+  --radius: 14px;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+body {
+  margin: 0;
+  padding: 0 0 76px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Vazirmatn, Tahoma, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+}
+
+#app { padding: 16px; max-width: 640px; margin: 0 auto; }
+
+/* --- loading ------------------------------------------------------------- */
+.loading { display: flex; flex-direction: column; align-items: center; padding: 64px 0; color: var(--hint); }
+.spinner {
+  width: 28px; height: 28px; margin-bottom: 12px;
+  border: 3px solid var(--secondary-bg); border-top-color: var(--link);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- cards --------------------------------------------------------------- */
+.card {
+  background: var(--secondary-bg);
+  border-radius: var(--radius);
+  padding: 16px;
+  margin-bottom: 12px;
+}
+
+.balance-card { text-align: center; padding: 24px 16px; }
+.balance-card .label { color: var(--hint); font-size: 13px; }
+.balance-card .amount { font-size: 32px; font-weight: 700; margin: 6px 0; letter-spacing: -0.5px; }
+.balance-card .unit { font-size: 15px; font-weight: 400; color: var(--hint); }
+
+.balance-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 14px; }
+.balance-grid div { background: var(--bg); border-radius: 10px; padding: 10px; }
+.balance-grid .k { color: var(--hint); font-size: 12px; }
+.balance-grid .v { font-weight: 600; font-size: 15px; }
+
+h2 { font-size: 17px; margin: 22px 0 10px; }
+
+/* --- rows ---------------------------------------------------------------- */
+.row {
+  display: flex; justify-content: space-between; align-items: center; gap: 12px;
+  padding: 12px 0; border-bottom: 1px solid var(--bg);
+}
+.row:last-child { border-bottom: none; }
+.row .main { min-width: 0; }
+.row .title { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.row .sub { color: var(--hint); font-size: 12.5px; }
+.row .end { text-align: left; white-space: nowrap; }
+
+/* --- badges -------------------------------------------------------------- */
+.badge {
+  display: inline-block; padding: 3px 9px; border-radius: 20px;
+  font-size: 11.5px; font-weight: 600; white-space: nowrap;
+}
+.badge.ok { background: rgba(52,199,89,.16); color: var(--ok); }
+.badge.warn { background: rgba(255,149,0,.16); color: var(--warn); }
+.badge.bad { background: rgba(255,59,48,.16); color: var(--bad); }
+.badge.neutral { background: var(--bg); color: var(--hint); }
+
+/* --- forms & buttons ----------------------------------------------------- */
+button.primary {
+  width: 100%; padding: 14px; border: none; border-radius: var(--radius);
+  background: var(--button); color: var(--button-text);
+  font-size: 16px; font-weight: 600; font-family: inherit; cursor: pointer;
+}
+button.primary:disabled { opacity: .5; }
+button.ghost {
+  width: 100%; padding: 12px; border: none; border-radius: var(--radius);
+  background: var(--secondary-bg); color: var(--link);
+  font-size: 15px; font-weight: 600; font-family: inherit; cursor: pointer;
+}
+
+input {
+  width: 100%; padding: 13px; margin-bottom: 10px;
+  border: none; border-radius: var(--radius);
+  background: var(--bg); color: var(--text);
+  font-size: 16px; font-family: inherit; text-align: right;
+}
+input:focus { outline: 2px solid var(--link); }
+
+label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 6px; }
+
+.fee-preview { font-size: 13px; color: var(--hint); margin: 4px 0 12px; line-height: 1.9; }
+.fee-preview b { color: var(--text); font-weight: 600; }
+
+.empty { text-align: center; color: var(--hint); padding: 36px 16px; }
+.error { background: rgba(255,59,48,.12); color: var(--bad); padding: 12px; border-radius: var(--radius); margin-bottom: 12px; }
+.notice { background: rgba(255,149,0,.12); color: var(--warn); padding: 12px; border-radius: var(--radius); font-size: 13px; margin-bottom: 12px; }
+
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; direction: ltr; unicode-bidi: embed; }
+
+/* --- tab bar ------------------------------------------------------------- */
+#tabbar {
+  position: fixed; bottom: 0; right: 0; left: 0;
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  background: var(--secondary-bg);
+  border-top: 1px solid var(--bg);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+#tabbar button {
+  padding: 14px 4px; border: none; background: none;
+  color: var(--hint); font-size: 12.5px; font-family: inherit; font-weight: 600; cursor: pointer;
+}
+#tabbar button.active { color: var(--link); }

@@ -480,6 +480,163 @@ export function buildRouter(container: Container): Router {
     };
   });
 
+  /**
+   * Authenticate a Mini App request and require that the user actually owns a
+   * shop. Mini App routes are the same use cases as the API key routes; only
+   * the way the caller proves who they are differs.
+   */
+  async function miniAppMerchant(ctx: RequestContext): Promise<string> {
+    const auth = await authenticateTelegram(db, config, ctx);
+    ctx.auth = { kind: 'TELEGRAM', userId: auth.userId, merchantId: auth.merchantId ?? undefined };
+    if (!auth.merchantId) {
+      throw new NotFoundError('merchant');
+    }
+    return auth.merchantId;
+  }
+
+  router.get('/v1/app/invoices', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const limit = Math.min(Number.parseInt(ctx.query.get('limit') ?? '20', 10) || 20, 100);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, invoice_number, base_amount::text, customer_total_amount::text,
+              platform_fee_amount::text, merchant_net_amount::text, fee_mode, status,
+              expires_at, created_at, provider_payment_url
+         FROM core.invoices
+        WHERE merchant_id = $1
+        ORDER BY created_at DESC
+        LIMIT $2`,
+      [merchantId, limit],
+    );
+    return { status: 200, body: { data: r.rows.map(serialiseInvoice) } };
+  });
+
+  router.post('/v1/app/invoices', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+
+    const body = asObject(ctx.body);
+    const feeMode = body['fee_mode'];
+    if (feeMode !== undefined && !isFeeMode(feeMode)) {
+      throw new ValidationError('INVALID_FEE_MODE', 'fee_mode must be CUSTOMER, MERCHANT or SPLIT');
+    }
+
+    const invoice = await createInvoice(db, config, {
+      merchantId,
+      baseAmount: requireString(body, 'amount'),
+      feeMode: feeMode as never,
+      description: optionalString(body, 'description'),
+    });
+
+    // Checkout is attached after the financial transaction has committed.
+    let paymentUrl: string | null = null;
+    try {
+      const providerInvoice = await provider.createInvoice({
+        internalInvoiceId: invoice.invoiceId,
+        amount: invoice.customerTotal,
+        description: optionalString(body, 'description'),
+        callbackUrl: `${config.app.appUrl}/v1/webhooks/cubepay`,
+      });
+      paymentUrl = providerInvoice.paymentUrl;
+      await db.query(
+        `UPDATE core.invoices SET provider_invoice_id = $2, provider_payment_url = $3, updated_at = NOW()
+          WHERE id = $1`,
+        [invoice.invoiceId, providerInvoice.externalInvoiceId, providerInvoice.paymentUrl],
+      );
+    } catch (e) {
+      logger.warn('provider.create_invoice_failed', {
+        invoiceId: invoice.invoiceId,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+
+    return {
+      status: 201,
+      body: {
+        id: invoice.invoiceId,
+        invoice_number: invoice.invoiceNumber,
+        amount: invoice.baseAmount,
+        customer_total: invoice.customerTotal,
+        platform_fee: invoice.platformFee,
+        merchant_net: invoice.merchantNet,
+        fee_mode: invoice.feeMode,
+        status: invoice.status,
+        expires_at: invoice.expiresAt,
+        payment_url: paymentUrl,
+      },
+    };
+  });
+
+  router.get('/v1/app/payouts', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, status, amount_toman::text, gram_amount_atomic::text, rate::text,
+              destination_address, transaction_hash, created_at, confirmed_at, failure_code
+         FROM finance.payouts
+        WHERE merchant_id = $1
+        ORDER BY created_at DESC
+        LIMIT 25`,
+      [merchantId],
+    );
+    return { status: 200, body: { data: r.rows.map(serialisePayout) } };
+  });
+
+  router.get('/v1/app/wallets', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, address, network, status, hold_until, verified_at, created_at
+         FROM core.wallets WHERE merchant_id = $1 ORDER BY created_at DESC`,
+      [merchantId],
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/v1/app/wallets', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const address = requireString(asObject(ctx.body), 'address');
+
+    if (!isValidTonAddress(address)) {
+      throw new ValidationError('INVALID_WALLET_ADDRESS', 'not a valid TON address');
+    }
+
+    const walletId = randomUUID();
+    const holdUntil = new Date(Date.now() + 24 * 3600 * 1000);
+
+    // Registering a new wallet retires the previous one, so a merchant always
+    // has exactly one payout destination. Both steps share a transaction: a
+    // half-applied change could leave the merchant with no active wallet.
+    const created = await db.transaction(async (tx) => {
+      const inserted = await tx.query<{ id: string }>(
+        `INSERT INTO core.wallets (id, merchant_id, network, asset, address, status, hold_until)
+         VALUES ($1,$2,$3,'GRAM',$4,'SECURITY_HOLD',$5)
+         ON CONFLICT (network, asset, address) DO NOTHING
+         RETURNING id`,
+        [walletId, merchantId, config.treasury.network, address, holdUntil.toISOString()],
+      );
+      if (inserted.rows.length === 0) return false;
+
+      await tx.query(
+        `UPDATE core.wallets SET status = 'DISABLED', updated_at = NOW()
+          WHERE merchant_id = $1 AND id <> $2 AND status IN ('ACTIVE','SECURITY_HOLD')`,
+        [merchantId, walletId],
+      );
+      return true;
+    });
+
+    if (!created) {
+      throw new ConflictError('WALLET_ALREADY_REGISTERED', 'this address is already registered');
+    }
+
+    return {
+      status: 201,
+      body: {
+        id: walletId,
+        address,
+        network: config.treasury.network,
+        status: 'SECURITY_HOLD',
+        usable_after: holdUntil.toISOString(),
+      },
+    };
+  });
+
   return router;
 }
 

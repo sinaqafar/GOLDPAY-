@@ -76,6 +76,7 @@ apps/
   worker/      the payment → payout pipeline
   scheduler/   integrity sweeps and housekeeping
   bot/         Telegram bot
+  mini-app/    Telegram Mini App (static UI + API proxy)
 db/migrations/ schema (numbered, checksummed)
 tests/         unit, integration and the golden-path end-to-end test
 ```
@@ -96,8 +97,9 @@ npm run dev            # API      → http://localhost:3000
 npm run worker         # pipeline
 npm run scheduler      # integrity sweeps
 npm run bot            # Telegram bot
+npm run mini-app       # Mini App → http://localhost:3002
 
-npm test               # 106 tests
+npm test               # 133 tests
 npm run typecheck
 ```
 
@@ -133,6 +135,19 @@ carry a valid signature.
 | `POST /v1/integrations/webhooks` | Register a webhook endpoint |
 | `POST /v1/webhooks/cubepay` | Inbound provider callback |
 | `GET /health/{live,ready,dependencies}` | Health |
+
+### Mini App
+
+The Mini App authenticates with Telegram `initData` instead of an API key: the
+client sends `X-Telegram-Init-Data`, and the server recomputes Telegram's HMAC
+over the sorted field list. A forged signature, an altered payload or a stale
+`auth_date` is refused. Its routes (`/v1/app/*`, `/v1/me`) call exactly the same
+use cases as the merchant API — only the proof of identity differs.
+
+It runs as its own process because the API sends `x-frame-options: DENY` (it
+serves machines), while Telegram must embed the Mini App in an iframe. The Mini
+App server therefore sets `frame-ancestors` for Telegram only, and proxies
+`/v1/*` to the API so the browser never needs to know the API's address.
 
 Outbound webhooks are signed with `X-Gateway-Event-Signature` and carry a stable
 `X-Gateway-Event-Id`, so merchants can deduplicate. Delivery is retried with

@@ -5,6 +5,8 @@ dist/
 .env.*
 !.env.example
 .pgdata/
+.demo/
+.verify/
 coverage/
 *.log
 .DS_Store
