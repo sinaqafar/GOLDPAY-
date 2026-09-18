@@ -163,3 +163,21 @@ describe('rate parsing without floats', () => {
     expect((await provider.getQuote()).tomanPerGram).toBe('75000000');
   });
 });
+
+describe('amount ceiling', () => {
+  it('rejects an amount too large for the NUMERIC(30,0) columns', async () => {
+    const { createInvoice } = await import('../../packages/core/src/use-cases/create-invoice.ts');
+    const explodingDb = {
+      transaction: async () => {
+        throw new Error('validation must happen before any SQL runs');
+      },
+    };
+
+    await expect(
+      createInvoice(explodingDb as never, { fees: { platformFeePercent: null } } as never, {
+        merchantId: 'm-1',
+        baseAmount: '9'.repeat(40),
+      }),
+    ).rejects.toMatchObject({ code: 'AMOUNT_TOO_LARGE' });
+  });
+});

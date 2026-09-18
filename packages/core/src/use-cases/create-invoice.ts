@@ -44,6 +44,16 @@ export interface CreateInvoiceResult {
 const MAX_EXPIRY_SECONDS = 30 * 24 * 3600;
 const MIN_EXPIRY_SECONDS = 60;
 
+/**
+ * Largest base amount we accept, in Toman.
+ *
+ * The storage columns are NUMERIC(30,0), i.e. 30 digits. A CUSTOMER-mode
+ * invoice stores up to 1.15x the base, so a 28-digit ceiling leaves ample room
+ * for every derived figure while still being astronomically above any real
+ * transaction.
+ */
+const MAX_TOMAN_AMOUNT = 10n ** 28n;
+
 export async function createInvoice(
   db: Database,
   config: Config,
@@ -63,6 +73,15 @@ export async function createInvoice(
   }
   if (!baseAmount.isPositive()) {
     throw new ValidationError('INVALID_AMOUNT', 'base amount must be greater than zero');
+  }
+  // Toman columns are NUMERIC(30,0). Reject anything that cannot fit BEFORE it
+  // reaches SQL, otherwise the driver raises a numeric overflow and the caller
+  // sees a 500 for what is plainly bad input. The ceiling is applied to the
+  // customer total, which is the largest derived figure (up to 115% of base).
+  if (baseAmount.atomic > MAX_TOMAN_AMOUNT) {
+    throw new ValidationError('AMOUNT_TOO_LARGE', 'amount exceeds the maximum supported value', {
+      maximum: MAX_TOMAN_AMOUNT.toString(),
+    });
   }
 
   const feeMode = input.feeMode ?? config.fees.defaultFeeMode;
