@@ -44,6 +44,18 @@ export async function recordTransition(
 }
 
 /**
+ * Tables that may be driven by a guarded transition. Each must have `id`,
+ * `status` and `updated_at` columns.
+ */
+const ALLOWED_TRANSITION_TABLES = new Set([
+  'core.invoices',
+  'core.payments',
+  'core.merchants',
+  'core.wallets',
+  'finance.payouts',
+]);
+
+/**
  * Perform a guarded state transition.
  * The UPDATE only matches when the row is still in `fromState`, so two workers
  * racing on the same entity cannot both advance it.
@@ -64,6 +76,13 @@ export async function transitionState(
     metadata?: Record<string, unknown>;
   },
 ): Promise<void> {
+  // The table name is interpolated, so it must be proven safe. Call sites are
+  // all internal, but an allow-list means a future caller cannot turn this into
+  // an injection point.
+  if (!ALLOWED_TRANSITION_TABLES.has(params.table)) {
+    throw new Error(`transitionState called with a non-allow-listed table: ${params.table}`);
+  }
+
   const froms = Array.isArray(params.fromState) ? params.fromState : [params.fromState as string];
 
   const setParts: string[] = ["status = $1", 'updated_at = NOW()'];

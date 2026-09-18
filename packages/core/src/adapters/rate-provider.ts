@@ -11,6 +11,16 @@ import { IntegrationError, ValidationError } from '../../../errors/src/index.ts'
 
 const DECIMAL_RE = /^\d+(\.\d+)?$/;
 
+/**
+ * Positivity check without floating point: a decimal string is > 0 exactly when
+ * it contains a non-zero digit. Parsing to a float here could round a very small
+ * rate to 0 (or a very large one to Infinity), which is precisely the class of
+ * bug this codebase forbids in money paths.
+ */
+function isPositiveDecimal(value: string): boolean {
+  return DECIMAL_RE.test(value) && /[1-9]/.test(value);
+}
+
 /** A fixed rate, for tests and for manual operator-set pricing. */
 export class StaticRateProvider implements RateProvider {
   #tomanPerGram: string;
@@ -21,7 +31,7 @@ export class StaticRateProvider implements RateProvider {
     if (!DECIMAL_RE.test(tomanPerGram)) {
       throw new ValidationError('INVALID_RATE', 'rate must be a positive decimal string');
     }
-    if (Number.parseFloat(tomanPerGram) <= 0) {
+    if (!isPositiveDecimal(tomanPerGram)) {
       throw new ValidationError('INVALID_RATE', 'rate must be greater than zero');
     }
     this.#tomanPerGram = tomanPerGram;
@@ -74,7 +84,7 @@ export class HttpRateProvider implements RateProvider {
       const body = (await res.json()) as Record<string, unknown>;
       const raw = body['toman_per_gram'] ?? body['rate'] ?? body['price'];
       const value = typeof raw === 'number' ? String(raw) : typeof raw === 'string' ? raw : null;
-      if (!value || !DECIMAL_RE.test(value) || Number.parseFloat(value) <= 0) {
+      if (!value || !isPositiveDecimal(value)) {
         throw new IntegrationError('RATE_INVALID', 'rate source returned an unusable rate', {
           retryable: false,
           details: { raw },
