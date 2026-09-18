@@ -11,6 +11,11 @@
 import { createServer, type IncomingMessage, type ServerResponse, type Server } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { AppError } from '../../../packages/errors/src/index.ts';
+import {
+  ruleFor,
+  type TokenBucketRateLimiter,
+} from '../../../packages/core/src/rate-limit.ts';
+import { createHash } from 'node:crypto';
 import type { Logger } from '../../../packages/core/src/logger.ts';
 
 export interface RequestContext {
@@ -145,10 +150,13 @@ export interface ServerOptions {
   logger: Logger;
   /** Trust `x-forwarded-for` only behind a known proxy. */
   trustProxy?: boolean;
+  /** Omit to disable rate limiting (tests, single-user development). */
+  rateLimiter?: TokenBucketRateLimiter;
 }
 
 export function createHttpServer(options: ServerOptions): Server {
   const { router, logger } = options;
+  const rateLimiter = options.rateLimiter;
 
   return createServer((req: IncomingMessage, res: ServerResponse) => {
     void handle(req, res).catch((e) => {
@@ -254,6 +262,36 @@ export function createHttpServer(options: ServerOptions): Server {
         ? (headerValue(req, 'x-forwarded-for')?.split(',')[0]?.trim() ?? req.socket.remoteAddress ?? '')
         : (req.socket.remoteAddress ?? '');
 
+      if (rateLimiter) {
+        // Key on the credential where one exists, falling back to IP. Keying on
+        // IP alone would let every caller behind one NAT share a single budget,
+        // and would let a caller rotate IPs to escape the limit entirely.
+        const credential = headerValue(req, 'authorization');
+        const identity = credential ? `key:${sha256Short(credential)}` : `ip:${ip}`;
+        const { name, rule } = ruleFor(method, url.pathname);
+        const decision = rateLimiter.check(`${identity}:${name}`, rule);
+
+        if (!decision.allowed) {
+          logger.warn('http.rate_limited', { path: url.pathname, bucket: name, requestId });
+          send({
+            status: 429,
+            headers: {
+              'retry-after': String(decision.retryAfterSeconds),
+              'x-ratelimit-limit': String(decision.limit),
+              'x-ratelimit-remaining': '0',
+            },
+            body: {
+              error: {
+                code: 'RATE_LIMITED',
+                message: 'too many requests',
+                retryable: true,
+              },
+            },
+          });
+          return;
+        }
+      }
+
       const ctx: RequestContext = {
         method,
         path: url.pathname,
@@ -330,4 +368,9 @@ export function toErrorResponse(e: unknown, logger: Logger, requestId: string): 
 function headerValue(req: IncomingMessage, name: string): string | undefined {
   const v = req.headers[name];
   return Array.isArray(v) ? v[0] : v;
+}
+
+/** Short, non-reversible fingerprint of a credential, for rate-limit keying. */
+function sha256Short(value: string): string {
+  return createHash('sha256').update(value).digest('hex').slice(0, 24);
 }

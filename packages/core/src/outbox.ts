@@ -14,6 +14,8 @@ export type OutboxEventType =
   | 'merchant.created'
   | 'merchant.activated'
   | 'invoice.created'
+  | 'invoice.cancelled'
+  | 'invoice.expired'
   | 'payment.detected'
   | 'payment.verified'
   | 'payment.released'

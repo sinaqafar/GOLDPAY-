@@ -233,3 +233,86 @@ export async function expireStaleInvoices(db: Database): Promise<number> {
   );
   return r.rowCount;
 }
+
+/**
+ * Cancel an invoice — SPEC 124 (invoice lifecycle).
+ *
+ * Only an invoice that has not been paid may be cancelled. A verified payment
+ * is a financial fact: cancelling the invoice it belongs to must never unwind
+ * it, so a PAID invoice is refused and the caller is pointed at refunds
+ * instead.
+ *
+ * The row is locked and the status re-checked inside the transaction, because a
+ * callback can arrive between reading and writing.
+ */
+export async function cancelInvoice(
+  db: Database,
+  params: { merchantId: string; invoiceId: string; reason?: string },
+): Promise<{ invoiceId: string; status: 'CANCELLED'; alreadyCancelled: boolean }> {
+  return db.transaction(async (tx) => {
+    const r = await tx.query<{ id: string; merchant_id: string; status: string }>(
+      'SELECT id, merchant_id, status FROM core.invoices WHERE id = $1 FOR UPDATE',
+      [params.invoiceId],
+    );
+    const invoice = r.rows[0];
+    if (!invoice) throw new NotFoundError('invoice', params.invoiceId);
+
+    // Tenant check inside the lock: never leak another merchant's invoice,
+    // and never let one cancel it either.
+    if (invoice.merchant_id !== params.merchantId) {
+      throw new NotFoundError('invoice', params.invoiceId);
+    }
+
+    // Idempotent: cancelling twice is not an error.
+    if (invoice.status === 'CANCELLED') {
+      return { invoiceId: invoice.id, status: 'CANCELLED' as const, alreadyCancelled: true };
+    }
+
+    if (invoice.status !== 'CREATED') {
+      throw new ConflictError(
+        'INVOICE_NOT_CANCELLABLE',
+        `an invoice in status ${invoice.status} cannot be cancelled`,
+        { status: invoice.status },
+      );
+    }
+
+    // A payment may have arrived and be mid-verification even though the
+    // invoice still reads CREATED. Refuse rather than race it.
+    const payment = await tx.query<{ id: string }>(
+      `SELECT id FROM core.payments
+        WHERE invoice_id = $1 AND status IN ('VERIFIED','PENDING','REVIEW')`,
+      [params.invoiceId],
+    );
+    if (payment.rows.length > 0) {
+      throw new ConflictError(
+        'INVOICE_HAS_PAYMENT',
+        'this invoice already has a payment in progress or verified',
+      );
+    }
+
+    await tx.query(
+      `UPDATE core.invoices SET status = 'CANCELLED', updated_at = NOW()
+        WHERE id = $1 AND status = 'CREATED'`,
+      [params.invoiceId],
+    );
+
+    await recordTransition(tx, {
+      entityType: 'INVOICE',
+      entityId: params.invoiceId,
+      fromState: 'CREATED',
+      toState: 'CANCELLED',
+      event: 'CANCEL',
+      actorType: 'MERCHANT',
+      metadata: params.reason ? { reason: params.reason.slice(0, 200) } : {},
+    });
+
+    await enqueue(tx, {
+      eventType: 'invoice.cancelled',
+      aggregateType: 'INVOICE',
+      aggregateId: params.invoiceId,
+      payload: { invoice_id: params.invoiceId, merchant_id: params.merchantId },
+    });
+
+    return { invoiceId: invoice.id, status: 'CANCELLED' as const, alreadyCancelled: false };
+  });
+}

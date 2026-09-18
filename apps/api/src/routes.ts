@@ -16,7 +16,7 @@ import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.t
 import { registerAdminRoutes } from './admin-routes.ts';
 import { readPageRequest, buildPage } from './pagination.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
-import { createInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
+import { createInvoice, cancelInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
 import { runIdempotent, hashRequest } from '../../../packages/core/src/idempotency.ts';
 import { isFeeMode } from '../../../packages/core/src/fees.ts';
@@ -193,6 +193,32 @@ export function buildRouter(container: Container): Router {
     return { status: 200, body: buildPage(r.rows, page.limit, serialiseInvoice) };
   });
 
+  router.post('/v1/invoices/:id/cancel', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = ctx.body === undefined ? {} : asObject(ctx.body);
+    const reason = body['reason'];
+    if (reason !== undefined && typeof reason !== 'string') {
+      throw new ValidationError('INVALID_REASON', 'reason must be a string');
+    }
+
+    const result = await cancelInvoice(db, {
+      merchantId: auth.merchantId,
+      invoiceId: ctx.params['id'] as string,
+      reason: reason as string | undefined,
+    });
+
+    return {
+      status: 200,
+      body: {
+        id: result.invoiceId,
+        status: result.status,
+        already_cancelled: result.alreadyCancelled,
+      },
+    };
+  });
+
   // --- payments -------------------------------------------------------------
 
   router.get('/v1/payments/:id', async (ctx) => {
@@ -209,20 +235,137 @@ export function buildRouter(container: Container): Router {
     if (!payment) throw new NotFoundError('payment', ctx.params['id']);
     assertTenant(ctx, payment['merchant_id'] as string);
 
+    return { status: 200, body: serialisePayment(payment) };
+  });
+
+  router.get('/v1/payments', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const page = readPageRequest(ctx.query);
+
+    // Filters are optional and always ANDed on top of the tenant scope, so no
+    // combination of them can widen access beyond this merchant (SPEC 97 IDOR).
+    const status = ctx.query.get('status');
+    if (status !== null && !/^[A-Z_]{2,32}$/.test(status)) {
+      throw new ValidationError('INVALID_STATUS_FILTER', 'status filter is malformed');
+    }
+    const invoiceId = ctx.query.get('invoice_id');
+    if (invoiceId !== null && !UUID_RE.test(invoiceId)) {
+      throw new ValidationError('INVALID_INVOICE_FILTER', 'invoice_id must be a UUID');
+    }
+    const from = parseDateFilter(ctx.query.get('from'), 'from');
+    const to = parseDateFilter(ctx.query.get('to'), 'to');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, merchant_id, invoice_id, status, verified_amount::text, currency,
+              verified_paid_at, release_at, released_at, mismatch_code, created_at
+         FROM core.payments
+        WHERE merchant_id = $1
+          AND ($2::text IS NULL OR status = $2)
+          AND ($3::uuid IS NULL OR invoice_id = $3)
+          AND ($4::timestamptz IS NULL OR created_at >= $4)
+          AND ($5::timestamptz IS NULL OR created_at <= $5)
+          AND ($6::timestamptz IS NULL OR (created_at, id) < ($6::timestamptz, $7::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $8`,
+      [
+        auth.merchantId,
+        status,
+        invoiceId,
+        from,
+        to,
+        page.cursor?.createdAt ?? null,
+        page.cursor?.id ?? null,
+        page.limit + 1,
+      ],
+    );
+    return { status: 200, body: buildPage(r.rows, page.limit, serialisePayment) };
+  });
+
+  // --- API keys ---------------------------------------------------------------
+  //
+  // SPEC 101453-101459. The secret is shown exactly once, at creation: only its
+  // hash is stored, so it is not merely policy but physically unrecoverable
+  // afterwards.
+
+  router.post('/v1/api-keys', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const body = asObject(ctx.body);
+    const name = body['name'];
+    if (typeof name !== 'string' || name.trim().length === 0 || name.length > 64) {
+      throw new ValidationError('INVALID_KEY_NAME', 'name is required, at most 64 characters');
+    }
+
+    const active = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM core.api_keys
+        WHERE merchant_id = $1 AND status = 'ACTIVE'`,
+      [auth.merchantId],
+    );
+    // A bounded number of live credentials keeps the blast radius of a leak
+    // small and makes rotation a deliberate act rather than accumulation.
+    if (Number(active.rows[0]?.count ?? '0') >= 10) {
+      throw new ConflictError('TOO_MANY_API_KEYS', 'revoke an existing key before creating another');
+    }
+
+    const key = generateApiKey();
+    const id = randomUUID();
+    await db.query(
+      `INSERT INTO core.api_keys (id, merchant_id, name, key_prefix, secret_hash, status)
+       VALUES ($1,$2,$3,$4,$5,'ACTIVE')`,
+      [id, auth.merchantId, name.trim(), key.prefix, key.secretHash],
+    );
+
     return {
-      status: 200,
+      status: 201,
       body: {
-        id: payment['id'],
-        invoice_id: payment['invoice_id'],
-        status: payment['status'],
-        amount: payment['verified_amount'],
-        currency: payment['currency'],
-        paid_at: payment['verified_paid_at'],
-        releasable_at: payment['release_at'],
-        released_at: payment['released_at'],
-        mismatch_code: payment['mismatch_code'],
+        id,
+        name: name.trim(),
+        key_prefix: key.prefix,
+        // Shown once. There is no endpoint that can return it again.
+        api_key: key.token,
+        created_at: new Date().toISOString(),
       },
     };
+  });
+
+  router.get('/v1/api-keys', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, name, key_prefix, status, last_used_at, created_at, revoked_at
+         FROM core.api_keys WHERE merchant_id = $1 ORDER BY created_at DESC`,
+      [auth.merchantId],
+    );
+    // Never the hash, never the secret.
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/v1/api-keys/:id/revoke', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    const keyId = ctx.params['id'] as string;
+    if (!UUID_RE.test(keyId)) throw new NotFoundError('api_key', keyId);
+
+    const updated = await db.query(
+      `UPDATE core.api_keys SET status = 'REVOKED', revoked_at = NOW()
+        WHERE id = $1 AND merchant_id = $2 AND status = 'ACTIVE'`,
+      [keyId, auth.merchantId],
+    );
+    if (updated.rowCount !== 1) {
+      // Either it does not exist, belongs to someone else, or is already
+      // revoked. All three answer the same way so the endpoint cannot be used
+      // to discover which keys exist.
+      throw new NotFoundError('api_key', keyId);
+    }
+
+    // Revocation stops future use; it never rewrites financial history
+    // (SPEC 7672).
+    return { status: 200, body: { id: keyId, status: 'REVOKED' } };
   });
 
   // --- balances -------------------------------------------------------------
@@ -682,6 +825,39 @@ function optionalInt(body: Record<string, unknown>, key: string): number | undef
   if (typeof v === 'number' && Number.isInteger(v)) return v;
   if (typeof v === 'string' && /^\d+$/.test(v)) return Number.parseInt(v, 10);
   throw new ValidationError('INVALID_FIELD', `${key} must be an integer`);
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Parse an optional ISO date filter, rejecting garbage rather than ignoring it. */
+function parseDateFilter(value: string | null, field: string): string | null {
+  if (value === null || value === '') return null;
+  if (Number.isNaN(Date.parse(value))) {
+    throw new ValidationError('INVALID_DATE_FILTER', `${field} must be an ISO-8601 timestamp`, {
+      field,
+    });
+  }
+  return new Date(value).toISOString();
+}
+
+/**
+ * Merchant-facing payment shape.
+ * Internal columns (provider fee expectations, raw evidence) are deliberately
+ * absent: SPEC 101385 keeps platform-internal figures out of merchant APIs.
+ */
+function serialisePayment(row: Record<string, unknown>): Record<string, unknown> {
+  return {
+    id: row['id'],
+    invoice_id: row['invoice_id'],
+    status: row['status'],
+    amount: row['verified_amount'],
+    currency: row['currency'],
+    paid_at: row['verified_paid_at'],
+    releasable_at: row['release_at'],
+    released_at: row['released_at'],
+    mismatch_code: row['mismatch_code'],
+    created_at: row['created_at'],
+  };
 }
 
 function serialiseInvoice(row: Record<string, unknown>): Record<string, unknown> {

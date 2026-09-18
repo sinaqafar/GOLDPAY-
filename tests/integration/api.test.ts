@@ -439,3 +439,80 @@ describe('error handling', () => {
     expect(text).not.toContain('.ts:');
   });
 });
+
+describe('payments list, cancellation and API keys', () => {
+  it('lists payments scoped to the merchant, with pagination', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/payments?limit=5');
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.envelope['data'])).toBe(true);
+    expect(res.envelope['pagination']).toBeTruthy();
+  });
+
+  it('rejects a malformed filter rather than silently ignoring it', async () => {
+    const bad = await call(keyA.token, 'GET', '/v1/payments?invoice_id=not-a-uuid');
+    expect(bad.status).toBe(400);
+    expect(bad.body['error'].code).toBe('INVALID_INVOICE_FILTER');
+
+    const badDate = await call(keyA.token, 'GET', '/v1/payments?from=yesterday');
+    expect(badDate.status).toBe(400);
+    expect(badDate.body['error'].code).toBe('INVALID_DATE_FILTER');
+  });
+
+  it('cancels an unpaid invoice, and is idempotent about it', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '50000' });
+    expect(created.status).toBe(201);
+    const id = created.body.id as string;
+
+    const first = await call(keyA.token, 'POST', `/v1/invoices/${id}/cancel`, { reason: 'test' });
+    expect(first.status).toBe(200);
+    expect(first.body.status).toBe('CANCELLED');
+    expect(first.body.already_cancelled).toBe(false);
+
+    const second = await call(keyA.token, 'POST', `/v1/invoices/${id}/cancel`);
+    expect(second.status).toBe(200);
+    expect(second.body.already_cancelled).toBe(true);
+  });
+
+  it("will not let one merchant cancel another's invoice", async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '60000' });
+    const id = created.body.id as string;
+
+    // 404, not 403: B must not learn that this invoice exists at all.
+    const res = await call(keyB.token, 'POST', `/v1/invoices/${id}/cancel`);
+    expect(res.status).toBe(404);
+  });
+
+  it('issues an API key, shows the secret once, and never again', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/api-keys', { name: 'CI key' });
+    expect(created.status).toBe(201);
+    expect(created.body.api_key).toBeTruthy();
+    expect(created.body.key_prefix).toBeTruthy();
+
+    const list = await call(keyA.token, 'GET', '/v1/api-keys');
+    expect(list.status).toBe(200);
+    const serialised = JSON.stringify(list.envelope);
+    // Neither the secret nor its hash may appear in any listing.
+    expect(serialised).not.toContain(created.body.api_key as string);
+    expect(serialised).not.toContain('secret_hash');
+  });
+
+  it('revokes a key and answers 404 for one that is not the caller’s', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/api-keys', { name: 'to revoke' });
+    const id = created.body.id as string;
+
+    const revoked = await call(keyA.token, 'POST', `/v1/api-keys/${id}/revoke`);
+    expect(revoked.status).toBe(200);
+    expect(revoked.body.status).toBe('REVOKED');
+
+    // Revoking twice, or revoking someone else's, is indistinguishable — the
+    // endpoint must not be usable to discover which keys exist.
+    expect((await call(keyA.token, 'POST', `/v1/api-keys/${id}/revoke`)).status).toBe(404);
+    expect((await call(keyB.token, 'POST', `/v1/api-keys/${id}/revoke`)).status).toBe(404);
+  });
+
+  it('refuses a nameless key', async () => {
+    const res = await call(keyA.token, 'POST', '/v1/api-keys', { name: '   ' });
+    expect(res.status).toBe(400);
+    expect(res.body['error'].code).toBe('INVALID_KEY_NAME');
+  });
+});

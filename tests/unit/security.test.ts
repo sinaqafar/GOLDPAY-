@@ -22,6 +22,10 @@ import { SecurityError, ConfigError } from '../../packages/errors/src/index.ts';
 import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/webhooks.ts';
 import { TEST_ENV } from '../helpers/harness.ts';
 import { StubSigner } from '../../packages/ton/src/signer.ts';
+import {
+  TokenBucketRateLimiter,
+  ruleFor,
+} from '../../packages/core/src/rate-limit.ts';
 
 const SECRET = 'test-secret-value';
 
@@ -290,5 +294,63 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     expect(() => new StubSigner(tonConfig, { isProduction: true })).toThrow(
       /never be used in production/,
     );
+  });
+});
+
+describe('rate limiting (SPEC 253)', () => {
+  it('allows the sustained rate and refuses the excess', () => {
+    let clock = 0;
+    const limiter = new TokenBucketRateLimiter({ now: () => clock });
+    const rule = { limit: 5, windowSeconds: 60 };
+
+    for (let i = 0; i < 5; i++) {
+      expect(limiter.check('caller', rule).allowed).toBe(true);
+    }
+    const blocked = limiter.check('caller', rule);
+    expect(blocked.allowed).toBe(false);
+    expect(blocked.retryAfterSeconds).toBeGreaterThan(0);
+  });
+
+  it('refills continuously instead of resetting on a window edge', () => {
+    // A fixed window would let a caller spend the full budget twice across the
+    // boundary. A token bucket refills smoothly, so it cannot.
+    let clock = 0;
+    const limiter = new TokenBucketRateLimiter({ now: () => clock });
+    const rule = { limit: 60, windowSeconds: 60 };
+
+    for (let i = 0; i < 60; i++) limiter.check('caller', rule);
+    expect(limiter.check('caller', rule).allowed).toBe(false);
+
+    // One second later exactly one token is back.
+    clock += 1000;
+    expect(limiter.check('caller', rule).allowed).toBe(true);
+    expect(limiter.check('caller', rule).allowed).toBe(false);
+  });
+
+  it('keeps callers independent of one another', () => {
+    let clock = 0;
+    const limiter = new TokenBucketRateLimiter({ now: () => clock });
+    const rule = { limit: 2, windowSeconds: 60 };
+
+    limiter.check('a', rule);
+    limiter.check('a', rule);
+    expect(limiter.check('a', rule).allowed).toBe(false);
+    // B is untouched by A exhausting its budget.
+    expect(limiter.check('b', rule).allowed).toBe(true);
+  });
+
+  it('gives credential issuance the tightest budget', () => {
+    expect(ruleFor('POST', '/v1/api-keys').name).toBe('SENSITIVE');
+    expect(ruleFor('POST', '/v1/wallets').name).toBe('SENSITIVE');
+    // Reading wallets is not sensitive in the same way.
+    expect(ruleFor('GET', '/v1/wallets').name).toBe('MERCHANT');
+  });
+
+  it('separates writes from reads, and provider callbacks from both', () => {
+    expect(ruleFor('POST', '/v1/invoices').name).toBe('MERCHANT_WRITE');
+    expect(ruleFor('GET', '/v1/invoices').name).toBe('MERCHANT');
+    // The provider retries legitimately, so its budget is generous.
+    expect(ruleFor('POST', '/v1/webhooks/cubepay').name).toBe('WEBHOOK');
+    expect(ruleFor('GET', '/health/live').name).toBe('PUBLIC');
   });
 });
