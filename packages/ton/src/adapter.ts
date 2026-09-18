@@ -133,6 +133,13 @@ export class TonAdapter implements BlockchainPayoutPort {
         txHash: request.txHash,
         confirmations,
         onChainAmountAtomic: parseAtomic(tx['amount']),
+        onChainDestination:
+          typeof tx['destination'] === 'string'
+            ? tx['destination']
+            : typeof tx['account'] === 'string'
+              ? tx['account']
+              : undefined,
+        networkFeeAtomic: parseAtomic(tx['total_fees'] ?? tx['fee']),
       };
     }
 
@@ -216,7 +223,12 @@ function parseAtomic(value: unknown): bigint | undefined {
  * It models the states the real adapter can return, including UNKNOWN.
  */
 export class InMemoryTonAdapter implements BlockchainPayoutPort {
-  #sent = new Map<string, { txHash: string; to: string; amount: bigint; confirmed: boolean }>();
+  #sent = new Map<
+    string,
+    { txHash: string; to: string; amount: bigint; confirmed: boolean; networkFee: bigint }
+  >();
+  /** Simulated gas, so settlement accounting can be exercised. */
+  #networkFee = 1_000_000n;
   #balances = new Map<string, bigint>();
   #nextOutcome: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN' = 'ACCEPTED';
   #autoConfirm: boolean;
@@ -231,6 +243,11 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
 
   setBalance(address: string, amount: bigint): void {
     this.#balances.set(address, amount);
+  }
+
+  /** Control the simulated network fee. */
+  setNetworkFee(fee: bigint): void {
+    this.#networkFee = fee;
   }
 
   isValidAddress(address: string): boolean {
@@ -254,6 +271,7 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
       to: request.to,
       amount: request.amountAtomic,
       confirmed: this.#autoConfirm,
+      networkFee: this.#networkFee,
     });
     if (outcome === 'UNKNOWN') return { status: 'UNKNOWN', error: 'SIMULATED_TIMEOUT' };
     return { status: 'ACCEPTED', txHash, raw: { simulated: true } };
@@ -268,6 +286,8 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
       txHash: record.txHash,
       confirmations: 10,
       onChainAmountAtomic: record.amount,
+      onChainDestination: record.to,
+      networkFeeAtomic: record.networkFee,
     };
   }
 

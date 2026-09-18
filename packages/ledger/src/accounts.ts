@@ -30,6 +30,14 @@ export const SYSTEM_ACCOUNTS = {
   NETWORK_FEE_EXPENSE_GRAM: { code: 'NETWORK_FEE_EXPENSE_GRAM', type: 'EXPENSE', currency: 'GRAM' },
   /** Settlement clearing: TOMAN liability discharged against GRAM sent. */
   SETTLEMENT_CLEARING_TOMAN: { code: 'SETTLEMENT_CLEARING_TOMAN', type: 'EXPENSE', currency: 'TOMAN' },
+  /**
+   * GRAM principal sent to merchants, kept separate from the network fee.
+   *
+   * Without this the only GRAM debit available was the network-fee account, so
+   * the whole payout was booked as gas and the treasury could never reconcile
+   * against the chain.
+   */
+  SETTLEMENT_CLEARING_GRAM: { code: 'SETTLEMENT_CLEARING_GRAM', type: 'EXPENSE', currency: 'GRAM' },
   /** SPEC 119.36 — genuinely unresolved items, never a dumping ground. */
   SUSPENSE_TOMAN: { code: 'SUSPENSE_TOMAN', type: 'ASSET', currency: 'TOMAN' },
 } as const;

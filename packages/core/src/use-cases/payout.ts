@@ -137,29 +137,55 @@ export async function queuePayoutForMerchant(
       // The per-payment figure must be scoped to the MERCHANT'S OWN liability
       // account: a payment journal also touches the provider clearing asset and
       // platform revenue, and summing those in would net to zero.
+      // Allocate payments up to EXACTLY the payout amount, oldest first.
+      //
+      // Two bugs live here if this is done carelessly:
+      //
+      //  1. Without the running-total cap, every unallocated payment is
+      //     attached regardless of the payout's size, so the items can sum to
+      //     more than the payout itself and the audit trail contradicts the
+      //     ledger.
+      //
+      //  2. Excluding any payment that has EVER appeared in payout_items
+      //     strands money permanently: a failed payout returns the funds to
+      //     AVAILABLE but leaves its rows behind, so the payment is spendable
+      //     in the ledger yet invisible to every future selection. Only items
+      //     belonging to a LIVE payout may exclude a payment.
+      //
+      // A payment larger than the remaining room is left for the next payout
+      // rather than partially attached, so an item always means "this payment
+      // was settled by this payout".
       await tx.query(
         `INSERT INTO finance.payout_items(payout_id, payment_id, amount_toman)
-         SELECT $1, src.payment_id, src.amount
+         SELECT $1, payment_id, amount
            FROM (
-             SELECT p.id AS payment_id,
-                    p.released_at,
-                    COALESCE((SELECT SUM(e.credit - e.debit)
-                                FROM finance.journal_entries e
-                                JOIN finance.journals j ON j.id = e.journal_id
-                               WHERE j.reference_type = 'PAYMENT'
-                                 AND j.reference_id = p.id
-                                 AND e.account_id = $3
-                                 AND e.bucket = 'AVAILABLE'), 0) AS amount
-               FROM core.payments p
-              WHERE p.merchant_id = $2
-                AND p.status = 'RELEASED'
-                AND NOT EXISTS (
-                      SELECT 1 FROM finance.payout_items pi WHERE pi.payment_id = p.id)
-           ) src
-          WHERE src.amount > 0
-          ORDER BY src.released_at ASC
+             SELECT src.payment_id,
+                    src.amount,
+                    SUM(src.amount) OVER (ORDER BY src.released_at, src.payment_id
+                                          ROWS UNBOUNDED PRECEDING) AS running_total
+               FROM (
+                 SELECT p.id AS payment_id,
+                        p.released_at,
+                        COALESCE((SELECT SUM(e.credit - e.debit)
+                                    FROM finance.journal_entries e
+                                    JOIN finance.journals j ON j.id = e.journal_id
+                                   WHERE j.reference_type = 'PAYMENT'
+                                     AND j.reference_id = p.id
+                                     AND e.account_id = $3
+                                     AND e.bucket = 'AVAILABLE'), 0) AS amount
+                   FROM core.payments p
+                  WHERE p.merchant_id = $2
+                    AND p.status = 'RELEASED'
+                    AND NOT EXISTS (
+                          SELECT 1 FROM finance.payout_items pi
+                           WHERE pi.payment_id = p.id AND pi.is_live)
+               ) src
+              WHERE src.amount > 0
+           ) ranked
+          WHERE running_total <= $4::numeric
+          ORDER BY running_total
          ON CONFLICT DO NOTHING`,
-        [payoutId, merchantId, merchantAccount],
+        [payoutId, merchantId, merchantAccount, amount.toAtomicString()],
       );
 
       // AVAILABLE -> SETTLING on the merchant's liability account.
@@ -440,7 +466,15 @@ export async function signPayout(
   payoutId: string,
   signer?: SignerPort,
 ): Promise<{ status: 'SIGNED'; signingReference: string }> {
-  return db.transaction(async (tx) => {
+  // --- phase 1: validate, inside a short transaction ------------------------
+  //
+  // The signer is an external service (KMS/HSM over the network). Calling it
+  // while holding FOR UPDATE would pin a row lock and a database connection for
+  // the whole round trip, and a slow or hanging signer would stall every other
+  // payout behind it. SPEC 56.36 forbids an external call inside a financial
+  // transaction, so validation commits first and the signer is called with no
+  // transaction open.
+  const prepared = await db.transaction(async (tx) => {
     const r = await tx.query<{
       id: string;
       status: string;
@@ -460,7 +494,7 @@ export async function signPayout(
 
     // Already signed: return the existing reference instead of signing again.
     if (payout.status === 'SIGNED' && payout.signing_reference) {
-      return { status: 'SIGNED' as const, signingReference: payout.signing_reference };
+      return { alreadySigned: true as const, signingReference: payout.signing_reference };
     }
     if (payout.status !== 'RESERVED') {
       throw new PayoutError('PAYOUT_NOT_SIGNABLE', `payout is ${payout.status}`);
@@ -496,28 +530,61 @@ export async function signPayout(
       );
     }
 
-    // The signer holds the key; we only ever store a handle to the result.
-    // SPEC 5485-5487 / 118.37: no key material touches this process.
-    //
-    // The sign request id is derived from the payout so a retry presents the
-    // SAME id, letting the signer refuse to produce a second signature for
-    // money that may already be committed (SPEC 5569/5570).
-    let signingReference: string;
-    if (signer) {
-      const signed = await signer.sign({
-        signRequestId: `payout:${payoutId}`,
-        payoutId,
-        asset: config.ton.gramAsset,
-        network: payout.destination_network,
-        destinationAddress: payout.destination_address,
-        amountAtomic: payout.gram_amount_atomic,
-        fromAddress: config.ton.payoutWalletAddress ?? '',
-      });
-      signingReference = signed.signingReference;
-    } else {
-      // No signer wired up (development). The state machine still records that
-      // signing happened, so the SIGNED stage cannot be skipped by accident.
-      signingReference = `unsigned:${payoutId}`;
+    return {
+      alreadySigned: false as const,
+      amountAtomic: payout.gram_amount_atomic,
+      destinationAddress: payout.destination_address,
+      destinationNetwork: payout.destination_network,
+    };
+  });
+
+  if (prepared.alreadySigned) {
+    return { status: 'SIGNED' as const, signingReference: prepared.signingReference };
+  }
+
+  // --- phase 2: sign, with no transaction held ------------------------------
+  //
+  // The sign request id is derived from the payout, so a retry after a crash
+  // presents the SAME id and the signer refuses to produce a second signature
+  // for money that may already be committed (SPEC 5569/5570). That idempotency
+  // is what makes it safe to do this outside the transaction.
+  let signingReference: string;
+  if (signer) {
+    const signed = await signer.sign({
+      signRequestId: `payout:${payoutId}`,
+      payoutId,
+      asset: config.ton.gramAsset,
+      network: prepared.destinationNetwork,
+      destinationAddress: prepared.destinationAddress,
+      amountAtomic: prepared.amountAtomic,
+      fromAddress: config.ton.payoutWalletAddress ?? '',
+    });
+    signingReference = signed.signingReference;
+  } else {
+    // No signer wired up (development). The state machine still records that
+    // signing happened, so the SIGNED stage cannot be skipped by accident.
+    signingReference = `unsigned:${payoutId}`;
+  }
+
+  // --- phase 3: record the signature ----------------------------------------
+  //
+  // If the process dies between phase 2 and here the payout stays RESERVED and
+  // is retried; the signer returns the same reference for the same request id
+  // rather than signing twice.
+  return db.transaction(async (tx) => {
+    const current = await tx.query<{ status: string; signing_reference: string | null }>(
+      'SELECT status, signing_reference FROM finance.payouts WHERE id = $1 FOR UPDATE',
+      [payoutId],
+    );
+    const row = current.rows[0];
+    if (!row) throw new NotFoundError('payout', payoutId);
+
+    // Another worker got there first while we were signing.
+    if (row.status === 'SIGNED' && row.signing_reference) {
+      return { status: 'SIGNED' as const, signingReference: row.signing_reference };
+    }
+    if (row.status !== 'RESERVED') {
+      throw new PayoutError('PAYOUT_NOT_SIGNABLE', `payout is ${row.status}`);
     }
 
     await transitionState(tx, {
@@ -724,14 +791,42 @@ async function markUnknown(db: Database, payoutId: string, reason: string): Prom
 // ---------------------------------------------------------------------------
 
 /**
+ * Evidence that a payout actually landed on chain.
+ *
+ * Every field is required because settlement is irreversible: once the merchant
+ * liability is closed there is nothing to undo. A caller cannot assert
+ * settlement from a transaction hash alone — the amount, destination, asset and
+ * network must all have been read back from the chain and must all match the
+ * snapshot taken when the payout was locked (SPEC 124.168, 97.115, 97.116).
+ */
+export interface ChainSettlementEvidence {
+  txHash: string;
+  /** Amount observed ON CHAIN, in nanogram. Not the amount we intended. */
+  onChainAmountAtomic: bigint;
+  /** Destination observed on chain. */
+  onChainDestination: string;
+  asset: string;
+  network: string;
+  confirmations: number;
+  /** Network fee actually charged, in nanogram, when the chain reports it. */
+  networkFeeAtomic?: bigint;
+}
+
+/**
  * Finalise a confirmed payout.
+ *
  * SPEC 119.47: close the merchant liability and reduce the treasury.
  * SPEC 119.42: a second confirmation is idempotent and creates no new settlement.
+ * SPEC 124.168: NO CHAIN CONFIRMATION -> NO SETTLED.
+ *
+ * This function is the only place a payout becomes SETTLED, so it re-verifies
+ * the evidence itself rather than trusting whoever called it.
  */
 export async function settlePayout(
   db: Database,
   payoutId: string,
-  confirmation: { txHash: string; networkFeeAtomic?: bigint },
+  confirmation: ChainSettlementEvidence,
+  options: { minConfirmations?: number } = {},
 ): Promise<{ settled: boolean }> {
   return db.transaction(
     async (tx) => {
@@ -741,8 +836,11 @@ export async function settlePayout(
         merchant_id: string;
         amount_toman: string;
         gram_amount_atomic: string | null;
+        destination_address: string;
+        destination_network: string;
       }>(
-        `SELECT id, status, merchant_id, amount_toman::text, gram_amount_atomic::text
+        `SELECT id, status, merchant_id, amount_toman::text, gram_amount_atomic::text,
+                destination_address, destination_network
            FROM finance.payouts WHERE id = $1 FOR UPDATE`,
         [payoutId],
       );
@@ -757,19 +855,72 @@ export async function settlePayout(
       const amountToman = Money.toman(payout.amount_toman);
       const gramAmount = Money.gram(payout.gram_amount_atomic ?? '0');
 
+      // --- verify the chain evidence before anything is posted ---------------
+      //
+      // These are the same guards the broadcast path applies, re-applied here
+      // because settlement is irreversible and this is the last gate.
+
+      if (confirmation.asset !== 'GRAM') {
+        throw new PayoutError('SETTLEMENT_ASSET_MISMATCH', `chain reports asset ${confirmation.asset}`);
+      }
+      if (confirmation.network !== payout.destination_network) {
+        throw new PayoutError(
+          'SETTLEMENT_NETWORK_MISMATCH',
+          `chain reports network ${confirmation.network}, expected ${payout.destination_network}`,
+        );
+      }
+      if (confirmation.onChainDestination !== payout.destination_address) {
+        // Money reached an address that is not the one we locked. Never close
+        // the liability on that basis.
+        throw new PayoutError(
+          'SETTLEMENT_DESTINATION_MISMATCH',
+          'the on-chain destination does not match the payout snapshot',
+        );
+      }
+      if (confirmation.onChainAmountAtomic !== gramAmount.atomic) {
+        throw new PayoutError(
+          'SETTLEMENT_AMOUNT_MISMATCH',
+          'the on-chain amount does not match the locked payout amount',
+        );
+      }
+      const required = options.minConfirmations ?? 1;
+      if (confirmation.confirmations < required) {
+        throw new PayoutError(
+          'SETTLEMENT_NOT_CONFIRMED',
+          `only ${confirmation.confirmations} confirmations, ${required} required`,
+        );
+      }
+
       const merchantAccount = await getOrCreateMerchantAccount(tx, payout.merchant_id);
       const treasuryAccount = await getSystemAccountId(tx, 'TREASURY_GRAM');
       const settlementAccount = await getSystemAccountId(tx, 'SETTLEMENT_CLEARING_TOMAN');
       const feeExpenseAccount = await getSystemAccountId(tx, 'NETWORK_FEE_EXPENSE_GRAM');
 
+      // The network fee is a SEPARATE cost from the merchant's principal.
+      //
+      // Booking the whole payout as a network fee — as this once did — made the
+      // ledger claim the platform spent the entire settlement on gas, so
+      // treasury, ledger and chain could never be reconciled against one
+      // another. The principal leaves the treasury on the merchant's behalf;
+      // the fee leaves it as a platform expense (SPEC 104008).
+      const networkFee = Money.gram(confirmation.networkFeeAtomic ?? 0n);
+      const totalGramOut = gramAmount.add(networkFee);
+
       // Two balanced currency legs in one journal:
-      //   TOMAN: DR merchant liability (SETTLING)  CR settlement clearing
-      //   GRAM : DR settlement expense             CR treasury asset
+      //   TOMAN: DR merchant liability (SETTLING)   CR settlement clearing
+      //   GRAM : DR settlement clearing (principal) + DR network fee expense
+      //          CR treasury asset (principal + fee)
+      const settlementGramAccount = await getSystemAccountId(tx, 'SETTLEMENT_CLEARING_GRAM');
+
       const lines = [
         { accountId: merchantAccount, debit: amountToman, bucket: 'SETTLING' as const },
         { accountId: settlementAccount, credit: amountToman, bucket: 'AVAILABLE' as const },
-        { accountId: feeExpenseAccount, debit: gramAmount, bucket: 'AVAILABLE' as const },
-        { accountId: treasuryAccount, credit: gramAmount, bucket: 'AVAILABLE' as const },
+        // The principal: GRAM sent on the merchant's behalf.
+        { accountId: settlementGramAccount, debit: gramAmount, bucket: 'AVAILABLE' as const },
+        ...(networkFee.isPositive()
+          ? [{ accountId: feeExpenseAccount, debit: networkFee, bucket: 'AVAILABLE' as const }]
+          : []),
+        { accountId: treasuryAccount, credit: totalGramOut, bucket: 'AVAILABLE' as const },
       ];
 
       const posting = await post(tx, {
@@ -788,13 +939,16 @@ export async function settlePayout(
           WHERE payout_id = $1 AND status = 'ACTIVE'`,
         [payoutId],
       );
+      // The wallet really lost principal + fee, so that is what leaves the
+      // recorded balance. Subtracting only the principal would drift the
+      // treasury above its true on-chain value by the gas of every payout.
       await tx.query(
         `UPDATE finance.treasury_accounts t
             SET confirmed_balance_atomic = confirmed_balance_atomic - $2,
                 updated_at = NOW()
            FROM finance.liquidity_reservations r
           WHERE r.payout_id = $1 AND r.treasury_account_id = t.id`,
-        [payoutId, gramAmount.toAtomicString()],
+        [payoutId, totalGramOut.toAtomicString()],
       );
       await tx.query(
         `INSERT INTO finance.treasury_transactions
@@ -805,8 +959,23 @@ export async function settlePayout(
           WHERE r.payout_id = $4
           LIMIT 1
          ON CONFLICT DO NOTHING`,
-        [randomUUID(), gramAmount.toAtomicString(), confirmation.txHash, payoutId],
+        [randomUUID(), totalGramOut.toAtomicString(), confirmation.txHash, payoutId],
       );
+
+      // The network fee is booked separately so it is auditable on its own.
+      if (networkFee.isPositive()) {
+        await tx.query(
+          `INSERT INTO finance.treasury_transactions
+              (id, treasury_account_id, direction, asset, amount_atomic,
+               external_tx_hash, status, source, payout_id, confirmed_at)
+           SELECT $1, r.treasury_account_id, 'OUT', 'GRAM', $2, $3, 'CONFIRMED', 'NETWORK_FEE', $4, NOW()
+             FROM finance.liquidity_reservations r
+            WHERE r.payout_id = $4
+            LIMIT 1
+           ON CONFLICT DO NOTHING`,
+          [randomUUID(), networkFee.toAtomicString(), `${confirmation.txHash}:fee`, payoutId],
+        );
+      }
 
       await transitionState(tx, {
         table: 'finance.payouts',
@@ -945,15 +1114,19 @@ export async function reconcilePayout(
   db: Database,
   chain: BlockchainPayoutPort,
   payoutId: string,
+  config: Config,
 ): Promise<{ resolution: 'SETTLED' | 'FAILED' | 'STILL_UNKNOWN' }> {
   const r = await db.query<{
     id: string;
     status: string;
     transaction_hash: string | null;
     destination_address: string;
+    destination_network: string;
     gram_amount_atomic: string | null;
+    updated_at: string;
   }>(
-    `SELECT id, status, transaction_hash, destination_address, gram_amount_atomic::text
+    `SELECT id, status, transaction_hash, destination_address, destination_network,
+            gram_amount_atomic::text, updated_at
        FROM finance.payouts WHERE id = $1`,
     [payoutId],
   );
@@ -970,14 +1143,42 @@ export async function reconcilePayout(
     amountAtomic: BigInt(payout.gram_amount_atomic ?? '0'),
   });
 
-  if (status.state === 'CONFIRMED' && status.txHash) {
-    await settlePayout(db, payoutId, { txHash: status.txHash });
+  if (
+    status.state === 'CONFIRMED' &&
+    status.txHash &&
+    status.onChainAmountAtomic !== undefined &&
+    status.onChainDestination !== undefined
+  ) {
+    await settlePayout(db, payoutId, {
+      txHash: status.txHash,
+      onChainAmountAtomic: status.onChainAmountAtomic,
+      onChainDestination: status.onChainDestination,
+      asset: config.ton.gramAsset,
+      network: payout.destination_network,
+      confirmations: status.confirmations ?? 0,
+      ...(status.networkFeeAtomic !== undefined
+        ? { networkFeeAtomic: status.networkFeeAtomic }
+        : {}),
+    });
     await resolveExceptions(db, payoutId);
     return { resolution: 'SETTLED' };
   }
 
   if (status.state === 'NOT_FOUND') {
-    // The chain has no record of it: safe to return the funds.
+    // "The RPC cannot see it" is not "it does not exist". An indexer lagging,
+    // a node still syncing, or a transaction sitting in the mempool all look
+    // identical to a genuine absence, and returning the funds while the
+    // transfer is actually in flight would pay the merchant twice.
+    //
+    // So NOT_FOUND only becomes definitive after the payout has been
+    // unresolved for longer than any plausible propagation delay.
+    const ageMs = Date.now() - new Date(payout.updated_at).getTime();
+    const windowMs = (config.settlement.notFoundObservationSeconds ?? 900) * 1000;
+
+    if (ageMs < windowMs) {
+      return { resolution: 'STILL_UNKNOWN' };
+    }
+
     await db.transaction(async (tx) => {
       await tx.query(
         `UPDATE finance.payouts SET status = 'RESERVED', updated_at = NOW()

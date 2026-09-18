@@ -82,7 +82,7 @@ export async function startWorker(container: Container, intervalMs = 5000): Prom
             ORDER BY updated_at ASC LIMIT 20`,
         );
         for (const row of unknown.rows) {
-          await safely('reconcile', () => reconcilePayout(db, chain, row.id));
+          await safely('reconcile', () => reconcilePayout(db, chain, row.id, config));
         }
       });
     }
@@ -167,20 +167,52 @@ async function advancePayouts(container: Container): Promise<void> {
 
         case 'BROADCASTED': {
           // Only settle once the chain actually confirms (SPEC 124.168).
-          const row = await db.query<{ transaction_hash: string | null; gram_amount_atomic: string }>(
-            'SELECT transaction_hash, gram_amount_atomic::text FROM finance.payouts WHERE id = $1',
+          const row = await db.query<{
+            transaction_hash: string | null;
+            gram_amount_atomic: string;
+            destination_address: string;
+            destination_network: string;
+          }>(
+            `SELECT transaction_hash, gram_amount_atomic::text,
+                    destination_address, destination_network
+               FROM finance.payouts WHERE id = $1`,
             [payout.id],
           );
           const record = row.rows[0];
           if (!record) break;
+
           const status = await chain.getTransferStatus({
             idempotencyKey: `payout:${payout.id}`,
             txHash: record.transaction_hash,
-            to: '',
+            to: record.destination_address,
             amountAtomic: BigInt(record.gram_amount_atomic ?? '0'),
           });
-          if (status.state === 'CONFIRMED' && status.txHash) {
-            await settlePayout(db, payout.id, { txHash: status.txHash });
+
+          // Settle only on evidence read back FROM the chain. settlePayout
+          // re-checks every field itself; passing them through unchanged keeps
+          // the worker from being the component that decides what is true.
+          if (
+            status.state === 'CONFIRMED' &&
+            status.txHash &&
+            status.onChainAmountAtomic !== undefined &&
+            status.onChainDestination !== undefined
+          ) {
+            await settlePayout(
+              db,
+              payout.id,
+              {
+                txHash: status.txHash,
+                onChainAmountAtomic: status.onChainAmountAtomic,
+                onChainDestination: status.onChainDestination,
+                asset: config.ton.gramAsset,
+                network: record.destination_network,
+                confirmations: status.confirmations ?? 0,
+                ...(status.networkFeeAtomic !== undefined
+                  ? { networkFeeAtomic: status.networkFeeAtomic }
+                  : {}),
+              },
+              { minConfirmations: config.ton.minConfirmations },
+            );
           }
           break;
         }

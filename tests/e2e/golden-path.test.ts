@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, afterEach } from 'vitest';
-import { createHarness, createMerchant, fundTreasury, fastForwardRelease, type Harness } from '../helpers/harness.ts';
+import { createHarness, createMerchant, fundTreasury, fastForwardRelease, type Harness , chainEvidenceFor } from '../helpers/harness.ts';
 import { createInvoice } from '../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../packages/core/src/use-cases/finalize-payment.ts';
 import { releaseEligiblePayments } from '../../packages/core/src/use-cases/release-payment.ts';
@@ -112,7 +112,7 @@ describe('golden path', () => {
     const broadcast = await broadcastPayout(db, chain, payoutId);
     expect(broadcast.status).toBe('BROADCASTED');
 
-    const settled = await settlePayout(db, payoutId, { txHash: broadcast.txHash as string });
+    const settled = await settlePayout(db, payoutId, await chainEvidenceFor(db, payoutId, broadcast.txHash as string));
     expect(settled.settled).toBe(true);
 
     // --- Final state -------------------------------------------------------
@@ -128,11 +128,27 @@ describe('golden path', () => {
     expect(payout.rows[0]?.status).toBe('SETTLED');
     expect(payout.rows[0]?.transaction_hash).toBeTruthy();
 
-    // The treasury paid out 10 GRAM from its 20.
+    // The treasury paid out 10 GRAM principal PLUS the network fee, from its 20.
+    // Booking only the principal would leave the recorded balance permanently
+    // above the real on-chain one by the gas of every payout.
     const treasury = await db.query<{ confirmed_balance_atomic: string }>(
       `SELECT confirmed_balance_atomic::text FROM finance.treasury_accounts WHERE asset = 'GRAM'`,
     );
-    expect(treasury.rows[0]?.confirmed_balance_atomic).toBe('10000000000');
+    expect(treasury.rows[0]?.confirmed_balance_atomic).toBe('9999000000');
+
+    // Principal and fee are booked to different accounts, so platform margin
+    // is not silently inflated by treating a payout as gas.
+    const gramLegs = await db.query<{ account_code: string; total: string }>(
+      `SELECT a.account_code, SUM(e.debit - e.credit)::text AS total
+         FROM finance.journal_entries e
+         JOIN finance.ledger_accounts a ON a.id = e.account_id
+        WHERE a.currency = 'GRAM'
+        GROUP BY a.account_code
+        ORDER BY a.account_code`,
+    );
+    const byCode = Object.fromEntries(gramLegs.rows.map((r) => [r.account_code, r.total]));
+    expect(byCode['SETTLEMENT_CLEARING_GRAM']).toBe('10000000000');
+    expect(byCode['NETWORK_FEE_EXPENSE_GRAM']).toBe('1000000');
 
     // The reservation was consumed, not left dangling.
     const reservation = await db.query<{ status: string }>(

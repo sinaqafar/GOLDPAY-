@@ -34,7 +34,17 @@ export interface TransferStatus {
   state: 'CONFIRMED' | 'PENDING' | 'NOT_FOUND' | 'FAILED';
   txHash?: string;
   confirmations?: number;
+  /** Amount observed on chain, in nanogram. */
   onChainAmountAtomic?: bigint;
+  /**
+   * Destination observed on chain.
+   *
+   * Required to settle: a transaction can exist, be confirmed, and still have
+   * paid the wrong address. Settlement compares this to the locked snapshot.
+   */
+  onChainDestination?: string;
+  /** Network fee actually charged, in nanogram, when the chain reports it. */
+  networkFeeAtomic?: bigint;
 }
 
 export interface BlockchainPayoutPort {

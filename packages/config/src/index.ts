@@ -55,6 +55,12 @@ export interface SettlementConfig {
   readonly maxPayoutToman: bigint;
   readonly reservationTtlSeconds: number;
   readonly quoteTtlSeconds: number;
+  /**
+   * How long a payout must have been unresolved before a chain NOT_FOUND is
+   * treated as definitive. An indexer lagging looks exactly like a transaction
+   * that was never sent, so returning the funds too early risks paying twice.
+   */
+  readonly notFoundObservationSeconds: number;
 }
 
 export interface TreasuryConfig {
@@ -300,6 +306,7 @@ export function loadConfig(env: Env = process.env): Config {
       maxPayoutToman: big(env, 'MAX_PAYOUT_TOMAN', 1_000_000_000n),
       reservationTtlSeconds: int(env, 'RESERVATION_TTL_SECONDS', 900),
       quoteTtlSeconds: int(env, 'QUOTE_TTL_SECONDS', 300),
+      notFoundObservationSeconds: int(env, 'PAYOUT_NOT_FOUND_WINDOW_SECONDS', 900),
     },
     treasury,
     security: {

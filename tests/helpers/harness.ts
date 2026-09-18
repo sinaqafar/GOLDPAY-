@@ -146,3 +146,49 @@ export async function fastForwardRelease(
     throw new Error(`fastForwardRelease: payment ${paymentId} is not in a verified state`);
   }
 }
+
+/**
+ * Chain evidence for a payout that really landed, built from the payout's own
+ * locked snapshot.
+ *
+ * Settlement now demands amount, destination, asset, network and confirmations
+ * read back from the chain, so a test cannot assert settlement from a hash
+ * alone — which is the point. This helper keeps that explicit without making
+ * every test restate it.
+ */
+export async function chainEvidenceFor(
+  db: Database,
+  payoutId: string,
+  txHash: string,
+  overrides: Partial<{
+    onChainAmountAtomic: bigint;
+    onChainDestination: string;
+    asset: string;
+    network: string;
+    confirmations: number;
+    networkFeeAtomic: bigint;
+  }> = {},
+) {
+  const r = await db.query<{
+    gram_amount_atomic: string;
+    destination_address: string;
+    destination_network: string;
+  }>(
+    `SELECT gram_amount_atomic::text, destination_address, destination_network
+       FROM finance.payouts WHERE id = $1`,
+    [payoutId],
+  );
+  const row = r.rows[0];
+  if (!row) throw new Error(`no payout ${payoutId}`);
+
+  return {
+    txHash,
+    onChainAmountAtomic: BigInt(row.gram_amount_atomic),
+    onChainDestination: row.destination_address,
+    asset: 'GRAM',
+    network: row.destination_network,
+    confirmations: 10,
+    networkFeeAtomic: 1_000_000n,
+    ...overrides,
+  };
+}

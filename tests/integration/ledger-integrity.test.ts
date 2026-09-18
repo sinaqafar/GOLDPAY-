@@ -11,7 +11,7 @@
 
 import { describe, it, expect, afterEach } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { createHarness, createMerchant, fundTreasury, fastForwardRelease, type Harness } from '../helpers/harness.ts';
+import { createHarness, createMerchant, fundTreasury, fastForwardRelease, type Harness , chainEvidenceFor } from '../helpers/harness.ts';
 import { createInvoice } from '../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../packages/core/src/use-cases/finalize-payment.ts';
 import { releaseEligiblePayments } from '../../packages/core/src/use-cases/release-payment.ts';
@@ -390,7 +390,7 @@ describe('payout state machine and liquidity', () => {
     await expect(failPayout(db, payoutId, 'guessing')).rejects.toThrow();
 
     // Reconciliation is the only way out. The chain did receive it.
-    const reconciled = await reconcilePayout(db, chain, payoutId);
+    const reconciled = await reconcilePayout(db, chain, payoutId, config);
     expect(reconciled.resolution).toBe('SETTLED');
 
     const payout = await db.query<{ status: string }>(
@@ -412,16 +412,16 @@ describe('payout state machine and liquidity', () => {
     await signPayout(db, chain, config, payoutId);
     const broadcast = await broadcastPayout(db, chain, payoutId);
 
-    const first = await settlePayout(db, payoutId, { txHash: broadcast.txHash as string });
-    const second = await settlePayout(db, payoutId, { txHash: broadcast.txHash as string });
+    const first = await settlePayout(db, payoutId, await chainEvidenceFor(db, payoutId, broadcast.txHash as string));
+    const second = await settlePayout(db, payoutId, await chainEvidenceFor(db, payoutId, broadcast.txHash as string));
     expect(first.settled).toBe(true);
     expect(second.settled).toBe(false);
 
     const treasury = await db.query<{ confirmed_balance_atomic: string }>(
       `SELECT confirmed_balance_atomic::text FROM finance.treasury_accounts WHERE asset = 'GRAM'`,
     );
-    // Exactly 10 GRAM left the treasury, not 20.
-    expect(treasury.rows[0]?.confirmed_balance_atomic).toBe('10000000000');
+    // One settlement only: 10 GRAM principal + 0.001 fee, not twice that.
+    expect(treasury.rows[0]?.confirmed_balance_atomic).toBe('9999000000');
   });
 
   it('respects the safety reserve when computing spendable liquidity', async () => {
@@ -1210,5 +1210,173 @@ describe('risk holds and disputes', () => {
         merchantId: other.merchantId,
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+describe('payout allocation and settlement evidence', () => {
+  /** Release a payment of an exact net amount for a merchant. */
+  async function releasedPayment(h: Harness, merchantId: string, baseAmount: string) {
+    const invoice = await createInvoice(h.db, h.config, { merchantId, baseAmount });
+    const payment = await finalizePayment(h.db, h.config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+    await fastForwardRelease(h.db, payment.paymentId);
+    await releaseEligiblePayments(h.db);
+    return payment.paymentId;
+  }
+
+  it('never attaches more in items than the payout is worth', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 500_000_000_000n);
+
+    // Two payments of 700,000 and 600,000 = 1,300,000 available.
+    await releasedPayment(harness, merchant.merchantId, '700000');
+    await releasedPayment(harness, merchant.merchantId, '600000');
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+
+    const items = await db.query<{ total: string; count: string }>(
+      `SELECT COALESCE(SUM(amount_toman),0)::text AS total, COUNT(*)::text AS count
+         FROM finance.payout_items WHERE payout_id = $1`,
+      [payoutId],
+    );
+    const payout = await db.query<{ amount_toman: string }>(
+      'SELECT amount_toman::text FROM finance.payouts WHERE id = $1',
+      [payoutId],
+    );
+
+    // The audit trail must never claim the payout settled more than it moved.
+    expect(BigInt(items.rows[0]?.total ?? '0')).toBeLessThanOrEqual(
+      BigInt(payout.rows[0]?.amount_toman ?? '0'),
+    );
+  });
+
+  it('re-uses a payment after its payout failed, instead of stranding it', async () => {
+    // Previously a failed payout left its items behind, so the money sat in
+    // AVAILABLE forever while every future selection skipped it.
+    harness = await createHarness();
+    const { db, config, chain } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 500_000_000_000n);
+
+    const paymentId = await releasedPayment(harness, merchant.merchantId, '400000');
+
+    const first = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const firstPayoutId = first.payoutId as string;
+    await lockPayoutRate(db, config, harness.rates, firstPayoutId);
+    await reservePayoutLiquidity(db, config, firstPayoutId);
+    await signPayout(db, chain, config, firstPayoutId, harness.signer);
+
+    chain.setNextOutcome('REJECTED');
+    expect((await broadcastPayout(db, chain, firstPayoutId)).status).toBe('FAILED');
+
+    // The money is back in AVAILABLE...
+    const balance = await db.query<{ available: string }>(
+      `SELECT b.available::text FROM finance.balances b
+         JOIN finance.ledger_accounts a ON a.id = b.account_id
+        WHERE a.owner_id = $1`,
+      [merchant.merchantId],
+    );
+    expect(BigInt(balance.rows[0]?.available ?? '0')).toBeGreaterThan(0n);
+
+    // ...and a new payout must actually pick that payment up again.
+    const second = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    expect(second.payoutId).toBeTruthy();
+
+    const reattached = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM finance.payout_items
+        WHERE payout_id = $1 AND payment_id = $2`,
+      [second.payoutId, paymentId],
+    );
+    expect(reattached.rows[0]?.count).toBe('1');
+  });
+
+  it('refuses to settle on a transaction hash alone', async () => {
+    harness = await createHarness();
+    const { db, config, chain } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 500_000_000_000n);
+    await releasedPayment(harness, merchant.merchantId, '300000');
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, harness.rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId, harness.signer);
+    const broadcast = await broadcastPayout(db, chain, payoutId);
+
+    const good = await chainEvidenceFor(db, payoutId, broadcast.txHash as string);
+
+    // Wrong destination: the transfer confirmed, but not to our merchant.
+    await expect(
+      settlePayout(db, payoutId, { ...good, onChainDestination: 'EQsomewhereElse' }),
+    ).rejects.toMatchObject({ code: 'SETTLEMENT_DESTINATION_MISMATCH' });
+
+    // Wrong amount.
+    await expect(
+      settlePayout(db, payoutId, { ...good, onChainAmountAtomic: good.onChainAmountAtomic - 1n }),
+    ).rejects.toMatchObject({ code: 'SETTLEMENT_AMOUNT_MISMATCH' });
+
+    // Not yet confirmed.
+    await expect(
+      settlePayout(db, payoutId, { ...good, confirmations: 0 }, { minConfirmations: 1 }),
+    ).rejects.toMatchObject({ code: 'SETTLEMENT_NOT_CONFIRMED' });
+
+    // Wrong asset entirely.
+    await expect(
+      settlePayout(db, payoutId, { ...good, asset: 'USDT' }),
+    ).rejects.toMatchObject({ code: 'SETTLEMENT_ASSET_MISMATCH' });
+
+    // Still BROADCASTED: none of the above moved it.
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE id = $1',
+      [payoutId],
+    );
+    expect(row.rows[0]?.status).toBe('BROADCASTED');
+
+    // Correct evidence settles it.
+    expect((await settlePayout(db, payoutId, good)).settled).toBe(true);
+  });
+
+  it('does not treat a fresh NOT_FOUND as a definitive failure', async () => {
+    // An indexer lagging looks exactly like a transfer that never happened.
+    // Returning the funds immediately risks paying the merchant twice.
+    harness = await createHarness();
+    const { db, config, chain } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    await fundTreasury(db, 500_000_000_000n);
+    await releasedPayment(harness, merchant.merchantId, '250000');
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, harness.rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId, harness.signer);
+
+    chain.setNextOutcome('UNKNOWN');
+    await broadcastPayout(db, chain, payoutId);
+
+    // The in-memory chain has no record under a different key, so this reads
+    // NOT_FOUND — but the payout only just became UNKNOWN.
+    const fresh = await reconcilePayout(db, chain, payoutId, config);
+    expect(fresh.resolution).not.toBe('FAILED');
+
+    const row = await db.query<{ status: string }>(
+      'SELECT status FROM finance.payouts WHERE id = $1',
+      [payoutId],
+    );
+    // Funds stay committed while the outcome is genuinely unknown.
+    expect(['UNKNOWN', 'SETTLED']).toContain(row.rows[0]?.status);
   });
 });
