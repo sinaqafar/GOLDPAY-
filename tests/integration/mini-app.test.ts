@@ -249,3 +249,33 @@ describe('wallet registration from the mini app', () => {
     expect(again.status).toBe(409);
   });
 });
+
+describe('mini app "more" tab resources', () => {
+  it('returns recent payments scoped to the merchant', async () => {
+    const res = await call('GET', '/v1/app/payments?limit=5', buildInitData(ownerTelegramId));
+    expect(res.status).toBe(200);
+    expect(Array.isArray(res.envelope['data'])).toBe(true);
+  });
+
+  it('lists API keys without ever exposing a secret', async () => {
+    const res = await call('GET', '/v1/app/api-keys', buildInitData(ownerTelegramId));
+    expect(res.status).toBe(200);
+
+    const serialised = JSON.stringify(res.envelope);
+    expect(serialised).not.toContain('secret_hash');
+    expect(serialised).not.toContain('api_key');
+  });
+
+  it('reports the terms the merchant is actually on', async () => {
+    const res = await call('GET', '/v1/app/settings', buildInitData(ownerTelegramId));
+    expect(res.status).toBe(200);
+    expect(res.body['platform_fee_percent']).toBe(15);
+    expect(res.body['hold_hours']).toBe(48);
+    expect(res.body['settlement_asset']).toBe('GRAM');
+  });
+
+  it('requires authentication like every other app route', async () => {
+    const res = await call('GET', '/v1/app/settings', null);
+    expect(res.status).toBe(401);
+  });
+});

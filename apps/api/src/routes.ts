@@ -291,6 +291,96 @@ export function buildRouter(container: Container): Router {
     return { status: 200, body: buildPage(r.rows, page.limit, serialisePayment) };
   });
 
+  // --- statements -------------------------------------------------------------
+
+  router.get('/v1/statements', async (ctx) => {
+    const auth = await authenticateApiKey(db, config, ctx);
+    ctx.auth = { kind: 'API_KEY', merchantId: auth.merchantId };
+
+    // SPEC 101405: the caller chooses the period. Default to the last 30 days.
+    const to = parseDateFilter(ctx.query.get('to'), 'to') ?? new Date().toISOString();
+    const from =
+      parseDateFilter(ctx.query.get('from'), 'from') ??
+      new Date(Date.parse(to) - 30 * 24 * 3600 * 1000).toISOString();
+
+    if (Date.parse(from) > Date.parse(to)) {
+      throw new ValidationError('INVALID_PERIOD', 'from must not be after to');
+    }
+
+    const account = await db.query<{ id: string }>(
+      `SELECT id FROM finance.ledger_accounts
+        WHERE owner_type = 'MERCHANT' AND owner_id = $1 AND currency = 'TOMAN'`,
+      [auth.merchantId],
+    );
+    const accountId = account.rows[0]?.id;
+
+    // A merchant with no ledger account yet has an empty statement, not an error.
+    if (!accountId) {
+      return {
+        status: 200,
+        body: {
+          period: { from, to },
+          opening_balance: '0',
+          closing_balance: '0',
+          totals: { credits: '0', debits: '0' },
+          lines: [],
+          as_of: new Date().toISOString(),
+        },
+      };
+    }
+
+    // Everything below is derived from journal entries, never from the
+    // projection: SPEC 71.15/101407 requires a statement to reconcile against
+    // the ledger itself.
+    const opening = await db.query<{ balance: string }>(
+      `SELECT COALESCE(SUM(e.credit - e.debit), 0)::text AS balance
+         FROM finance.journal_entries e
+         JOIN finance.journals j ON j.id = e.journal_id
+        WHERE e.account_id = $1 AND j.created_at < $2`,
+      [accountId, from],
+    );
+
+    const lines = await db.query<Record<string, unknown>>(
+      `SELECT j.id, j.reference_type, j.reference_id, j.description, j.created_at,
+              e.debit::text, e.credit::text, e.bucket
+         FROM finance.journal_entries e
+         JOIN finance.journals j ON j.id = e.journal_id
+        WHERE e.account_id = $1 AND j.created_at >= $2 AND j.created_at <= $3
+        ORDER BY j.created_at ASC
+        LIMIT 1000`,
+      [accountId, from, to],
+    );
+
+    let credits = 0n;
+    let debits = 0n;
+    for (const line of lines.rows) {
+      credits += BigInt((line['credit'] as string) ?? '0');
+      debits += BigInt((line['debit'] as string) ?? '0');
+    }
+    const openingBalance = BigInt(opening.rows[0]?.balance ?? '0');
+
+    return {
+      status: 200,
+      body: {
+        period: { from, to },
+        opening_balance: openingBalance.toString(),
+        closing_balance: (openingBalance + credits - debits).toString(),
+        totals: { credits: credits.toString(), debits: debits.toString() },
+        lines: lines.rows.map((line) => ({
+          journal_id: line['id'],
+          type: line['reference_type'],
+          reference_id: line['reference_id'],
+          description: line['description'],
+          credit: line['credit'],
+          debit: line['debit'],
+          bucket: line['bucket'],
+          created_at: line['created_at'],
+        })),
+        as_of: new Date().toISOString(),
+      },
+    };
+  });
+
   // --- API keys ---------------------------------------------------------------
   //
   // SPEC 101453-101459. The secret is shown exactly once, at creation: only its
@@ -739,6 +829,59 @@ export function buildRouter(container: Container): Router {
       [merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
     );
     return { status: 200, body: buildPage(r.rows, page.limit, serialisePayout) };
+  });
+
+  router.get('/v1/app/payments', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const page = readPageRequest(ctx.query);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, invoice_id, status, verified_amount::text, currency,
+              verified_paid_at, release_at, released_at, mismatch_code, created_at
+         FROM core.payments
+        WHERE merchant_id = $1
+          AND ($2::timestamptz IS NULL OR (created_at, id) < ($2::timestamptz, $3::uuid))
+        ORDER BY created_at DESC, id DESC
+        LIMIT $4`,
+      [merchantId, page.cursor?.createdAt ?? null, page.cursor?.id ?? null, page.limit + 1],
+    );
+    return { status: 200, body: buildPage(r.rows, page.limit, serialisePayment) };
+  });
+
+  router.get('/v1/app/api-keys', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, name, key_prefix, status, last_used_at, created_at
+         FROM core.api_keys WHERE merchant_id = $1 ORDER BY created_at DESC`,
+      [merchantId],
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/v1/app/settings', async (ctx) => {
+    const merchantId = await miniAppMerchant(ctx);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT name, status, default_fee_mode, auto_payout, created_at
+         FROM core.merchants WHERE id = $1`,
+      [merchantId],
+    );
+    const merchant = r.rows[0];
+    if (!merchant) throw new NotFoundError('merchant', merchantId);
+
+    return {
+      status: 200,
+      body: {
+        name: merchant['name'],
+        status: merchant['status'],
+        fee_mode: merchant['default_fee_mode'],
+        auto_payout: merchant['auto_payout'],
+        // Shown so a merchant can see the terms they are actually on.
+        platform_fee_percent: Number(config.fees.platformFeePercent.bps) / 100,
+        hold_hours: config.settlement.holdHours,
+        settlement_asset: config.ton.gramAsset,
+        settlement_network: config.ton.network,
+        created_at: merchant['created_at'],
+      },
+    };
   });
 
   router.get('/v1/app/wallets', async (ctx) => {

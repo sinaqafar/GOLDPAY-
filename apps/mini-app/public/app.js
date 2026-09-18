@@ -119,10 +119,28 @@ const PAYOUT_STATUS = {
   RATE_LOCKED: ['نرخ قفل شد', 'warn'],
   WAITING_LIQUIDITY: ['در انتظار نقدینگی', 'warn'],
   RESERVED: ['رزرو شد', 'warn'],
+  SIGNED: ['امضا شد', 'warn'],
   BROADCASTED: ['ارسال شد به شبکه', 'warn'],
   SETTLED: ['تسویه شد', 'ok'],
   FAILED: ['ناموفق', 'bad'],
   UNKNOWN: ['در حال بررسی', 'warn'],
+};
+
+const PAYMENT_STATUS = {
+  PENDING: ['در انتظار', 'warn'],
+  VERIFYING: ['در حال بررسی', 'warn'],
+  VERIFIED: ['تأیید شد', 'ok'],
+  RELEASED: ['آزاد شد', 'ok'],
+  FAILED: ['ناموفق', 'bad'],
+  MISMATCH: ['مغایرت مبلغ', 'bad'],
+  REVIEW: ['در حال بررسی', 'warn'],
+  UNKNOWN: ['نامشخص', 'warn'],
+};
+
+const FEE_MODE_LABEL = {
+  CUSTOMER: 'پرداخت کارمزد توسط خریدار',
+  MERCHANT: 'پرداخت کارمزد توسط فروشنده',
+  SPLIT: 'کارمزد نصف‌نصف',
 };
 
 const WALLET_STATUS = {
@@ -388,7 +406,13 @@ function showError(message) {
 
 /* --- router --------------------------------------------------------------- */
 
-const VIEWS = { home: viewHome, invoices: viewInvoices, payouts: viewPayouts, wallet: viewWallet };
+const VIEWS = {
+  home: viewHome,
+  invoices: viewInvoices,
+  payouts: viewPayouts,
+  wallet: viewWallet,
+  more: viewMore,
+};
 
 async function render(tab) {
   state.tab = tab;

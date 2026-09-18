@@ -586,3 +586,48 @@ describe('public checkout page (SPEC 1459)', () => {
     ).toBe(404);
   });
 });
+
+describe('statements (SPEC 101403)', () => {
+  it('reconciles opening + credits - debits to the closing balance', async () => {
+    const res = await call(keyA.token, 'GET', '/v1/statements');
+    expect(res.status).toBe(200);
+
+    const opening = BigInt(res.body.opening_balance as string);
+    const totals = res.body.totals as { credits: string; debits: string };
+    const credits = BigInt(totals.credits);
+    const debits = BigInt(totals.debits);
+    const closing = BigInt(res.body.closing_balance as string);
+
+    // The statement must add up, because it is derived from the journal rather
+    // than from the balance projection.
+    expect(opening + credits - debits).toBe(closing);
+    expect(res.body.as_of).toBeTruthy();
+  });
+
+  it('honours an explicit period and rejects a reversed one', async () => {
+    const ok = await call(
+      keyA.token,
+      'GET',
+      '/v1/statements?from=2026-01-01T00:00:00Z&to=2026-12-31T00:00:00Z',
+    );
+    expect(ok.status).toBe(200);
+    expect((ok.body.period as Record<string, string>).from).toContain('2026-01-01');
+
+    const reversed = await call(
+      keyA.token,
+      'GET',
+      '/v1/statements?from=2026-12-31T00:00:00Z&to=2026-01-01T00:00:00Z',
+    );
+    expect(reversed.status).toBe(400);
+    expect(reversed.body['error'].code).toBe('INVALID_PERIOD');
+  });
+
+  it('shows only this merchant’s ledger lines', async () => {
+    const a = await call(keyA.token, 'GET', '/v1/statements');
+    const b = await call(keyB.token, 'GET', '/v1/statements');
+
+    const aIds = (a.body.lines as { journal_id: string }[]).map((l) => l.journal_id);
+    const bIds = (b.body.lines as { journal_id: string }[]).map((l) => l.journal_id);
+    for (const id of bIds) expect(aIds).not.toContain(id);
+  });
+});
