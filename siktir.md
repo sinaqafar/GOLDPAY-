@@ -1138,8 +1138,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۰ فایل / ۱۸۰ تست سبز**
-· ۵ مهاجرت اعمال‌شده
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۱ فایل / ۲۱۸ تست سبز**
+· ۶ مهاجرت اعمال‌شده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1168,6 +1168,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 004_admin.sql                   core.admin_users · core.admin_approvals
                                 system.platform_state · core.admin_sessions
 005_payout_signed_state.sql     signed_at + signing_reference؛ حالت SIGNED
+006_provider_fee_reconciliation.sql  provider_fee_{expected,actual,
+                                diff,status,source}
 ```
 
 ### اپ‌ها
@@ -1246,9 +1248,17 @@ docs/recovery/README.md
 اعمال‌شده در: `create-invoice.ts`، `payout.ts` (مبلغ payout + تبدیل نرخ +
 `recordManualTreasuryFunding`)، `admin/operations.ts` (درخواست funding).
 
-### 🟢 ۷. موارد آگاهانه ساده‌سازی‌شده (باقی‌مانده)
-صف واقعی Redis/BullMQ نیست؛ TON signer یک reference است نه KMS/HSM واقعی؛
-Risk Engine، Refund و Dispute پیاده نشده‌اند.
+### ✅ ۷. صف، امضاکننده و نرخ — **رفع شد**
+
+| مورد | وضعیت |
+|---|---|
+| **QueuePort + BullMQ** | `packages/core/src/ports/queue.ts` + `packages/queue/src/{bullmq,in-memory}-queue.ts`. ۹ صف مشخصات. Redis باید `noeviction` + AOF داشته باشد. Production بدون `REDIS_URL` بالا نمی‌آید. |
+| **SignerPort + KMS** | `packages/core/src/ports/signer.ts` + `packages/ton/src/signer.ts`. `KmsSigner` برای Production، `StubSigner` فقط dev (در Production throw می‌کند). Keystore محلی **معماری Production نیست**. |
+| **RateAggregator** | `GRAM/USD × USD/TOMAN` با failover، freshness، sanity bounds و سقف انحراف. Production نرخ ثابت را رد می‌کند. |
+| **Provider fee** | expected از config + actual از provider + flag اختلاف (مهاجرت ۰۰۶). |
+
+### 🟢 ۸. باقی‌مانده‌های آگاهانه
+Risk Engine، Refund و Dispute پیاده نشده‌اند (PART 70 — نیاز به تصمیم کسب‌وکاری).
 
 ---
 
