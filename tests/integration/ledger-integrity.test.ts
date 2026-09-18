@@ -650,3 +650,65 @@ describe('treasury (manual funding only)', () => {
     }
   });
 });
+
+describe('per-merchant fee mode (SPEC 2386)', () => {
+  it("uses the merchant's own default rather than the platform default", async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+
+    // The platform default is CUSTOMER; this merchant is configured MERCHANT.
+    expect(config.fees.defaultFeeMode).toBe('CUSTOMER');
+    const merchant = await createMerchant(db, { feeMode: 'MERCHANT' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+
+    // MERCHANT mode: the customer pays the base and the merchant absorbs 15%.
+    expect(invoice.feeMode).toBe('MERCHANT');
+    expect(invoice.customerTotal).toBe('1000000');
+    expect(invoice.merchantNet).toBe('850000');
+  });
+
+  it('still lets an explicit request override the merchant default', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'MERCHANT' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+      feeMode: 'SPLIT',
+    });
+
+    // SPLIT: 7.5% each side.
+    expect(invoice.feeMode).toBe('SPLIT');
+    expect(invoice.customerTotal).toBe('1075000');
+    expect(invoice.merchantNet).toBe('925000');
+  });
+
+  it('freezes the snapshot, so changing the default later does not move it', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+
+    const invoice = await createInvoice(db, config, {
+      merchantId: merchant.merchantId,
+      baseAmount: '1000000',
+    });
+    expect(invoice.customerTotal).toBe('1150000');
+
+    // The merchant switches their default afterwards.
+    await db.query(`UPDATE core.merchants SET default_fee_mode = 'MERCHANT' WHERE id = $1`, [
+      merchant.merchantId,
+    ]);
+
+    const stored = await db.query<{ fee_mode: string; customer_total_amount: string }>(
+      'SELECT fee_mode, customer_total_amount::text FROM core.invoices WHERE id = $1',
+      [invoice.invoiceId],
+    );
+    expect(stored.rows[0]?.fee_mode).toBe('CUSTOMER');
+    expect(stored.rows[0]?.customer_total_amount).toBe('1150000');
+  });
+});

@@ -81,9 +81,11 @@ export async function createInvoice(
     });
   }
 
-  const feeMode = input.feeMode ?? config.fees.defaultFeeMode;
-  if (!isFeeMode(feeMode)) {
-    throw new ValidationError('INVALID_FEE_MODE', `unknown fee mode: ${String(feeMode)}`);
+  // An explicitly requested mode is validated here; when it is absent the
+  // merchant's own default is read inside the transaction below, because a
+  // per-merchant setting must outrank the platform-wide default.
+  if (input.feeMode !== undefined && !isFeeMode(input.feeMode)) {
+    throw new ValidationError('INVALID_FEE_MODE', `unknown fee mode: ${String(input.feeMode)}`);
   }
 
   const expiresIn = input.expiresInSeconds ?? 3600;
@@ -98,12 +100,6 @@ export async function createInvoice(
     throw new ValidationError('DESCRIPTION_TOO_LONG', 'description must be at most 500 characters');
   }
 
-  // The fee snapshot is computed once, here, and never recomputed downstream.
-  const breakdown: FeeBreakdown = calculateFees(baseAmount, feeMode, {
-    rate: config.fees.platformFeePercent,
-    version: config.fees.policyVersion,
-  });
-
   const invoiceNumber = input.invoiceNumber ?? `INV-${Date.now()}-${randomUUID().slice(0, 8)}`;
   if (invoiceNumber.length > 64) {
     throw new ValidationError('INVOICE_NUMBER_TOO_LONG', 'invoiceNumber must be at most 64 characters');
@@ -112,8 +108,8 @@ export async function createInvoice(
   return db.transaction(async (tx) => {
     // Only an ACTIVE merchant may issue invoices, and the row is locked so a
     // concurrent suspension cannot slip past this check.
-    const merchant = await tx.query<{ id: string; status: string }>(
-      'SELECT id, status FROM core.merchants WHERE id = $1 FOR UPDATE',
+    const merchant = await tx.query<{ id: string; status: string; default_fee_mode: string }>(
+      'SELECT id, status, default_fee_mode FROM core.merchants WHERE id = $1 FOR UPDATE',
       [input.merchantId],
     );
     const m = merchant.rows[0];
@@ -123,6 +119,20 @@ export async function createInvoice(
         status: m.status,
       });
     }
+
+    // Precedence: explicit request > the merchant's configured default >
+    // the platform default. SPEC 2386 keeps fee behaviour per merchant, so
+    // reading only the global config would ignore their setting entirely.
+    const merchantDefault = isFeeMode(m.default_fee_mode) ? m.default_fee_mode : undefined;
+    const feeMode: FeeMode = input.feeMode ?? merchantDefault ?? config.fees.defaultFeeMode;
+
+    // The fee snapshot is computed once, here, and never recomputed downstream
+    // (SPEC 4335): a later change to the merchant's default or to the platform
+    // rate must not alter an invoice that already exists.
+    const breakdown: FeeBreakdown = calculateFees(baseAmount, feeMode, {
+      rate: config.fees.platformFeePercent,
+      version: config.fees.policyVersion,
+    });
 
     const invoiceId = randomUUID();
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
