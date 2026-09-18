@@ -35,11 +35,13 @@ function renderLabels(labels: Labels): string {
 
 export class Counter {
   #samples = new Map<string, Sample>();
+  readonly name: string;
+  readonly help: string;
 
-  constructor(
-    readonly name: string,
-    readonly help: string,
-  ) {}
+  constructor(name: string, help: string) {
+    this.name = name;
+    this.help = help;
+  }
 
   inc(labels: Labels = {}, by = 1): void {
     const key = renderLabels(labels);
@@ -59,11 +61,13 @@ export class Counter {
 
 export class Gauge {
   #samples = new Map<string, Sample>();
+  readonly name: string;
+  readonly help: string;
 
-  constructor(
-    readonly name: string,
-    readonly help: string,
-  ) {}
+  constructor(name: string, help: string) {
+    this.name = name;
+    this.help = help;
+  }
 
   set(value: number, labels: Labels = {}): void {
     this.#samples.set(renderLabels(labels), { value, labels });
@@ -84,12 +88,12 @@ const DEFAULT_BUCKETS = [5, 10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10_000]
 export class Histogram {
   #buckets: number[];
   #counts = new Map<string, { counts: number[]; sum: number; total: number; labels: Labels }>();
+  readonly name: string;
+  readonly help: string;
 
-  constructor(
-    readonly name: string,
-    readonly help: string,
-    buckets: number[] = DEFAULT_BUCKETS,
-  ) {
+  constructor(name: string, help: string, buckets: number[] = DEFAULT_BUCKETS) {
+    this.name = name;
+    this.help = help;
     this.#buckets = [...buckets].sort((a, b) => a - b);
   }
 
