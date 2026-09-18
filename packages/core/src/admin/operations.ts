@@ -21,6 +21,7 @@ import {
 } from '../../../errors/src/index.ts';
 import { recordManualTreasuryFunding } from '../use-cases/payout.ts';
 import { assertPermission, type AdminRole } from './rbac.ts';
+import { assertGramWithinBounds } from '../limits.ts';
 
 export interface AdminActor {
   adminId: string;
@@ -78,6 +79,9 @@ export async function requestTreasuryFunding(
   if (!/^\d+$/.test(input.amountAtomic) || BigInt(input.amountAtomic) <= 0n) {
     throw new ValidationError('INVALID_FUNDING_AMOUNT', 'amount must be a positive integer string');
   }
+  // Reject at the request stage, not four-eyes-approval stage: an amount that
+  // cannot be stored should never become a pending approval in the first place.
+  assertGramWithinBounds(BigInt(input.amountAtomic), 'funding amount');
   if (!input.txHash.trim()) {
     throw new ValidationError('MISSING_TX_HASH', 'the on-chain transaction hash is required');
   }

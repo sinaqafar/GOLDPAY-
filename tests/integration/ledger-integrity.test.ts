@@ -19,6 +19,7 @@ import {
   queuePayoutForMerchant,
   lockPayoutRate,
   reservePayoutLiquidity,
+  signPayout,
   broadcastPayout,
   settlePayout,
   failPayout,
@@ -345,6 +346,7 @@ describe('payout state machine and liquidity', () => {
     const payoutId = queued.payoutId as string;
     await lockPayoutRate(db, config, rates, payoutId);
     await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId);
 
     chain.setNextOutcome('REJECTED');
     const result = await broadcastPayout(db, chain, payoutId);
@@ -375,6 +377,7 @@ describe('payout state machine and liquidity', () => {
     const payoutId = queued.payoutId as string;
     await lockPayoutRate(db, config, rates, payoutId);
     await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId);
 
     chain.setNextOutcome('UNKNOWN');
     const result = await broadcastPayout(db, chain, payoutId);
@@ -403,6 +406,7 @@ describe('payout state machine and liquidity', () => {
     const payoutId = queued.payoutId as string;
     await lockPayoutRate(db, config, rates, payoutId);
     await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId);
     const broadcast = await broadcastPayout(db, chain, payoutId);
 
     const first = await settlePayout(db, payoutId, { txHash: broadcast.txHash as string });
@@ -460,6 +464,68 @@ describe('payout state machine and liquidity', () => {
       [payoutId],
     );
     expect(payout.rows[0]?.status).toBe('RATE_LOCKED');
+  });
+
+  it('refuses to broadcast a payout that has not been signed', async () => {
+    harness = await createHarness();
+    const { db, config, rates, chain } = harness;
+    const merchant = await readyForPayout(harness);
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+
+    // RESERVED but not SIGNED: nothing may reach the network yet (SPEC 5502).
+    await expect(broadcastPayout(db, chain, payoutId)).rejects.toThrow(/PAYOUT_NOT_BROADCASTABLE|is RESERVED/);
+  });
+
+  it('signs exactly once and is idempotent on a repeated signing attempt', async () => {
+    harness = await createHarness();
+    const { db, config, rates, chain } = harness;
+    const merchant = await readyForPayout(harness);
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+
+    const first = await signPayout(db, chain, config, payoutId);
+    // SPEC 5498 — a second attempt must return the existing signature rather
+    // than building a second spendable transaction.
+    const second = await signPayout(db, chain, config, payoutId);
+    expect(second.signingReference).toBe(first.signingReference);
+
+    const row = await db.query<{ status: string; signed_at: string | null; signing_reference: string | null }>(
+      'SELECT status, signed_at, signing_reference FROM finance.payouts WHERE id = $1',
+      [payoutId],
+    );
+    expect(row.rows[0]?.status).toBe('SIGNED');
+    expect(row.rows[0]?.signed_at).not.toBeNull();
+    expect(row.rows[0]?.signing_reference).not.toBeNull();
+  });
+
+  it('refuses to sign when the destination no longer matches the active wallet', async () => {
+    harness = await createHarness();
+    const { db, config, rates, chain } = harness;
+    const merchant = await readyForPayout(harness);
+
+    const queued = await queuePayoutForMerchant(db, config, merchant.merchantId);
+    const payoutId = queued.payoutId as string;
+    await lockPayoutRate(db, config, rates, payoutId);
+    await reservePayoutLiquidity(db, config, payoutId);
+    await signPayout(db, chain, config, payoutId);
+
+    // The merchant swaps their wallet after the payout was snapshotted.
+    await db.query(
+      `UPDATE finance.payouts SET destination_address = $2 WHERE id = $1`,
+      [payoutId, 'EQD__________________________________________1vo'],
+    );
+
+    // SPEC 97.115 — the broadcast guard must catch the divergence.
+    await expect(broadcastPayout(db, chain, payoutId)).rejects.toMatchObject({
+      code: 'DESTINATION_MISMATCH',
+    });
   });
 
   it('refuses to broadcast without a valid reservation', async () => {

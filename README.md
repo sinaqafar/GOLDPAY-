@@ -41,7 +41,7 @@ RATE LOCKED       → immutable Toman/GRAM snapshot
    ↓
 RESERVED          → full-amount liquidity reservation, or WAITING_LIQUIDITY
    ↓
-BROADCASTED       → TON jetton transfer
+BROADCASTED       → native GRAM transfer on TON
    ↓  chain confirmation
 SETTLED           → close merchant liability, reduce treasury
 ```

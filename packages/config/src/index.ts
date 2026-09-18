@@ -36,6 +36,16 @@ export interface FeeConfig {
   readonly platformFeePercent: Percentage;
   readonly policyVersion: string;
   readonly defaultFeeMode: 'CUSTOMER' | 'MERCHANT' | 'SPLIT';
+  /**
+   * The payment provider's own cut of what it collects (CubePay ≈ 9%).
+   *
+   * This is a platform COST, never shown to or charged to the merchant, and
+   * never added to platformFeePercent to form one headline rate. It exists so
+   * the ledger can record real platform margin instead of flattering itself.
+   * SPEC 103.26: the value must come from configuration, never a hardcoded
+   * constant buried in the code.
+   */
+  readonly providerFeePercent: Percentage;
 }
 
 export interface SettlementConfig {
@@ -87,8 +97,14 @@ export interface TonConfig {
   readonly apiKey: string | null;
   readonly minConfirmations: number;
   readonly timeoutMs: number;
-  /** Jetton master contract of the GRAM asset. */
-  readonly gramJettonMaster: string;
+  /**
+   * Settlement asset ticker. GRAM is TON's NATIVE currency (renamed from
+   * Toncoin on 2026-06-15), so there is no jetton master, no token contract
+   * and no jetton wallet: a plain internal message carries value, and network
+   * fees are paid in GRAM itself.
+   * SPEC 97.114: a mismatch here must block every broadcast.
+   */
+  readonly gramAsset: string;
   readonly gramDecimals: number;
   /** Hot wallet that payouts are sent from. */
   readonly payoutWalletAddress: string | null;
@@ -237,6 +253,13 @@ export function loadConfig(env: Env = process.env): Config {
     throw new ConfigError('INVALID_CONFIG', 'PLATFORM_FEE_PERCENT cannot exceed 100');
   }
 
+  // The provider's own rate. Separate from ours by design (see FeeConfig).
+  const providerFeePercentRaw = Number.parseFloat(str(env, 'PROVIDER_FEE_PERCENT', '9'));
+  const providerFeePercent = Percentage.fromPercent(providerFeePercentRaw);
+  if (providerFeePercent.bps > 10_000n) {
+    throw new ConfigError('INVALID_CONFIG', 'PROVIDER_FEE_PERCENT cannot exceed 100');
+  }
+
   const defaultFeeModeRaw = str(env, 'DEFAULT_FEE_MODE', 'CUSTOMER').toUpperCase();
   if (!['CUSTOMER', 'MERCHANT', 'SPLIT'].includes(defaultFeeModeRaw)) {
     throw new ConfigError('INVALID_CONFIG', `unknown DEFAULT_FEE_MODE: ${defaultFeeModeRaw}`);
@@ -268,6 +291,7 @@ export function loadConfig(env: Env = process.env): Config {
       platformFeePercent,
       policyVersion: str(env, 'FEE_POLICY_VERSION', 'v1'),
       defaultFeeMode: defaultFeeModeRaw as FeeConfig['defaultFeeMode'],
+      providerFeePercent,
     },
     settlement: {
       holdHours,
@@ -308,7 +332,7 @@ export function loadConfig(env: Env = process.env): Config {
       apiKey: optional(env, 'TON_API_KEY'),
       minConfirmations: int(env, 'TON_REQUIRED_CONFIRMATIONS', 1),
       timeoutMs: int(env, 'TON_REQUEST_TIMEOUT_MS', 20_000),
-      gramJettonMaster: str(env, 'GRAM_JETTON_MASTER', ''),
+      gramAsset: str(env, 'GRAM_ASSET', 'GRAM'),
       gramDecimals: treasury.gramDecimals,
       payoutWalletAddress: optional(env, 'PAYOUT_WALLET_ADDRESS'),
       signerReference: optional(env, 'TON_SIGNER_REFERENCE'),
@@ -338,7 +362,6 @@ function validateProductionInvariants(config: Config): void {
   if (!config.telegram.botToken) missing.push('TELEGRAM_BOT_TOKEN');
   if (!config.treasury.address) missing.push('TREASURY_ADDRESS');
   if (!config.ton.payoutWalletAddress) missing.push('PAYOUT_WALLET_ADDRESS');
-  if (!config.ton.gramJettonMaster) missing.push('GRAM_JETTON_MASTER');
   if (!config.ton.signerReference) missing.push('TON_SIGNER_REFERENCE');
   if (missing.length > 0) {
     throw new ConfigError('MISSING_PRODUCTION_SECRETS', `missing in production: ${missing.join(', ')}`, {
@@ -354,6 +377,21 @@ function validateProductionInvariants(config: Config): void {
   }
   if (config.ton.network !== 'TON_MAINNET' || config.treasury.network !== 'TON_MAINNET') {
     throw new ConfigError('TESTNET_IN_PRODUCTION', 'production must use TON_MAINNET');
+  }
+  // SPEC 103.7 — production invariants that must hold no matter what the
+  // environment says. GRAM is the native TON coin; anything else means the
+  // deployment is pointed at the wrong asset.
+  if (config.ton.gramAsset !== 'GRAM') {
+    throw new ConfigError(
+      'INVALID_SETTLEMENT_ASSET',
+      `production settlement asset must be GRAM, got ${config.ton.gramAsset}`,
+    );
+  }
+  if (config.treasury.gramDecimals !== 9) {
+    throw new ConfigError(
+      'INVALID_GRAM_DECIMALS',
+      `GRAM uses 9 decimals (nanogram), got ${config.treasury.gramDecimals}`,
+    );
   }
   if (config.database.url.startsWith('pglite:')) {
     throw new ConfigError('EMBEDDED_DB_IN_PRODUCTION', 'production requires a PostgreSQL server URL');

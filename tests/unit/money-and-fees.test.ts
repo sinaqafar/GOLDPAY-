@@ -5,7 +5,13 @@
 
 import { describe, it, expect } from 'vitest';
 import { Money, Percentage, Rate, MoneyError } from '../../packages/money/src/index.ts';
-import { calculateFees } from '../../packages/core/src/fees.ts';
+import { calculateFees, calculateProviderCost } from '../../packages/core/src/fees.ts';
+import {
+  assertTomanWithinBounds,
+  assertGramWithinBounds,
+  MAX_TOMAN_ATOMIC,
+  MAX_GRAM_ATOMIC,
+} from '../../packages/core/src/limits.ts';
 
 const FEE = { rate: Percentage.fromPercent(15), version: 'v1' };
 
@@ -99,5 +105,88 @@ describe('Rate', () => {
   it('rejects a zero or malformed rate', () => {
     expect(() => Rate.of('0', 'TEST')).toThrow(MoneyError);
     expect(() => Rate.of('abc', 'TEST')).toThrow(MoneyError);
+  });
+});
+
+describe('provider cost (CubePay 9%)', () => {
+  const PROVIDER = Percentage.fromPercent(9);
+
+  it('is kept separate from the platform fee and never merged into one rate', () => {
+    // MERCHANT mode on a 1,000,000 base: the customer pays the base, we credit
+    // 850,000, CubePay keeps 90,000 of what it collects, so our real margin is
+    // 150,000 − 90,000 = 60,000. The merchant only ever sees our 15%.
+    const breakdown = calculateFees(Money.toman(1_000_000), 'MERCHANT', FEE);
+    const cost = calculateProviderCost(breakdown.customerTotal, PROVIDER);
+
+    expect(breakdown.customerTotal.toAtomicString()).toBe('1000000');
+    expect(breakdown.merchantNet.toAtomicString()).toBe('850000');
+    expect(breakdown.platformFee.toAtomicString()).toBe('150000');
+
+    expect(cost.providerFee.toAtomicString()).toBe('90000');
+    expect(cost.providerNet.toAtomicString()).toBe('910000');
+
+    const grossMargin = cost.providerNet.subtract(breakdown.merchantNet);
+    expect(grossMargin.toAtomicString()).toBe('60000');
+  });
+
+  it('charges the provider rate on what was actually collected, not on the base', () => {
+    // CUSTOMER mode: the customer pays 1,150,000, so CubePay's 9% applies to
+    // the larger figure — 103,500, not 90,000.
+    const breakdown = calculateFees(Money.toman(1_000_000), 'CUSTOMER', FEE);
+    const cost = calculateProviderCost(breakdown.customerTotal, PROVIDER);
+
+    expect(breakdown.customerTotal.toAtomicString()).toBe('1150000');
+    expect(cost.providerFee.toAtomicString()).toBe('103500');
+
+    const grossMargin = cost.providerNet.subtract(breakdown.merchantNet);
+    expect(grossMargin.toAtomicString()).toBe('46500');
+  });
+
+  it('rounds the cost up so platform margin is never flattered', () => {
+    // 9% of 1,001 = 90.09 -> 91, never 90.
+    const cost = calculateProviderCost(Money.toman(1_001), PROVIDER);
+    expect(cost.providerFee.toAtomicString()).toBe('91');
+  });
+
+  it('conserves value: collected == fee + net', () => {
+    for (const amount of [1n, 7n, 999n, 1_000_000n, 123_456_789n]) {
+      const cost = calculateProviderCost(Money.toman(amount), PROVIDER);
+      expect(cost.providerFee.add(cost.providerNet).toAtomicString()).toBe(amount.toString());
+    }
+  });
+
+  it('refuses a negative collected amount', () => {
+    expect(() => calculateProviderCost(Money.toman(-1), PROVIDER)).toThrow();
+  });
+});
+
+describe('numeric bounds', () => {
+  it('accepts an amount at the ceiling and rejects one past it', () => {
+    expect(() => assertTomanWithinBounds(MAX_TOMAN_ATOMIC, 'amount')).not.toThrow();
+    expect(() => assertTomanWithinBounds(MAX_TOMAN_ATOMIC + 1n, 'amount')).toThrow();
+
+    expect(() => assertGramWithinBounds(MAX_GRAM_ATOMIC, 'amount')).not.toThrow();
+    expect(() => assertGramWithinBounds(MAX_GRAM_ATOMIC + 1n, 'amount')).toThrow();
+  });
+
+  it('keeps Toman inside NUMERIC(30,0) even after a 115% customer total', () => {
+    // The ceiling must leave room for the largest derived figure.
+    const maxCustomerTotal = (MAX_TOMAN_ATOMIC * 115n) / 100n;
+    expect(maxCustomerTotal.toString().length).toBeLessThanOrEqual(30);
+  });
+
+  it('keeps nanoGRAM inside NUMERIC(40,0)', () => {
+    expect(MAX_GRAM_ATOMIC.toString().length).toBeLessThanOrEqual(40);
+  });
+
+  it('names the offending field so the caller can act on it', () => {
+    expect(() => assertGramWithinBounds(MAX_GRAM_ATOMIC + 1n, 'funding amount')).toThrow(
+      /funding amount/,
+    );
+  });
+
+  it('rejects negatives outright', () => {
+    expect(() => assertTomanWithinBounds(-1n, 'amount')).toThrow();
+    expect(() => assertGramWithinBounds(-1n, 'amount')).toThrow();
   });
 });

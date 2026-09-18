@@ -10,6 +10,7 @@ import { randomUUID } from 'node:crypto';
 import type { Database } from '../../../database/src/client.ts';
 import { Money } from '../../../money/src/index.ts';
 import { calculateFees, isFeeMode, type FeeBreakdown, type FeeMode } from '../fees.ts';
+import { MAX_TOMAN_ATOMIC } from '../limits.ts';
 import { enqueue } from '../outbox.ts';
 import { recordTransition } from '../transitions.ts';
 import type { Config } from '../../../config/src/index.ts';
@@ -45,14 +46,10 @@ const MAX_EXPIRY_SECONDS = 30 * 24 * 3600;
 const MIN_EXPIRY_SECONDS = 60;
 
 /**
- * Largest base amount we accept, in Toman.
- *
- * The storage columns are NUMERIC(30,0), i.e. 30 digits. A CUSTOMER-mode
- * invoice stores up to 1.15x the base, so a 28-digit ceiling leaves ample room
- * for every derived figure while still being astronomically above any real
- * transaction.
+ * Largest base amount we accept, in Toman. Shared with every other financial
+ * entry point so the ceiling is defined exactly once (see ../limits.ts).
  */
-const MAX_TOMAN_AMOUNT = 10n ** 28n;
+const MAX_TOMAN_AMOUNT = MAX_TOMAN_ATOMIC;
 
 export async function createInvoice(
   db: Database,

@@ -37,6 +37,7 @@ export type PayoutStatus =
   | 'RATE_LOCKED'
   | 'WAITING_LIQUIDITY'
   | 'RESERVED'
+  | 'SIGNED'
   | 'BROADCASTED'
   | 'SETTLED'
   | 'FAILED'
@@ -91,7 +92,13 @@ export const PAYOUT_TRANSITIONS: Transitions<PayoutStatus> = {
   QUEUED: ['RATE_LOCKED', 'FAILED'],
   RATE_LOCKED: ['RESERVED', 'WAITING_LIQUIDITY', 'FAILED'],
   WAITING_LIQUIDITY: ['RATE_LOCKED', 'RESERVED', 'FAILED'],
-  RESERVED: ['BROADCASTED', 'FAILED', 'UNKNOWN'],
+  // SPEC 90.10 — signing is its own step; a signed payload must exist before
+  // anything is put on the wire.
+  RESERVED: ['SIGNED', 'FAILED', 'UNKNOWN'],
+  // SPEC 5496-5501 — "signed but not broadcast". A signing failure can still be
+  // definitive (FAILED), but once signed we must never build a second
+  // transaction; the only ways forward are broadcast or reconciliation.
+  SIGNED: ['BROADCASTED', 'FAILED', 'UNKNOWN'],
   BROADCASTED: ['SETTLED', 'FAILED', 'UNKNOWN'],
   SETTLED: [],
   FAILED: [],
@@ -143,7 +150,12 @@ export function isTerminal<S extends string>(table: Transitions<S>, state: S): b
  * States in which money is committed to an in-flight on-chain transaction.
  * SPEC 124.170: while in these states the amount must NOT be made spendable again.
  */
-export const PAYOUT_IN_FLIGHT: readonly PayoutStatus[] = ['RESERVED', 'BROADCASTED', 'UNKNOWN'];
+export const PAYOUT_IN_FLIGHT: readonly PayoutStatus[] = [
+  'RESERVED',
+  'SIGNED',
+  'BROADCASTED',
+  'UNKNOWN',
+];
 
 export function isPayoutInFlight(status: PayoutStatus): boolean {
   return PAYOUT_IN_FLIGHT.includes(status);

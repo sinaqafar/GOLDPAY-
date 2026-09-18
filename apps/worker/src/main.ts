@@ -16,6 +16,7 @@ import {
   queuePayoutForMerchant,
   lockPayoutRate,
   reservePayoutLiquidity,
+  signPayout,
   broadcastPayout,
   settlePayout,
   reconcilePayout,
@@ -135,7 +136,7 @@ async function advancePayouts(container: Container): Promise<void> {
 
   const pending = await db.query<{ id: string; status: string }>(
     `SELECT id, status FROM finance.payouts
-      WHERE status IN ('QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','BROADCASTED')
+      WHERE status IN ('QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','SIGNED','BROADCASTED')
       ORDER BY created_at ASC
       LIMIT 25`,
   );
@@ -152,7 +153,13 @@ async function advancePayouts(container: Container): Promise<void> {
           await reservePayoutLiquidity(db, config, payout.id);
           break;
 
+        // SPEC 90.10 — sign and broadcast are separate stages, so a crash
+        // between them leaves a state that describes what actually happened.
         case 'RESERVED':
+          await signPayout(db, chain, config, payout.id);
+          break;
+
+        case 'SIGNED':
           await broadcastPayout(db, chain, payout.id);
           break;
 

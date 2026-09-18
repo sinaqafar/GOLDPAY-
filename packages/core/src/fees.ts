@@ -136,6 +136,72 @@ export function calculateFees(
 }
 
 /**
+ * The provider's own cut, which is NOT the platform fee.
+ *
+ * CubePay charges ~9% of the amount it actually collects. The spec is explicit
+ * that this must never be merged with our 15% into a single headline number for
+ * the merchant: the merchant's contract is with us, and CubePay deducts its
+ * cost from OUR receipts.
+ *
+ *     Invoice Amount − CubePay Fee = CubePay Net
+ *     Base Amount    − Merchant Fee = Merchant Credit
+ *     CubePay Net    − Merchant Credit = Platform Gross Margin
+ *
+ * Worked example (MERCHANT mode, 1,000,000 base, 15% platform, 9% provider):
+ *     customer pays          1,000,000
+ *     provider keeps            90,000
+ *     we receive               910,000
+ *     merchant is credited     850,000
+ *     our gross margin          60,000
+ */
+export interface ProviderCostBreakdown {
+  /** Amount the provider actually collected from the customer. */
+  readonly collectedAmount: Money;
+  /** The provider's fee on that amount — a platform expense, not merchant's. */
+  readonly providerFee: Money;
+  /** What the provider will settle to us. */
+  readonly providerNet: Money;
+  /** Snapshotted provider rate in basis points, e.g. 900 for 9%. */
+  readonly providerFeeRateBps: bigint;
+}
+
+/**
+ * Compute the provider's cost on a collected amount.
+ *
+ * Rounded CEIL deliberately: under-stating a cost we will actually be charged
+ * would overstate platform margin, and the ledger must never flatter itself.
+ */
+export function calculateProviderCost(
+  collectedAmount: Money,
+  rate: Percentage,
+): ProviderCostBreakdown {
+  if (collectedAmount.currency !== 'TOMAN') {
+    throw new ValidationError('PROVIDER_FEE_CURRENCY', 'provider fees are only defined for TOMAN', {
+      currency: collectedAmount.currency,
+    });
+  }
+  if (collectedAmount.isNegative()) {
+    throw new ValidationError('PROVIDER_FEE_NEGATIVE_BASE', 'collected amount cannot be negative');
+  }
+
+  const providerFee = rate.applyTo(collectedAmount, 'CEIL');
+  if (providerFee.compare(collectedAmount) > 0) {
+    throw new ValidationError(
+      'PROVIDER_FEE_EXCEEDS_COLLECTED',
+      'provider fee cannot exceed the collected amount',
+      { collected: collectedAmount.toAtomicString(), fee: providerFee.toAtomicString() },
+    );
+  }
+
+  return Object.freeze({
+    collectedAmount,
+    providerFee,
+    providerNet: collectedAmount.subtract(providerFee),
+    providerFeeRateBps: rate.bps,
+  });
+}
+
+/**
  * Rebuild a breakdown from persisted invoice columns instead of recomputing it.
  * SPEC 4335: an old invoice keeps its own snapshot even after the policy changes.
  */

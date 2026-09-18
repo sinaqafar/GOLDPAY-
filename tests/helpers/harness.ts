@@ -22,7 +22,7 @@ export const TEST_ENV: Record<string, string> = {
   TON_NETWORK: 'TON_TESTNET',
   TREASURY_ADDRESS: 'EQD__________________________________________0vo',
   PAYOUT_WALLET_ADDRESS: 'EQD__________________________________________0vo',
-  GRAM_JETTON_MASTER: 'EQAvlWFDxGF2lXm67y4yzC17wYKD9A0guwPkMs1gOsM__NOT',
+  GRAM_ASSET: 'GRAM',
   TON_SIGNER_REFERENCE: 'kms://test/key-1',
   MIN_PAYOUT_TOMAN: '1000',
   CUBEPAY_SANDBOX: 'true',

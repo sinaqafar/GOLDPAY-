@@ -1,5 +1,11 @@
 /**
- * TON adapter for GRAM jetton payouts.
+ * TON adapter for NATIVE GRAM payouts.
+ *
+ * GRAM is the native currency of The Open Network — Toncoin was renamed to
+ * Gram on 2026-06-15 (ticker only; addresses, balances and history unchanged).
+ * A transfer is therefore a plain internal message carrying value: there is no
+ * jetton master, no token contract, no jetton wallet, and network fees are
+ * paid in GRAM itself. Amounts are in nanogram (9 decimals).
  *
  * SPEC 124.168: NO CHAIN CONFIRMATION -> NO SETTLED.
  * SPEC 124.170: an ambiguous send returns UNKNOWN, never a silent retry.
@@ -43,6 +49,13 @@ export class TonAdapter implements BlockchainPayoutPort {
   }
 
   async send(request: SendTransferRequest): Promise<BroadcastResult> {
+    // SPEC 97.114 — wrong-network guard. Config drift must never reach the chain.
+    if (this.#config.gramAsset !== 'GRAM') {
+      return { status: 'REJECTED', error: 'INVALID_SETTLEMENT_ASSET' };
+    }
+    if (request.network !== this.#config.network) {
+      return { status: 'REJECTED', error: 'NETWORK_MISMATCH' };
+    }
     if (!this.isValidAddress(request.to, request.network)) {
       return { status: 'REJECTED', error: 'INVALID_DESTINATION_ADDRESS' };
     }
@@ -64,9 +77,14 @@ export class TonAdapter implements BlockchainPayoutPort {
           idempotency_key: request.idempotencyKey,
           from: this.#config.payoutWalletAddress,
           to: request.to,
-          jetton_master: this.#config.gramJettonMaster,
-          amount: request.amountAtomic.toString(),
+          // Native value transfer: nanogram carried by the message itself.
+          value: request.amountAtomic.toString(),
+          asset: this.#config.gramAsset,
           decimals: this.#config.gramDecimals,
+          // The sender pays the network fee out of its own GRAM balance, so the
+          // recipient receives exactly the quoted amount (SPEC 97.117).
+          send_mode: 'PAY_GAS_SEPARATELY',
+          bounce: false,
           signer_reference: this.#config.signerReference,
         }),
       });
@@ -123,15 +141,19 @@ export class TonAdapter implements BlockchainPayoutPort {
     return this.getTransferStatus({ ...request, txHash: found });
   }
 
+  /**
+   * Native GRAM balance of an account. No jetton wallet lookup is involved:
+   * the balance lives on the account state itself.
+   */
   async getBalance(address: string): Promise<bigint> {
     const res = await this.#rpc(
-      `/api/v3/jetton/wallets?owner_address=${encodeURIComponent(address)}&jetton_address=${encodeURIComponent(this.#config.gramJettonMaster)}`,
+      `/api/v3/accountStates?address=${encodeURIComponent(address)}`,
       { method: 'GET' },
     );
-    const wallets = Array.isArray(res['jetton_wallets']) ? (res['jetton_wallets'] as unknown[]) : [];
-    const wallet = wallets[0] as Record<string, unknown> | undefined;
-    if (!wallet) return 0n;
-    return parseAtomic(wallet['balance']) ?? 0n;
+    const accounts = Array.isArray(res['accounts']) ? (res['accounts'] as unknown[]) : [];
+    const account = accounts[0] as Record<string, unknown> | undefined;
+    if (!account) return 0n;
+    return parseAtomic(account['balance']) ?? 0n;
   }
 
   /** Look up a previously broadcast transfer by our idempotency key. */

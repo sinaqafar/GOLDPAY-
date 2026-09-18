@@ -24,6 +24,7 @@ import { sha256Hex } from '../../../crypto/src/index.ts';
 import type { Config } from '../../../config/src/index.ts';
 import type { RateProvider } from '../ports/rate-provider.ts';
 import type { BlockchainPayoutPort, BroadcastResult } from '../ports/blockchain.ts';
+import { assertGramWithinBounds, assertTomanWithinBounds } from '../limits.ts';
 import {
   PayoutError,
   FinancialError,
@@ -119,6 +120,7 @@ export async function queuePayoutForMerchant(
         available.atomic > config.settlement.maxPayoutToman
           ? Money.toman(config.settlement.maxPayoutToman)
           : available;
+      assertTomanWithinBounds(amount.atomic, 'payout amount');
 
       const payoutId = randomUUID();
       await tx.query(
@@ -240,6 +242,8 @@ export async function lockPayoutRate(
     if (!gramAmount.isPositive()) {
       throw new PayoutError('PAYOUT_AMOUNT_TOO_SMALL', 'payout converts to zero GRAM');
     }
+    // A corrupt or hostile quote could otherwise blow past NUMERIC(40,0).
+    assertGramWithinBounds(gramAmount.atomic, 'converted GRAM amount');
 
     // Persist the quote so the snapshot is auditable.
     await tx.query(
@@ -414,7 +418,106 @@ export async function reservePayoutLiquidity(
 }
 
 // ---------------------------------------------------------------------------
-// 4. Broadcast
+// 4. Sign
+// ---------------------------------------------------------------------------
+
+/**
+ * Sign the payout transaction — SPEC 90.10.
+ *
+ * Signing is deliberately a separate state from broadcasting. Once a payload is
+ * signed it must never be rebuilt: a second signature over the same payout is
+ * a second spendable transaction. SPEC 5498 is explicit that a worker may not
+ * construct a new transaction while the previous one's fate is undecided.
+ *
+ * Every guard from SPEC 90.10 is re-checked here rather than trusted from the
+ * reservation step, because time has passed and the world may have moved.
+ */
+export async function signPayout(
+  db: Database,
+  chain: BlockchainPayoutPort,
+  config: Config,
+  payoutId: string,
+): Promise<{ status: 'SIGNED'; signingReference: string }> {
+  return db.transaction(async (tx) => {
+    const r = await tx.query<{
+      id: string;
+      status: string;
+      gram_amount_atomic: string | null;
+      destination_address: string;
+      destination_network: string;
+      merchant_id: string;
+      signing_reference: string | null;
+    }>(
+      `SELECT id, status, gram_amount_atomic::text, destination_address,
+              destination_network, merchant_id, signing_reference
+         FROM finance.payouts WHERE id = $1 FOR UPDATE`,
+      [payoutId],
+    );
+    const payout = r.rows[0];
+    if (!payout) throw new NotFoundError('payout', payoutId);
+
+    // Already signed: return the existing reference instead of signing again.
+    if (payout.status === 'SIGNED' && payout.signing_reference) {
+      return { status: 'SIGNED' as const, signingReference: payout.signing_reference };
+    }
+    if (payout.status !== 'RESERVED') {
+      throw new PayoutError('PAYOUT_NOT_SIGNABLE', `payout is ${payout.status}`);
+    }
+
+    // SPEC 90.10 — check rate lock, asset, network, wallet before signing.
+    if (!payout.gram_amount_atomic) {
+      throw new PayoutError('RATE_NOT_LOCKED', 'cannot sign before the rate is locked');
+    }
+    if (config.ton.gramAsset !== 'GRAM') {
+      throw new PayoutError('INVALID_SETTLEMENT_ASSET', 'settlement asset must be GRAM');
+    }
+    if (payout.destination_network !== config.ton.network) {
+      throw new PayoutError('NETWORK_MISMATCH', 'payout network does not match configuration');
+    }
+    if (!chain.isValidAddress(payout.destination_address, payout.destination_network)) {
+      throw new PayoutError('WALLET_INVALID', 'destination address is not valid for this network');
+    }
+
+    const reservation = await tx.query<{ amount_atomic: string }>(
+      `SELECT amount_atomic::text FROM finance.liquidity_reservations
+        WHERE payout_id = $1 AND status = 'ACTIVE' AND expires_at > NOW()`,
+      [payoutId],
+    );
+    const active = reservation.rows[0];
+    if (!active) {
+      throw new PayoutError('RESERVATION_MISSING_OR_EXPIRED', 'no valid liquidity reservation');
+    }
+    if (active.amount_atomic !== payout.gram_amount_atomic) {
+      throw new PayoutError(
+        'PAYOUT_AMOUNT_MISMATCH',
+        'reserved liquidity does not match the locked payout amount',
+      );
+    }
+
+    // The signer holds the key; we only ever store a handle to the result.
+    // SPEC 5485-5487 / 118.37: no key material touches this process.
+    const signingReference = `sign:${payoutId}`;
+
+    await transitionState(tx, {
+      table: 'finance.payouts',
+      entityType: 'PAYOUT',
+      entityId: payoutId,
+      fromState: 'RESERVED',
+      toState: 'SIGNED',
+      event: 'SIGN',
+      extraSet: {
+        signed_at: new Date().toISOString(),
+        signing_reference: signingReference,
+      },
+      actorType: 'WORKER',
+    });
+
+    return { status: 'SIGNED' as const, signingReference };
+  });
+}
+
+// ---------------------------------------------------------------------------
+// 5. Broadcast
 // ---------------------------------------------------------------------------
 
 /**
@@ -446,17 +549,48 @@ export async function broadcastPayout(
     );
     const payout = r.rows[0];
     if (!payout) throw new NotFoundError('payout', payoutId);
-    if (payout.status !== 'RESERVED') {
+    // SPEC 5502 — only a SIGNED payout may be broadcast.
+    if (payout.status !== 'SIGNED') {
       throw new PayoutError('PAYOUT_NOT_BROADCASTABLE', `payout is ${payout.status}`);
     }
 
-    const reservation = await tx.query<{ id: string }>(
-      `SELECT id FROM finance.liquidity_reservations
+    const reservation = await tx.query<{ id: string; amount_atomic: string }>(
+      `SELECT id, amount_atomic::text FROM finance.liquidity_reservations
         WHERE payout_id = $1 AND status = 'ACTIVE' AND expires_at > NOW()`,
       [payoutId],
     );
-    if (reservation.rows.length === 0) {
+    const activeReservation = reservation.rows[0];
+    if (!activeReservation) {
       throw new PayoutError('RESERVATION_MISSING_OR_EXPIRED', 'no valid liquidity reservation');
+    }
+
+    // SPEC 97.115 — destination guard. The address we are about to pay must
+    // still be the merchant's active wallet. A wallet change mid-flight must
+    // never silently redirect funds.
+    const wallet = await tx.query<{ address: string; network: string }>(
+      `SELECT address, network FROM core.wallets
+        WHERE merchant_id = $1 AND status = 'ACTIVE'`,
+      [payout.merchant_id],
+    );
+    const activeWallet = wallet.rows[0];
+    if (
+      !activeWallet ||
+      activeWallet.address !== payout.destination_address ||
+      activeWallet.network !== payout.destination_network
+    ) {
+      throw new PayoutError(
+        'DESTINATION_MISMATCH',
+        'payout destination no longer matches the active wallet snapshot',
+      );
+    }
+
+    // SPEC 97.116 — amount guard. The GRAM figure must be exactly what the
+    // rate lock produced and exactly what liquidity was reserved for.
+    if (activeReservation.amount_atomic !== payout.gram_amount_atomic) {
+      throw new PayoutError(
+        'PAYOUT_AMOUNT_MISMATCH',
+        'reserved liquidity does not match the locked payout amount',
+      );
     }
 
     await tx.query(
@@ -504,7 +638,7 @@ export async function broadcastPayout(
       table: 'finance.payouts',
       entityType: 'PAYOUT',
       entityId: payoutId,
-      fromState: 'RESERVED',
+      fromState: 'SIGNED',
       toState: 'BROADCASTED',
       event: 'BROADCAST',
       extraSet: {
@@ -542,7 +676,7 @@ async function markUnknown(db: Database, payoutId: string, reason: string): Prom
       table: 'finance.payouts',
       entityType: 'PAYOUT',
       entityId: payoutId,
-      fromState: ['RESERVED', 'BROADCASTED'],
+      fromState: ['RESERVED', 'SIGNED', 'BROADCASTED'],
       toState: 'UNKNOWN',
       event: 'BROADCAST_UNKNOWN',
       extraSet: { failure_code: reason.slice(0, 200) },
@@ -748,7 +882,15 @@ export async function failPayout(
         table: 'finance.payouts',
         entityType: 'PAYOUT',
         entityId: payoutId,
-        fromState: ['CREATED', 'QUEUED', 'RATE_LOCKED', 'WAITING_LIQUIDITY', 'RESERVED', 'BROADCASTED'],
+        fromState: [
+          'CREATED',
+          'QUEUED',
+          'RATE_LOCKED',
+          'WAITING_LIQUIDITY',
+          'RESERVED',
+          'SIGNED',
+          'BROADCASTED',
+        ],
         toState: 'FAILED',
         event: 'FAIL',
         extraSet: { failure_code: reason.slice(0, 200) },
@@ -868,6 +1010,9 @@ export async function recordManualTreasuryFunding(
   if (params.amountAtomic <= 0n) {
     throw new ValidationError('INVALID_FUNDING_AMOUNT', 'funding amount must be positive');
   }
+  // Without this an oversized figure reaches NUMERIC(40,0) and comes back as an
+  // opaque 500 instead of a clean rejection.
+  assertGramWithinBounds(params.amountAtomic, 'funding amount');
   return db.transaction(async (tx) => {
     const amount = Money.gram(params.amountAtomic);
 

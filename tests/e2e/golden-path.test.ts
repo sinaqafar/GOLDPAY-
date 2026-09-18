@@ -14,6 +14,7 @@ import {
   queuePayoutForMerchant,
   lockPayoutRate,
   reservePayoutLiquidity,
+  signPayout,
   broadcastPayout,
   settlePayout,
 } from '../../packages/core/src/use-cases/payout.ts';
@@ -103,6 +104,10 @@ describe('golden path', () => {
 
     const reserved = await reservePayoutLiquidity(db, config, payoutId);
     expect(reserved.reserved).toBe(true);
+
+    // SPEC 90.10 — signing is its own stage before anything hits the wire.
+    const signed = await signPayout(db, chain, config, payoutId);
+    expect(signed.status).toBe('SIGNED');
 
     const broadcast = await broadcastPayout(db, chain, payoutId);
     expect(broadcast.status).toBe('BROADCASTED');

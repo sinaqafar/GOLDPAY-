@@ -14,7 +14,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Database, TransactionContext } from '../../../database/src/client.ts';
 import { Money } from '../../../money/src/index.ts';
-import { feeBreakdownFromSnapshot } from '../fees.ts';
+import { feeBreakdownFromSnapshot, calculateProviderCost } from '../fees.ts';
 import { post, type JournalLine } from '../../../ledger/src/ledger-service.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../../ledger/src/accounts.ts';
 import { enqueue } from '../outbox.ts';
@@ -282,6 +282,26 @@ export async function finalizePayment(
           credit: breakdown.platformFee,
           bucket: 'AVAILABLE' as const,
         });
+      }
+
+      // The provider's own cut, recognised as a platform expense against the
+      // clearing asset. CubePay never settles us the full customerTotal — it
+      // keeps ~9% — so booking only our 15% revenue would overstate margin.
+      //
+      // The merchant is untouched by this: their liability is already fixed by
+      // the fee snapshot. Gross platform margin is therefore
+      //   platformFee − providerFee
+      // and both halves are visible in the ledger rather than netted silently.
+      const providerCost = calculateProviderCost(
+        breakdown.customerTotal,
+        config.fees.providerFeePercent,
+      );
+      if (providerCost.providerFee.isPositive()) {
+        const expenseAccount = await getSystemAccountId(tx, 'PLATFORM_EXPENSE_TOMAN');
+        lines.push(
+          { accountId: expenseAccount, debit: providerCost.providerFee, bucket: 'AVAILABLE' },
+          { accountId: clearingAccount, credit: providerCost.providerFee, bucket: 'AVAILABLE' },
+        );
       }
 
       const posting = await post(tx, {

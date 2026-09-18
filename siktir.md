@@ -245,11 +245,10 @@ CubePay VIP = درگاه ریالی
 PENDING → VERIFYING → PAID | FAILED | EXPIRED | MISMATCH | REVIEW | UNKNOWN
 ```
 
-### Payout (زنجیرهٔ کامل با مرحلهٔ SIGNED)
+### Payout (زنجیرهٔ کامل با مرحلهٔ SIGNED — **پیاده‌سازی‌شده**)
 ```
-RELEASABLE → QUEUED → RESERVED → SIGNED → BROADCASTED
-→ CONFIRMING → SETTLED
-                ↘ FAILED | UNKNOWN | REVIEW
+CREATED → QUEUED → RATE_LOCKED → RESERVED → SIGNED → BROADCASTED → SETTLED
+                        ↘ WAITING_LIQUIDITY    ↘ FAILED | UNKNOWN
 ```
 حالت‌های انتظار: `WAITING_LIQUIDITY`، `WAITING_RATE`، `WAITING_NETWORK`، `WAITING_WALLET`
 
@@ -1139,7 +1138,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · HEAD `e46d647` · `tsc --noEmit` تمیز · **۱۰ فایل / ۱۶۷ تست سبز**
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۰ فایل / ۱۸۰ تست سبز**
+· ۵ مهاجرت اعمال‌شده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1152,7 +1152,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 | `packages/crypto/src/index.ts` | `safeEqual` · `hmacSha256Hex` · `signRequest(secret,{...})` · `verifyTelegramInitData` · `generateApiKey()` · **`parseApiToken` (throws)** |
 | `packages/database/src/client.ts` | **async** `createDatabase({url})` — `pglite:<dir>` \| `pglite:memory` \| `pg`؛ retry 40001/40P01؛ 23514→`NEGATIVE_BALANCE` |
 | `packages/ledger/` | `accounts.ts` (۸ حساب سیستمی) · `ledger-service.ts` (`post()` تنها مسیر) |
-| `packages/ton/src/adapter.ts` | 🔴 آداپتور TON — **هنوز jetton** |
+| `packages/ton/src/adapter.ts` | آداپتور TON — انتقال **بومی** GRAM + گاردهای asset/network |
+| `packages/core/src/limits.ts` | سقف‌های عددی `MAX_TOMAN_ATOMIC` / `MAX_GRAM_ATOMIC` |
 | `packages/config/src/index.ts` | `loadConfig` · `assertTreasuryManualOnly` · `validateProductionInvariants` |
 
 ### مهاجرت‌ها
@@ -1166,6 +1167,7 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 003_integration_audit_system.sql integration.* · audit.* · system.*
 004_admin.sql                   core.admin_users · core.admin_approvals
                                 system.platform_state · core.admin_sessions
+005_payout_signed_state.sql     signed_at + signing_reference؛ حالت SIGNED
 ```
 
 ### اپ‌ها
@@ -1182,39 +1184,71 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۳. شکاف‌های شناسایی‌شده
 
-### 🔴 ۱. GRAM به‌صورت Jetton پیاده شده (باگ قطعی)
-| فایل | مورد |
+### ✅ ۱. GRAM به‌صورت Jetton پیاده شده بود — **رفع شد**
+| فایل | تغییر |
 |---|---|
-| `packages/ton/src/adapter.ts:67` | ساخت jetton transfer |
-| `packages/ton/src/adapter.ts:128–131` | `/api/v3/jetton/wallets` |
-| `packages/config/src/index.ts:90–91, 311, 341` | `gramJettonMaster` / `GRAM_JETTON_MASTER` |
-| `tests/helpers/harness.ts:25` | `GRAM_JETTON_MASTER` در `TEST_ENV` |
-| `README.md:44` | «TON jetton transfer» |
+| `packages/ton/src/adapter.ts` | انتقال بومی (`value` + `PAY_GAS_SEPARATELY` + `bounce:false`) به‌جای jetton |
+| `packages/ton/src/adapter.ts` | `/api/v3/accountStates` به‌جای `/api/v3/jetton/wallets` |
+| `packages/config/src/index.ts` | `gramJettonMaster` حذف → `gramAsset` (`GRAM_ASSET`) |
+| `packages/config/src/index.ts` | ثوابت Production: `GRAM_ASSET==='GRAM'` و `GRAM_DECIMALS===9` |
+| `tests/helpers/harness.ts` | `GRAM_ASSET: 'GRAM'` |
+| `README.md` | «native GRAM transfer on TON» |
 
-**اصلاح:** انتقال بومی + `/api/v3/accountStates` برای موجودی.
+مستند: `docs/architecture/adr/ADR-006-native-gram-on-ton.md`
 
-### 🔴 ۲. کارمزد ۹٪ CubePay در Ledger مدل نشده
-نیاز به حساب **Provider Cost** تا حاشیهٔ واقعی پلتفرم دیده شود.
-مشخصات صریحاً ادغام ۱۵٪ و ۹٪ را ممنوع کرده است.
+### ✅ ۲. کارمزد ۹٪ CubePay — **رفع شد**
+- `calculateProviderCost()` در `packages/core/src/fees.ts` (گرد کردن **CEIL**)
+- `FeeConfig.providerFeePercent` از `PROVIDER_FEE_PERCENT` (پیش‌فرض ۹)
+- در `finalize-payment.ts` دو خط دفتر اضافه شد:
+  `DR PLATFORM_EXPENSE_TOMAN` / `CR PROVIDER_CLEARING_TOMAN`
+- بدهی فروشنده دست‌نخورده می‌ماند — Snapshot فاکتور آن را قفل کرده است.
 
-### 🟡 ۳. مرحلهٔ `SIGNED` در ماشین حالت Payout جدا نشده
-مشخصات `RESERVED → SIGNED → BROADCASTED` می‌خواهد؛ «Signed But Not Broadcast»
-حالت حساسی است که نباید تراکنش جدید ساخته شود.
+مستند: `docs/architecture/adr/ADR-005-provider-adapter.md`
 
-### 🟡 ۴. سه گارد Broadcast پیاده نشده
-`Network Guard` · `DESTINATION_MISMATCH` · `PAYOUT_AMOUNT_MISMATCH`
+### ✅ ۳. مرحلهٔ `SIGNED` — **رفع شد**
+- مهاجرت `db/migrations/005_payout_signed_state.sql`:
+  ستون‌های `signed_at` + `signing_reference`، گسترش `ck_payouts_status`،
+  قید جدید `ck_payouts_signed_evidence`، ایندکس `ix_payouts_signed`،
+  و افزودن `SIGNED` به `ux_payouts_merchant_in_flight`
+- `signPayout()` در `payout.ts` — idempotent، با تمام گاردهای PART 90.10
+- `broadcastPayout()` فقط `SIGNED` را می‌پذیرد
+- `PAYOUT_IN_FLIGHT` شامل `SIGNED` شد
+- Worker مرحلهٔ جدید را اجرا می‌کند
 
-### 🟡 ۵. پوشهٔ `docs/` خالی است
-مشخصات ساختار کامل می‌خواهد: architecture (+ADR)، api، integrations،
-operations، security، recovery.
+مستند: `docs/architecture/adr/ADR-007-signed-state.md`
 
-### 🟡 ۶. ممیزی سرریز عددی
-مبالغ Payout و Manual Treasury Funding در برابر `NUMERIC(30,0)` / `NUMERIC(40,0)`
-سقف بالا ندارند (فقط `> 0` بررسی می‌شود).
+### ✅ ۴. سه گارد Broadcast — **رفع شد**
+| گارد | محل | خطا |
+|---|---|---|
+| Asset/Network | `ton/src/adapter.ts::send` | `INVALID_SETTLEMENT_ASSET` / `NETWORK_MISMATCH` |
+| Destination | `payout.ts::broadcastPayout` | `DESTINATION_MISMATCH` |
+| Amount | `payout.ts::broadcastPayout` | `PAYOUT_AMOUNT_MISMATCH` |
 
-### 🟢 ۷. موارد آگاهانه ساده‌سازی‌شده
-صف واقعی Redis/BullMQ نیست؛ TON signer فعلاً mock است؛
-Risk Engine و Refund/Dispute پیاده نشده‌اند.
+همچنین در `signPayout()` پیش از امضا نیز بررسی می‌شوند.
+
+### ✅ ۵. پوشهٔ `docs/` — **نوشته شد**
+```
+docs/README.md
+docs/architecture/overview.md
+docs/architecture/adr/ADR-001 … ADR-007
+docs/api/README.md
+docs/operations/treasury.md
+docs/security/README.md
+docs/recovery/README.md
+```
+
+### ✅ ۶. سرریز عددی — **رفع شد**
+`packages/core/src/limits.ts` — یک منبع واحد:
+- `MAX_TOMAN_ATOMIC = 10^28` (ستون `NUMERIC(30,0)`)
+- `MAX_GRAM_ATOMIC = 10^38` (ستون `NUMERIC(40,0)`)
+- `assertTomanWithinBounds()` / `assertGramWithinBounds()`
+
+اعمال‌شده در: `create-invoice.ts`، `payout.ts` (مبلغ payout + تبدیل نرخ +
+`recordManualTreasuryFunding`)، `admin/operations.ts` (درخواست funding).
+
+### 🟢 ۷. موارد آگاهانه ساده‌سازی‌شده (باقی‌مانده)
+صف واقعی Redis/BullMQ نیست؛ TON signer یک reference است نه KMS/HSM واقعی؛
+Risk Engine، Refund و Dispute پیاده نشده‌اند.
 
 ---
 
