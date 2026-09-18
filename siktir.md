@@ -1138,8 +1138,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 
 ## ۲۲. وضعیت پیاده‌سازی فعلی
 
-شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۱ فایل / ۲۵۰ تست سبز**
-· ۷ مهاجرت اعمال‌شده
+شاخه `arena/01a0b327-goldpay` · `tsc --noEmit` تمیز · **۱۲ فایل / ۲۷۹ تست سبز**
+· ۸ مهاجرت اعمال‌شده
 
 ### بسته‌ها
 | مسیر | محتوا |
@@ -1171,6 +1171,8 @@ MONITOR, SUPPORT, RECOVER AND RECONCILE IT.
 006_provider_fee_reconciliation.sql  provider_fee_{expected,actual,
                                 diff,status,source}
 007_refunds.sql                 core.refunds + trigger سقف بازپرداخت
+008_risk_and_disputes.sql       risk.assessments · core.disputes
+                                finance.payment_holds
 ```
 
 ### اپ‌ها
@@ -1270,7 +1272,20 @@ docs/recovery/README.md
 | **API کامل** | `GET /v1/payments`، لغو فاکتور، مدیریت API key، `GET /v1/statements`. |
 | **Mini App** | تب «بیشتر»: پرداخت‌ها، صورت‌حساب، کلیدها، تنظیمات. |
 
-### 🔴 ۹. تنها موضوع باز: سیاست Refund
+### ✅ ۹. تکمیل نهایی — **انجام شد**
+
+| مورد | جزئیات |
+|---|---|
+| **Risk Engine** | `packages/core/src/risk.ts` + مهاجرت ۰۰۸. امتیاز ۰–۱۰۰ با سیگنال‌های قابل توضیح. **قوی‌ترین تصمیم REVIEW است؛ BLOCK وجود ندارد** — قید CHECK دیتابیس هم اجازه نمی‌دهد. REVIEW فقط hold می‌گذارد؛ پول تکان نمی‌خورد. |
+| **Dispute** | `use-cases/dispute.ts` + `core.disputes`. پرونده + شواهد + hold. `UPHELD_MERCHANT`/`NO_ACTION` قفل را برمی‌دارد؛ `REFUND_REQUIRED` **برنمی‌دارد** (پول هنوز بدهکار است). |
+| **Hold** | `finance.payment_holds`. آزادسازی را متوقف می‌کند بدون هیچ حرکت مالی. در مسیر release بررسی می‌شود (SPEC 117.50). |
+| **SDK** | `packages/sdk` — امضا با query string، idempotency خودکار، **POST مالی بدون کلید فقط یک‌بار تلاش می‌شود** (SPEC 1779)، backoff با jitter، خطای typed. |
+| **نمونه‌ها** | `docs/examples/` — curl، PHP، Python. امضای Python و Node با هم cross-check شد (یکسان). |
+| **Observability** | `/metrics` — شمارنده‌های درون‌پروسه + عددهای زندهٔ دیتابیس (صف payout، خزانه، سن قدیمی‌ترین UNKNOWN). |
+| **Docker + Compose** | یک image چندنقشه، Redis با `noeviction`، پنل ادمین روی loopback. |
+| **CI** | `infra/ci/github-actions-ci.yml` — کیفیت + **چهار گارد ثابت مالی** (هرکدام تست شد که واقعاً fail می‌کند). |
+
+### 🔴 ۱۰. تنها موضوع باز: سیاست Refund
 
 مدل کامل است ولی **اجرا عمداً غیرفعال**. دلیل: نه مشخصات و نه مستندات CubePay
 نگفته‌اند کارمزد ۱۵٪ هنگام برگشت چه می‌شود. ستون‌های
@@ -1278,8 +1293,12 @@ docs/recovery/README.md
 وقتی قرارداد CubePay مشخص شد، فقط همان سیاست نوشته می‌شود — دفتر کل و هستهٔ
 پرداخت تغییر نمی‌کنند.
 
-### 🟢 ۱۰. باقی‌مانده
-Risk Engine و Dispute (نیاز به تصمیم کسب‌وکاری: آستانهٔ امتیاز ریسک، مسئول هزینه).
+### 🟢 ۱۱. یادداشت‌های عملیاتی
+- **Rate limiting** در حافظهٔ پروسه است؛ با N نمونه سقف N برابر می‌شود. برای
+  production چندنمونه‌ای باید به Redis منتقل شود (در خود کد نوشته شده).
+- **CI** به‌خاطر نبود مجوز `workflows` در `infra/ci/` است؛ روش فعال‌سازی در
+  `infra/ci/README.md`.
+- **آستانه‌های Risk** قابل پیکربندی‌اند؛ پیش‌فرض‌ها نقطهٔ شروع‌اند نه یافته.
 
 ---
 
