@@ -10,3 +10,7 @@ dist/
 coverage/
 *.log
 .DS_Store
+
+# Built admin bundle — produced by `npm run admin:build`
+apps/admin/public/assets/admin.js
+apps/admin/public/assets/admin.js.map
