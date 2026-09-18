@@ -612,6 +612,106 @@ export function registerAdminRoutes(router: Router, container: Container): void 
     return { status: 200, body: { status: 'UPDATED' } };
   });
 
+  // --- payments, invoices, ledger, rates ----------------------------------------
+
+  router.get('/internal/admin/payments', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'payments:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT p.id, p.merchant_id, p.status, p.verified_amount::text AS amount,
+              p.verified_paid_at, p.release_at, p.released_at, p.mismatch_code,
+              p.provider_fee_status, p.created_at, m.name AS merchant_name
+         FROM core.payments p
+         JOIN core.merchants m ON m.id = p.merchant_id
+        ORDER BY p.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/invoices', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'payments:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT i.id, i.invoice_number, i.status, i.fee_mode,
+              i.base_amount::text, i.customer_total_amount::text,
+              i.created_at, m.name AS merchant_name
+         FROM core.invoices i
+         JOIN core.merchants m ON m.id = i.merchant_id
+        ORDER BY i.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  /**
+   * Ledger explorer.
+   *
+   * Read-only by construction: there is no endpoint that writes a journal
+   * entry, so the panel cannot edit the books even in principle.
+   */
+  router.get('/internal/admin/ledger', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'ledger:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT j.id, j.reference_type, j.reference_id, j.description, j.created_at,
+              a.account_code, a.currency, e.debit::text, e.credit::text, e.bucket
+         FROM finance.journal_entries e
+         JOIN finance.journals j ON j.id = e.journal_id
+         JOIN finance.ledger_accounts a ON a.id = e.account_id
+        ORDER BY j.created_at DESC
+        LIMIT 300`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/rates', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'treasury:read');
+
+    // Both legs, so a settlement's price can be explained after the fact.
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, rate::text, source, expires_at, created_at,
+              crypto_value::text, crypto_source, crypto_observed_at,
+              fx_value::text, fx_source, fx_observed_at
+         FROM finance.rate_quotes
+        ORDER BY created_at DESC
+        LIMIT 100`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/security', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'audit:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, event_type, severity, actor_id, created_at, metadata
+         FROM audit.security_events
+        ORDER BY created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/webhooks', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'merchants:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT d.id, d.status, d.attempts, d.next_attempt_at, d.last_error,
+              d.created_at, e.event_type
+         FROM integration.webhook_deliveries d
+         LEFT JOIN integration.webhook_events e ON e.id = d.event_id
+        ORDER BY d.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
   // --- payouts --------------------------------------------------------------
 
   router.get('/internal/admin/payouts', async (ctx) => {

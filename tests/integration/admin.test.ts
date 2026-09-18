@@ -624,3 +624,36 @@ describe('admin session cookies', () => {
     expect(stored.rows[0]?.token_hash).not.toBe(token);
   });
 });
+
+describe('admin explorer screens', () => {
+  it('exposes payments, invoices, ledger, rates, webhooks and security', async () => {
+    for (const path of [
+      '/internal/admin/payments',
+      '/internal/admin/invoices',
+      '/internal/admin/ledger',
+      '/internal/admin/rates',
+      '/internal/admin/webhooks',
+      '/internal/admin/security',
+    ]) {
+      const res = await call('GET', path, as('SUPER_ADMIN'));
+      expect(res.status, path).toBe(200);
+      expect(Array.isArray(res.envelope['data']), path).toBe(true);
+    }
+  });
+
+  it('gates each screen on the right permission', async () => {
+    // A support agent can see payments but has no business in the ledger.
+    expect((await call('GET', '/internal/admin/payments', as('SUPPORT_AGENT'))).status).toBe(200);
+    expect((await call('GET', '/internal/admin/ledger', as('SUPPORT_AGENT'))).status).toBe(403);
+    expect((await call('GET', '/internal/admin/rates', as('SUPPORT_AGENT'))).status).toBe(403);
+  });
+
+  it('offers no way to write a journal entry', async () => {
+    // The ledger explorer is read-only by construction, not by convention.
+    const res = await call('POST', '/internal/admin/ledger', as('SUPER_ADMIN'), {
+      account: 'TREASURY_GRAM',
+      debit: '1',
+    });
+    expect([404, 405]).toContain(res.status);
+  });
+});

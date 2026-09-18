@@ -23,6 +23,12 @@ type Tab =
   | 'payouts'
   | 'treasury'
   | 'approvals'
+  | 'payments'
+  | 'invoices'
+  | 'ledger'
+  | 'rates'
+  | 'webhooks'
+  | 'security'
   | 'holds'
   | 'disputes'
   | 'support'
@@ -35,6 +41,12 @@ const TABS: { id: Tab; label: string }[] = [
   { id: 'payouts', label: 'تسویه‌ها' },
   { id: 'treasury', label: 'خزانه' },
   { id: 'approvals', label: 'تأییدها' },
+  { id: 'payments', label: 'پرداخت‌ها' },
+  { id: 'invoices', label: 'فاکتورها' },
+  { id: 'ledger', label: 'دفتر کل' },
+  { id: 'rates', label: 'نرخ‌ها' },
+  { id: 'webhooks', label: 'وب‌هوک‌ها' },
+  { id: 'security', label: 'امنیت' },
   { id: 'holds', label: 'قفل‌ها' },
   { id: 'disputes', label: 'اختلافات' },
   { id: 'support', label: 'پشتیبانی' },
@@ -180,6 +192,18 @@ function Panel({ tab }: { tab: Tab }) {
       return <Treasury />;
     case 'approvals':
       return <Approvals />;
+    case 'payments':
+      return <Listing path="/internal/admin/payments" title="پرداخت‌ها" columns={PAYMENT_COLS} />;
+    case 'invoices':
+      return <Listing path="/internal/admin/invoices" title="فاکتورها" columns={INVOICE_COLS} />;
+    case 'ledger':
+      return <Ledger />;
+    case 'rates':
+      return <Listing path="/internal/admin/rates" title="نرخ‌ها" columns={RATE_COLS} />;
+    case 'webhooks':
+      return <Listing path="/internal/admin/webhooks" title="وب‌هوک‌ها" columns={WEBHOOK_COLS} />;
+    case 'security':
+      return <Listing path="/internal/admin/security" title="رویدادهای امنیتی" columns={SECURITY_COLS} />;
     case 'holds':
       return <Holds />;
     case 'disputes':
@@ -442,6 +466,53 @@ function Holds() {
   );
 }
 
+/**
+ * Ledger explorer. Read-only by construction: no endpoint writes a journal
+ * entry, so the panel cannot edit the books even in principle (SPEC 3694).
+ */
+function Ledger() {
+  return (
+    <Resource<Record<string, unknown>[]> path="/internal/admin/ledger">
+      {(rows) => (
+        <>
+          <h1>دفتر کل</h1>
+          <div className="banner">
+            فقط خواندنی. اصلاح مالی فقط با سند جبرانی جدید انجام می‌شود، نه با ویرایش.
+          </div>
+          {rows.length === 0 ? (
+            <div className="empty">سندی ثبت نشده.</div>
+          ) : (
+            <table>
+              <thead>
+                <tr>
+                  <th>حساب</th>
+                  <th>بدهکار</th>
+                  <th>بستانکار</th>
+                  <th>سطل</th>
+                  <th>مرجع</th>
+                  <th>زمان</th>
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={`${String(r['id'])}-${i}`}>
+                    <td className="mono">{String(r['account_code'] ?? '')}</td>
+                    <td>{r['currency'] === 'GRAM' ? formatGram(r['debit']) : formatAmount(r['debit'])}</td>
+                    <td>{r['currency'] === 'GRAM' ? formatGram(r['credit']) : formatAmount(r['credit'])}</td>
+                    <td>{String(r['bucket'] ?? '')}</td>
+                    <td>{String(r['reference_type'] ?? '')}</td>
+                    <td>{formatDate(r['created_at'])}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </>
+      )}
+    </Resource>
+  );
+}
+
 interface Column {
   key: string;
   label: string;
@@ -464,6 +535,49 @@ const PAYOUT_COLS: Column[] = [
     render: (r) => formatGram(r['gram_amount_atomic']),
   },
   { key: 'created_at', label: 'تاریخ', render: (r) => formatDate(r['created_at']) },
+];
+
+const PAYMENT_COLS: Column[] = [
+  { key: 'merchant_name', label: 'فروشنده' },
+  { key: 'status', label: 'وضعیت' },
+  { key: 'amount', label: 'مبلغ', render: (r) => `${formatAmount(r['amount'])} تومان` },
+  { key: 'provider_fee_status', label: 'کارمزد درگاه' },
+  { key: 'verified_paid_at', label: 'پرداخت', render: (r) => formatDate(r['verified_paid_at']) },
+];
+
+const INVOICE_COLS: Column[] = [
+  { key: 'invoice_number', label: 'شماره' },
+  { key: 'merchant_name', label: 'فروشنده' },
+  { key: 'status', label: 'وضعیت' },
+  { key: 'fee_mode', label: 'حالت کارمزد' },
+  {
+    key: 'customer_total_amount',
+    label: 'مبلغ کل',
+    render: (r) => `${formatAmount(r['customer_total_amount'])} تومان`,
+  },
+  { key: 'created_at', label: 'تاریخ', render: (r) => formatDate(r['created_at']) },
+];
+
+const RATE_COLS: Column[] = [
+  { key: 'rate', label: 'تومان/گرم' },
+  { key: 'source', label: 'منبع' },
+  { key: 'crypto_value', label: 'GRAM/USD' },
+  { key: 'fx_value', label: 'USD/تومان' },
+  { key: 'created_at', label: 'زمان', render: (r) => formatDate(r['created_at']) },
+];
+
+const WEBHOOK_COLS: Column[] = [
+  { key: 'event_type', label: 'رویداد' },
+  { key: 'status', label: 'وضعیت' },
+  { key: 'attempts', label: 'تلاش' },
+  { key: 'last_error', label: 'خطا' },
+  { key: 'created_at', label: 'زمان', render: (r) => formatDate(r['created_at']) },
+];
+
+const SECURITY_COLS: Column[] = [
+  { key: 'event_type', label: 'رویداد' },
+  { key: 'severity', label: 'شدت' },
+  { key: 'created_at', label: 'زمان', render: (r) => formatDate(r['created_at']) },
 ];
 
 const DISPUTE_COLS: Column[] = [
