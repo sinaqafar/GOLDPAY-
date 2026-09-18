@@ -177,7 +177,16 @@ export function createHttpServer(options: ServerOptions): Server {
       // SPEC 101329/101331 — every response carries its request_id, inside the
       // envelope as well as in the header, so a caller can quote one id when
       // reporting a problem.
-      const payload = result.body === undefined ? '' : JSON.stringify(withEnvelope(result.body, requestId));
+      // A handler that sets its own non-JSON content-type (the checkout page)
+      // owns its body verbatim; everything else is JSON in the standard envelope.
+      const explicitType = result.headers?.['content-type'];
+      const isJson = !explicitType || explicitType.includes('application/json');
+      const payload =
+        result.body === undefined
+          ? ''
+          : isJson
+            ? JSON.stringify(withEnvelope(result.body, requestId))
+            : String(result.body);
       res.writeHead(result.status, {
         'content-type': 'application/json; charset=utf-8',
         'x-request-id': requestId,

@@ -15,6 +15,7 @@ import { Router, type RequestContext, type HttpResult } from './http.ts';
 import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.ts';
 import { registerAdminRoutes } from './admin-routes.ts';
 import { readPageRequest, buildPage } from './pagination.ts';
+import { renderCheckout } from './checkout.ts';
 import type { Container } from '../../../packages/core/src/container.ts';
 import { createInvoice, cancelInvoice } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-payment.ts';
@@ -71,6 +72,10 @@ export function buildRouter(container: Container): Router {
   });
 
   // --- invoices -------------------------------------------------------------
+
+  // --- public checkout (no authentication) ------------------------------------
+
+  router.get('/checkout/:id', async (ctx) => renderCheckout(db, ctx.params['id'] as string));
 
   router.post('/v1/invoices', async (ctx) => {
     const auth = await authenticateApiKey(db, config, ctx);
@@ -131,6 +136,9 @@ export function buildRouter(container: Container): Router {
         fee_mode: invoice.feeMode,
         status: invoice.status,
         expires_at: invoice.expiresAt,
+        // Our own branded checkout is the official surface (SPEC 1459); the
+        // provider link is included so a merchant can bypass it if they must.
+        checkout_url: `${config.app.appUrl}/checkout/${invoice.invoiceId}`,
         payment_url: paymentUrl,
       };
     };

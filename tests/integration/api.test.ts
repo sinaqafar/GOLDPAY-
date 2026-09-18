@@ -516,3 +516,73 @@ describe('payments list, cancellation and API keys', () => {
     expect(res.body['error'].code).toBe('INVALID_KEY_NAME');
   });
 });
+
+describe('public checkout page (SPEC 1459)', () => {
+  it('shows the merchant, the amount, the fee and the total — with no auth', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', {
+      amount: '1000000',
+      description: 'Test product',
+    });
+    expect(created.status).toBe(201);
+    expect(created.body.checkout_url).toContain(`/checkout/${created.body.id}`);
+
+    // Deliberately unauthenticated: anyone with the link can view it.
+    const res = await fetch(`${baseUrl}/checkout/${created.body.id}`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/html');
+
+    const html = await res.text();
+    expect(html).toContain('1,000,000');
+    // CUSTOMER mode: 15% on top.
+    expect(html).toContain('150,000');
+    expect(html).toContain('1,150,000');
+    expect(html).toContain('Test product');
+  });
+
+  it('leaks no internal identifiers or figures to the buyer', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '500000' });
+    const html = await (await fetch(`${baseUrl}/checkout/${created.body.id}`)).text();
+
+    // The buyer has no business seeing who the merchant is internally, what the
+    // platform earns, or what the provider costs us.
+    expect(html).not.toContain('merchant_id');
+    expect(html).not.toContain('platform_fee');
+    expect(html).not.toContain('provider_fee');
+    expect(html).not.toContain('merchant_net');
+  });
+
+  it('escapes merchant-controlled text rather than rendering it', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', {
+      amount: '10000',
+      description: '<script>alert(1)</script>',
+    });
+    const html = await (await fetch(`${baseUrl}/checkout/${created.body.id}`)).text();
+
+    expect(html).not.toContain('<script>alert(1)</script>');
+    expect(html).toContain('&lt;script&gt;');
+  });
+
+  it('serves no scripts and refuses to be framed', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '10000' });
+    const res = await fetch(`${baseUrl}/checkout/${created.body.id}`);
+
+    const csp = res.headers.get('content-security-policy') ?? '';
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("frame-ancestors 'none'");
+    expect(res.headers.get('cache-control')).toContain('no-store');
+  });
+
+  it('refuses a cancelled invoice and answers 404 for an unknown one', async () => {
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '20000' });
+    await call(keyA.token, 'POST', `/v1/invoices/${created.body.id}/cancel`);
+
+    const cancelled = await fetch(`${baseUrl}/checkout/${created.body.id}`);
+    expect(cancelled.status).toBe(409);
+    expect(await cancelled.text()).toContain('لغو');
+
+    expect((await fetch(`${baseUrl}/checkout/not-a-uuid`)).status).toBe(404);
+    expect(
+      (await fetch(`${baseUrl}/checkout/00000000-0000-4000-8000-000000000000`)).status,
+    ).toBe(404);
+  });
+});
