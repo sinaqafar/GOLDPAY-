@@ -15,6 +15,7 @@ import { randomUUID } from 'node:crypto';
 import type { Database, TransactionContext } from '../../../database/src/client.ts';
 import { Money } from '../../../money/src/index.ts';
 import { feeBreakdownFromSnapshot, calculateProviderCost } from '../fees.ts';
+import { scorePayment, recordAssessment, placeHold } from '../risk.ts';
 import { post, type JournalLine } from '../../../ledger/src/ledger-service.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../../ledger/src/accounts.ts';
 import { enqueue } from '../outbox.ts';
@@ -318,6 +319,63 @@ export async function finalizePayment(
             }),
           ],
         );
+      }
+
+      // 6b. Score the payment for risk (SPEC 255-259).
+      //
+      // The assessment is advisory: a HIGH score records a hold that pauses
+      // RELEASE, but the payment is still verified and the money is still
+      // credited. Nothing is blocked, reversed or seized — SPEC 1415 forbids
+      // the risk engine from touching the ledger itself.
+      const riskFacts = await tx.query<{
+        merchant_age_days: string;
+        prior_payments: string;
+        payments_last_hour: string;
+        wallet_changed_recently: boolean;
+      }>(
+        `SELECT
+           EXTRACT(EPOCH FROM (NOW() - m.created_at)) / 86400 AS merchant_age_days,
+           (SELECT COUNT(*) FROM core.payments
+             WHERE merchant_id = m.id AND status = 'VERIFIED' AND id <> $2) AS prior_payments,
+           (SELECT COUNT(*) FROM core.payments
+             WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '1 hour') AS payments_last_hour,
+           EXISTS (SELECT 1 FROM core.wallets
+                    WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours')
+             AS wallet_changed_recently
+         FROM core.merchants m WHERE m.id = $1`,
+        [invoice.merchant_id, paymentId],
+      );
+      const facts = riskFacts.rows[0];
+
+      if (facts) {
+        const assessment = scorePayment({
+          merchantId: invoice.merchant_id,
+          paymentId,
+          amountAtomic: paidAmount.atomic,
+          merchantAgeDays: Number(facts.merchant_age_days),
+          priorPaymentCount: Number(facts.prior_payments),
+          recentFailures: 0,
+          paymentsLastHour: Number(facts.payments_last_hour),
+          amountMismatch: false,
+          walletChangedRecently: facts.wallet_changed_recently,
+        });
+
+        const assessmentId = await recordAssessment(tx, {
+          entityType: 'PAYMENT',
+          entityId: paymentId,
+          merchantId: invoice.merchant_id,
+          assessment,
+        });
+
+        if (assessment.decision === 'REVIEW') {
+          await placeHold(tx, {
+            paymentId,
+            merchantId: invoice.merchant_id,
+            source: 'RISK',
+            sourceId: assessmentId,
+            reason: `risk score ${assessment.score}: ${assessment.signals.map((s) => s.code).join(', ')}`,
+          });
+        }
       }
 
       // 7. Post the ledger (SPEC 119.44 — Payment Posting Matrix).

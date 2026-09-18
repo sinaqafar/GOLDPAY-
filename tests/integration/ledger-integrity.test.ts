@@ -28,6 +28,8 @@ import {
 } from '../../packages/core/src/use-cases/payout.ts';
 import { post, verifyGlobalBalance, verifyProjection } from '../../packages/ledger/src/ledger-service.ts';
 import { requestRefund, refundableAmount } from '../../packages/core/src/use-cases/refund.ts';
+import { placeHold, releaseHold } from '../../packages/core/src/risk.ts';
+import { openDispute, resolveDispute } from '../../packages/core/src/use-cases/dispute.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../packages/ledger/src/accounts.ts';
 import { Money } from '../../packages/money/src/index.ts';
 
@@ -998,6 +1000,214 @@ describe('refunds (PART 70)', () => {
         amount: '1000',
         reason: 'not mine',
         requestedByType: 'MERCHANT',
+      }),
+    ).rejects.toMatchObject({ code: 'NOT_FOUND' });
+  });
+});
+
+describe('risk holds and disputes', () => {
+  async function verifiedPaymentFor(h: Harness, merchantId: string) {
+    const invoice = await createInvoice(h.db, h.config, {
+      merchantId,
+      baseAmount: '1000000',
+    });
+    return finalizePayment(h.db, h.config, {
+      invoiceId: invoice.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: `pay_${randomUUID()}`,
+        paidAmount: invoice.customerTotal,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: {},
+      },
+    });
+  }
+
+  it('a hold pauses release without moving any money', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    await db.transaction(async (tx) =>
+      placeHold(tx, {
+        paymentId: payment.paymentId,
+        merchantId: merchant.merchantId,
+        source: 'RISK',
+        reason: 'manual test hold',
+      }),
+    );
+
+    await fastForwardRelease(db, payment.paymentId);
+    const released = await releaseEligiblePayments(db);
+    expect(released.released).toBe(0);
+
+    // The money is untouched — still credited, still PENDING, not lost.
+    const balance = await db.query<{ pending: string; available: string }>(
+      `SELECT b.pending::text, b.available::text FROM finance.balances b
+         JOIN finance.ledger_accounts a ON a.id = b.account_id
+        WHERE a.owner_id = $1`,
+      [merchant.merchantId],
+    );
+    expect(balance.rows[0]?.pending).toBe('1000000');
+    expect(balance.rows[0]?.available).toBe('0');
+  });
+
+  it('releases normally once the hold is lifted', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    const hold = await db.transaction(async (tx) =>
+      placeHold(tx, {
+        paymentId: payment.paymentId,
+        merchantId: merchant.merchantId,
+        source: 'RISK',
+        reason: 'temporary',
+      }),
+    );
+    await fastForwardRelease(db, payment.paymentId);
+    expect((await releaseEligiblePayments(db)).released).toBe(0);
+
+    await releaseHold(db, { holdId: hold.holdId, releasedBy: randomUUID() });
+    expect((await releaseEligiblePayments(db)).released).toBe(1);
+  });
+
+  it('is idempotent: holding twice from one source yields one hold', async () => {
+    harness = await createHarness();
+    const { db } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    const first = await db.transaction(async (tx) =>
+      placeHold(tx, {
+        paymentId: payment.paymentId,
+        merchantId: merchant.merchantId,
+        source: 'RISK',
+        reason: 'one',
+      }),
+    );
+    const second = await db.transaction(async (tx) =>
+      placeHold(tx, {
+        paymentId: payment.paymentId,
+        merchantId: merchant.merchantId,
+        source: 'RISK',
+        reason: 'two',
+      }),
+    );
+
+    expect(second.created).toBe(false);
+    expect(second.holdId).toBe(first.holdId);
+  });
+
+  it('opening a dispute holds the money but reverses nothing', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    const dispute = await openDispute(db, {
+      paymentId: payment.paymentId,
+      reason: 'customer claims non-delivery',
+      openedByType: 'CUSTOMER',
+    });
+    expect(dispute.status).toBe('HOLD');
+    expect(dispute.holdPlaced).toBe(true);
+
+    await fastForwardRelease(db, payment.paymentId);
+    expect((await releaseEligiblePayments(db)).released).toBe(0);
+
+    // Crucially: the ledger is unchanged. A dispute investigates; it does not
+    // claw back.
+    const balance = await db.query<{ pending: string }>(
+      `SELECT b.pending::text FROM finance.balances b
+         JOIN finance.ledger_accounts a ON a.id = b.account_id
+        WHERE a.owner_id = $1`,
+      [merchant.merchantId],
+    );
+    expect(balance.rows[0]?.pending).toBe('1000000');
+  });
+
+  it('allows only one live dispute per payment', async () => {
+    harness = await createHarness();
+    const { db } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    await openDispute(db, {
+      paymentId: payment.paymentId,
+      reason: 'first',
+      openedByType: 'MERCHANT',
+    });
+    await expect(
+      openDispute(db, {
+        paymentId: payment.paymentId,
+        reason: 'second',
+        openedByType: 'MERCHANT',
+      }),
+    ).rejects.toMatchObject({ code: 'DISPUTE_ALREADY_OPEN' });
+  });
+
+  it('lifts the hold when the merchant is upheld', async () => {
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    const dispute = await openDispute(db, {
+      paymentId: payment.paymentId,
+      reason: 'investigating',
+      openedByType: 'ADMIN',
+    });
+    const resolved = await resolveDispute(db, {
+      disputeId: dispute.disputeId,
+      resolution: 'UPHELD_MERCHANT',
+      resolvedBy: randomUUID(),
+    });
+
+    expect(resolved.holdReleased).toBe(true);
+    await fastForwardRelease(db, payment.paymentId);
+    expect((await releaseEligiblePayments(db)).released).toBe(1);
+  });
+
+  it('keeps the hold when a refund is required', async () => {
+    // Releasing here would let the money leave while it is still owed back.
+    harness = await createHarness();
+    const { db, config } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    const dispute = await openDispute(db, {
+      paymentId: payment.paymentId,
+      reason: 'customer wins',
+      openedByType: 'ADMIN',
+    });
+    const resolved = await resolveDispute(db, {
+      disputeId: dispute.disputeId,
+      resolution: 'REFUND_REQUIRED',
+      resolvedBy: randomUUID(),
+    });
+
+    expect(resolved.holdReleased).toBe(false);
+    await fastForwardRelease(db, payment.paymentId);
+    expect((await releaseEligiblePayments(db)).released).toBe(0);
+  });
+
+  it("will not let a merchant dispute another merchant's payment", async () => {
+    harness = await createHarness();
+    const { db } = harness;
+    const merchant = await createMerchant(db, { feeMode: 'CUSTOMER' });
+    const other = await createMerchant(db, { name: 'Other' });
+    const payment = await verifiedPaymentFor(harness, merchant.merchantId);
+
+    await expect(
+      openDispute(db, {
+        paymentId: payment.paymentId,
+        reason: 'not mine',
+        openedByType: 'MERCHANT',
+        merchantId: other.merchantId,
       }),
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });

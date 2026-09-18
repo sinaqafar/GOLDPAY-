@@ -17,6 +17,7 @@ import { getOrCreateMerchantAccount } from '../../../ledger/src/accounts.ts';
 import { enqueue } from '../outbox.ts';
 import { recordTransition } from '../transitions.ts';
 import { ErrorCodes, FinancialError } from '../../../errors/src/index.ts';
+import { hasActiveHold } from '../risk.ts';
 
 export interface ReleaseResult {
   released: number;
@@ -101,6 +102,13 @@ export async function releaseOne(
       const merchantStatus = merchantRes.rows[0]?.status;
       if (merchantStatus !== 'ACTIVE') {
         // Not an error: the payment simply stays PENDING until the hold clears.
+        return null;
+      }
+
+      // SPEC 117.50 — validate holds. A risk review or an open dispute pauses
+      // release without touching the money: the balance stays exactly where it
+      // is, in PENDING, until a human lifts the hold.
+      if (await hasActiveHold(tx, paymentId)) {
         return null;
       }
 
