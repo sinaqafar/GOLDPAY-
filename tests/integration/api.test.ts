@@ -13,6 +13,7 @@ import { silentLogger } from '../../packages/core/src/logger.ts';
 import { generateApiKey, sha256Hex, signRequest } from '../../packages/crypto/src/index.ts';
 import { createMerchant, TEST_ENV } from '../helpers/harness.ts';
 import { seed } from '../../scripts/seed.ts';
+import { GramGateway, GramGatewayError } from '../../packages/sdk/src/index.ts';
 
 let container: Container;
 let server: Server;
@@ -629,5 +630,141 @@ describe('statements (SPEC 101403)', () => {
     const aIds = (a.body.lines as { journal_id: string }[]).map((l) => l.journal_id);
     const bIds = (b.body.lines as { journal_id: string }[]).map((l) => l.journal_id);
     for (const id of bIds) expect(aIds).not.toContain(id);
+  });
+});
+
+describe('merchant SDK (SPEC 1778/1779)', () => {
+  function sdk(token = keyA.token) {
+    return new GramGateway({ baseUrl, apiKey: token, maxAttempts: 2 });
+  }
+
+  it('signs correctly enough to be accepted by the real server', async () => {
+    const invoice = await sdk().createInvoice({ amount: '250000' });
+    expect(invoice['id']).toBeTruthy();
+    expect(invoice['customer_total']).toBe('287500');
+  });
+
+  it('signs the query string, not just the path', async () => {
+    // The server rejects a signature that omits the query, so a working
+    // filtered read proves the SDK includes it.
+    const page = await sdk().listPayments({ limit: 2 });
+    expect(Array.isArray(page.data)).toBe(true);
+    expect(page.pagination).toBeTruthy();
+  });
+
+  it('makes a retried create safe by always sending an idempotency key', async () => {
+    const key = `inv_${randomUUID()}`;
+    const first = await sdk().createInvoice({ amount: '310000' }, { idempotencyKey: key });
+    const second = await sdk().createInvoice({ amount: '310000' }, { idempotencyKey: key });
+
+    // Same key, same body: one invoice, returned twice.
+    expect(second['id']).toBe(first['id']);
+  });
+
+  it('refuses to retry a financial write that cannot be deduplicated', async () => {
+    // A POST with no idempotency key must be attempted exactly once, because a
+    // retry after a timeout could create a second invoice (SPEC 1779).
+    let calls = 0;
+    const client = new GramGateway({
+      baseUrl,
+      apiKey: keyA.token,
+      maxAttempts: 5,
+      fetchImpl: (async () => {
+        calls += 1;
+        throw new Error('connection reset');
+      }) as unknown as typeof fetch,
+    });
+
+    await expect(
+      client.requestRefund({ payment_id: randomUUID(), amount: '1', reason: 'x' }, { idempotencyKey: '' }),
+    ).rejects.toThrow();
+    expect(calls).toBe(1);
+  });
+
+  it('does retry a GET, which is safe by nature', async () => {
+    let calls = 0;
+    const realFetch = fetch;
+    const client = new GramGateway({
+      baseUrl,
+      apiKey: keyA.token,
+      maxAttempts: 3,
+      fetchImpl: (async (url: string, init: RequestInit) => {
+        calls += 1;
+        if (calls === 1) throw new Error('transient');
+        return realFetch(url, init);
+      }) as unknown as typeof fetch,
+    });
+
+    const balances = await client.getBalances();
+    expect(calls).toBe(2);
+    expect(balances).toBeTruthy();
+  });
+
+  it('surfaces a typed error carrying the request id', async () => {
+    try {
+      await sdk().getInvoice('00000000-0000-4000-8000-000000000000');
+      expect.unreachable('should have thrown');
+    } catch (e) {
+      expect(e).toBeInstanceOf(GramGatewayError);
+      const error = e as InstanceType<typeof GramGatewayError>;
+      expect(error.status).toBe(404);
+      expect(error.retryable).toBe(false);
+      // So a merchant can quote one id when reporting a problem.
+      expect(error.requestId).toBeTruthy();
+    }
+  });
+
+  it('never exposes the secret in an error', async () => {
+    const secret = keyA.token.slice(keyA.token.indexOf('.') + 1);
+    try {
+      await sdk().getInvoice('00000000-0000-4000-8000-000000000000');
+    } catch (e) {
+      const serialised = JSON.stringify({
+        message: (e as Error).message,
+        ...(e as Record<string, unknown>),
+      });
+      expect(serialised).not.toContain(secret);
+    }
+  });
+
+  it('walks every page without the caller managing cursors', async () => {
+    for (let i = 0; i < 4; i++) {
+      await sdk().createInvoice({ amount: String(400000 + i) });
+    }
+
+    const seen: string[] = [];
+    for await (const invoice of sdk().paginate('/v1/invoices', { limit: 2 })) {
+      seen.push(String(invoice['id']));
+      if (seen.length > 50) break;
+    }
+    // Every id appears exactly once across the pages.
+    expect(new Set(seen).size).toBe(seen.length);
+    expect(seen.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it('verifies a webhook signature and rejects a stale or forged one', () => {
+    const secret = 'whsec_test';
+    const rawBody = JSON.stringify({ id: 'evt_1', type: 'payment.paid' });
+    const now = new Date();
+    const timestamp = String(Math.floor(now.getTime() / 1000));
+    const signature = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`).digest('hex');
+
+    expect(GramGateway.verifyWebhook({ secret, rawBody, timestamp, signature, now })).toBe(true);
+
+    // Wrong secret.
+    expect(
+      GramGateway.verifyWebhook({ secret: 'other', rawBody, timestamp, signature, now }),
+    ).toBe(false);
+
+    // Replayed an hour later.
+    const later = new Date(now.getTime() + 3600_000);
+    expect(GramGateway.verifyWebhook({ secret, rawBody, timestamp, signature, now: later })).toBe(
+      false,
+    );
+
+    // Body tampered with after signing.
+    expect(
+      GramGateway.verifyWebhook({ secret, rawBody: rawBody + ' ', timestamp, signature, now }),
+    ).toBe(false);
   });
 });
