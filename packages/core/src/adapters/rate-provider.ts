@@ -21,8 +21,14 @@ function isPositiveDecimal(value: string): boolean {
   return DECIMAL_RE.test(value) && /[1-9]/.test(value);
 }
 
-/** A fixed rate, for tests and for manual operator-set pricing. */
-export class StaticRateProvider implements RateProvider {
+/**
+ * A fixed rate. TESTS AND DEVELOPMENT ONLY.
+ *
+ * Named so nobody can mistake it for a deployable provider: settling real GRAM
+ * against a hardcoded number sends the wrong amount the moment the market
+ * moves. The composition root refuses it in production.
+ */
+export class TestOnlyStaticRateProvider implements RateProvider {
   #tomanPerGram: string;
   #ttlSeconds: number;
   #source: string;

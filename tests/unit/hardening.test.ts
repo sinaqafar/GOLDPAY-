@@ -11,7 +11,7 @@ import { redact, createLogger } from '../../packages/core/src/logger.ts';
 import { toErrorResponse } from '../../apps/api/src/http.ts';
 import { silentLogger } from '../../packages/core/src/logger.ts';
 import { transitionState } from '../../packages/core/src/transitions.ts';
-import { StaticRateProvider } from '../../packages/core/src/adapters/rate-provider.ts';
+import { TestOnlyStaticRateProvider } from '../../packages/core/src/adapters/rate-provider.ts';
 import {
   RateAggregator,
   StaticCryptoMarketProvider,
@@ -146,26 +146,26 @@ describe('guarded SQL identifiers', () => {
 describe('rate parsing without floats', () => {
   it('rejects zero written in any form', async () => {
     for (const bad of ['0', '0.0', '0.000000000000000000']) {
-      expect(() => new StaticRateProvider(bad)).toThrow(/greater than zero/);
+      expect(() => new TestOnlyStaticRateProvider(bad)).toThrow(/greater than zero/);
     }
   });
 
   it('rejects non-numeric and signed input', () => {
     for (const bad of ['-1', 'abc', '1e5', '', ' 1 ', 'Infinity', 'NaN']) {
-      expect(() => new StaticRateProvider(bad), `${bad} must be rejected`).toThrow();
+      expect(() => new TestOnlyStaticRateProvider(bad), `${bad} must be rejected`).toThrow();
     }
   });
 
   it('accepts a rate too small to survive a float round-trip', async () => {
     // 0.000000000000000001 is fine as a decimal string; naive float handling
     // would have compared it against zero after rounding.
-    const provider = new StaticRateProvider('0.000000000000000001');
+    const provider = new TestOnlyStaticRateProvider('0.000000000000000001');
     const quote = await provider.getQuote();
     expect(quote.tomanPerGram).toBe('0.000000000000000001');
   });
 
   it('accepts a realistic GRAM rate', async () => {
-    const provider = new StaticRateProvider('75000000');
+    const provider = new TestOnlyStaticRateProvider('75000000');
     expect((await provider.getQuote()).tomanPerGram).toBe('75000000');
   });
 });

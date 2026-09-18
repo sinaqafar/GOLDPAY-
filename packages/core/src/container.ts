@@ -13,7 +13,7 @@ import { ConfigError } from '../../errors/src/index.ts';
 import { CubePayAdapter } from '../../cubepay/src/adapter.ts';
 import { TonAdapter, InMemoryTonAdapter } from '../../ton/src/adapter.ts';
 import { StubSigner, KmsSigner } from '../../ton/src/signer.ts';
-import { StaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
+import { TestOnlyStaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
 import { RateAggregator } from './adapters/rate-aggregator.ts';
 import { CoinGeckoCryptoProvider, TindexFxProvider } from './adapters/market-sources.ts';
 import { createLogger, type Logger } from './logger.ts';
@@ -112,7 +112,7 @@ export async function createContainer(
  *   1. RateAggregator — GRAM/USD × USD/TOMAN from real market sources. This is
  *      the production path: two independent legs, each with failover.
  *   2. HttpRateProvider — a single pre-computed TOMAN/GRAM endpoint.
- *   3. StaticRateProvider — a fixed number, for tests and local development.
+ *   3. TestOnlyStaticRateProvider — a fixed number, for tests and local development.
  *
  * Production refuses the static provider outright: settling real GRAM against
  * a hardcoded rate would send the wrong amount the moment the market moved.
@@ -154,7 +154,7 @@ function buildRateProvider(config: Config, env: NodeJS.ProcessEnv): RateProvider
     );
   }
 
-  return new StaticRateProvider(env['STATIC_TOMAN_PER_GRAM'] ?? '100000', {
+  return new TestOnlyStaticRateProvider(env['STATIC_TOMAN_PER_GRAM'] ?? '100000', {
     ttlSeconds,
     source: 'STATIC',
   });

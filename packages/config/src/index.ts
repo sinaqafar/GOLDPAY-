@@ -260,6 +260,11 @@ export function loadConfig(env: Env = process.env): Config {
   }
 
   // The provider's own rate. Separate from ours by design (see FeeConfig).
+  //
+  // 9% is CubePay's published figure, not a confirmed contractual rate, so it
+  // is only ever an ESTIMATE. Development may fall back to it; production must
+  // state it explicitly rather than have the platform guess what it is being
+  // charged (validated below).
   const providerFeePercentRaw = Number.parseFloat(str(env, 'PROVIDER_FEE_PERCENT', '9'));
   const providerFeePercent = Percentage.fromPercent(providerFeePercentRaw);
   if (providerFeePercent.bps > 10_000n) {
@@ -352,7 +357,7 @@ export function loadConfig(env: Env = process.env): Config {
     },
   };
 
-  validateProductionInvariants(config);
+  validateProductionInvariants(config, env);
   return Object.freeze(config);
 }
 
@@ -360,7 +365,7 @@ export function loadConfig(env: Env = process.env): Config {
  * SPEC 117.94/117.95 + 4331: production must have every secret present and must
  * never run against a sandbox/mock adapter or a testnet.
  */
-function validateProductionInvariants(config: Config): void {
+function validateProductionInvariants(config: Config, env: NodeJS.ProcessEnv): void {
   if (!config.app.isProduction) return;
 
   const missing: string[] = [];
@@ -370,6 +375,9 @@ function validateProductionInvariants(config: Config): void {
   if (!config.treasury.address) missing.push('TREASURY_ADDRESS');
   if (!config.ton.payoutWalletAddress) missing.push('PAYOUT_WALLET_ADDRESS');
   if (!config.ton.signerReference) missing.push('TON_SIGNER_REFERENCE');
+  // The provider fee drives real expense postings. Defaulting it in production
+  // would have the ledger assert a cost nobody confirmed.
+  if (!env['PROVIDER_FEE_PERCENT']) missing.push('PROVIDER_FEE_PERCENT');
   if (missing.length > 0) {
     throw new ConfigError('MISSING_PRODUCTION_SECRETS', `missing in production: ${missing.join(', ')}`, {
       missing,

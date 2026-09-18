@@ -261,7 +261,12 @@ PENDING → AVAILABLE → SETTLING → SETTLED    (+ HOLD)
 ```
 PENDING → VERIFIED → ACTIVE
 ```
-تغییر Wallet نیاز به Security Hold + 2FA + Cooldown دارد.
+تغییر Wallet نیاز به `SECURITY_HOLD` ۲۴ ساعته دارد.
+
+> ⚠️ **تصمیم نهایی (بازنگری‌شده):** **بدون KYC، بدون OTP، بدون 2FA برای فروشنده.**
+> متن اولیهٔ مشخصات 2FA می‌خواست؛ آن لغو شد. امنیت از binding تلگرام +
+> Risk Engine + audit + همان ۲۴ ساعت تأمین می‌شود. 2FA فقط برای **ادمین** است،
+> نه فروشنده.
 `activation_available_at = now() + 24h`
 
 ### Reservation
@@ -717,7 +722,7 @@ Every Important Action = Authentication + Authorization + Audit
 
 `initDataUnsafe` هرگز نباید به‌تنهایی مبنای احراز هویت باشد.
 
-### 2FA اجباری برای
+### 2FA اجباری برای (فقط ادمین — نه فروشنده)
 ```
 Admin Login · Treasury Change · Wallet Change · Large Transfer · API Secret Reveal
 ```

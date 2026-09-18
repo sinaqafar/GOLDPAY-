@@ -69,6 +69,62 @@ jobs:
           done
           rm -rf .ci-load
 
+  # The suite runs on PGlite, which is not PostgreSQL. Migrations, triggers,
+  # partial indexes and window functions must be proven against the real
+  # engine, and BullMQ against real Redis, or "green tests" prove less than
+  # they appear to.
+  real-services:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: gram
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: gram
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U gram -d gram"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Migrations against real PostgreSQL
+        env:
+          DATABASE_URL: postgres://gram:ci@127.0.0.1:5432/gram
+        run: |
+          npm run db:migrate
+          npm run db:seed
+
+      - name: Migrations are idempotent
+        # A re-run must be a no-op, not an error: deploys re-run them.
+        env:
+          DATABASE_URL: postgres://gram:ci@127.0.0.1:5432/gram
+        run: npm run db:migrate
+
+      - name: Integration tests against real PostgreSQL
+        env:
+          DATABASE_URL: postgres://gram:ci@127.0.0.1:5432/gram
+          REDIS_URL: redis://127.0.0.1:6379
+        run: npm test
+
   # Financial invariants that must never regress, asserted against the source
   # rather than at runtime. Cheap, and each one has cost a real system money
   # somewhere.
