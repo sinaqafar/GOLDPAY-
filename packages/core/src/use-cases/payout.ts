@@ -1343,3 +1343,182 @@ export async function recordManualTreasuryFunding(
     return { recorded: true };
   });
 }
+
+// ---------------------------------------------------------------------------
+// Liquidity-fit selection
+// ---------------------------------------------------------------------------
+
+export interface LiquidityCandidate {
+  payoutId: string;
+  merchantId: string;
+  gramAtomic: bigint;
+  ageSeconds: number;
+}
+
+/**
+ * Choose which rate-locked payouts to reserve when GRAM is short.
+ *
+ * Reserving strictly oldest-first wastes liquidity: with 1000 spendable and
+ * payouts of 900, 600 and 400, the oldest alone leaves 100 idle while two
+ * merchants wait, where 600+400 would pay both. So the selector looks for a
+ * combination that fits.
+ *
+ * The obvious danger is that a large payout is passed over forever because
+ * smaller ones always fit better. `starvationSeconds` ends that: once a payout
+ * has waited too long it is taken first and the rest fill whatever remains,
+ * even if that leaves some liquidity unused (SPEC 5468).
+ *
+ * Pure and synchronous — no database, no reservations — so the policy can be
+ * tested exhaustively and cannot half-apply.
+ */
+export function selectByLiquidityFit(
+  candidates: readonly LiquidityCandidate[],
+  spendable: bigint,
+  options: { starvationSeconds?: number; maxSelected?: number } = {},
+): LiquidityCandidate[] {
+  const starvation = options.starvationSeconds ?? 3600;
+  const maxSelected = options.maxSelected ?? 25;
+
+  const affordable = candidates.filter((c) => c.gramAtomic > 0n && c.gramAtomic <= spendable);
+  if (affordable.length === 0) return [];
+
+  const selected: LiquidityCandidate[] = [];
+  let remaining = spendable;
+
+  // Anything that has waited past the threshold goes first, oldest first.
+  // Fairness outranks utilisation: a payout nobody ever gets to is worse than
+  // liquidity sitting idle for one cycle.
+  const starved = affordable
+    .filter((c) => c.ageSeconds >= starvation)
+    .sort((a, b) => b.ageSeconds - a.ageSeconds);
+
+  for (const candidate of starved) {
+    if (selected.length >= maxSelected) break;
+    if (candidate.gramAtomic <= remaining) {
+      selected.push(candidate);
+      remaining -= candidate.gramAtomic;
+    }
+  }
+
+  // Then fill the remainder with the combination that uses the most of it.
+  //
+  // Greedy largest-first is not enough: with 1000 remaining and 900/600/400 it
+  // takes the 900 and leaves 100 idle, where 600+400 pays two merchants and
+  // uses everything — the exact waste this function exists to avoid. A bounded
+  // search over the candidates finds the better combination.
+  const rest = affordable
+    .filter((c) => !selected.includes(c))
+    .sort((a, b) => b.ageSeconds - a.ageSeconds)
+    // Bound the search space; beyond this the queue is long enough that the
+    // next cycle will pick up whatever is left anyway.
+    .slice(0, 18);
+
+  const slots = maxSelected - selected.length;
+  if (slots > 0 && rest.length > 0 && remaining > 0n) {
+    let best: LiquidityCandidate[] = [];
+    let bestTotal = 0n;
+
+    // Enumerate subsets, keeping the one that uses the most liquidity; ties go
+    // to the subset that pays more merchants, then to the older payouts.
+    const total = 1 << rest.length;
+    for (let mask = 1; mask < total; mask++) {
+      let sum = 0n;
+      let count = 0;
+      for (let i = 0; i < rest.length; i++) {
+        if (mask & (1 << i)) {
+          sum += (rest[i] as LiquidityCandidate).gramAtomic;
+          count += 1;
+          if (sum > remaining || count > slots) break;
+        }
+      }
+      if (sum > remaining || count > slots || sum <= bestTotal) continue;
+
+      const subset: LiquidityCandidate[] = [];
+      for (let i = 0; i < rest.length; i++) {
+        if (mask & (1 << i)) subset.push(rest[i] as LiquidityCandidate);
+      }
+      best = subset;
+      bestTotal = sum;
+      if (bestTotal === remaining) break; // cannot do better than exact
+    }
+
+    for (const candidate of best) {
+      selected.push(candidate);
+      remaining -= candidate.gramAtomic;
+    }
+  }
+
+  return selected;
+}
+
+/**
+ * Reserve liquidity across the whole queue rather than one merchant at a time.
+ *
+ * Reserving per merchant in arrival order is what leaves liquidity stranded;
+ * this looks at every rate-locked payout together and reserves the combination
+ * that fits.
+ */
+export async function reserveQueuedPayouts(
+  db: Database,
+  config: Config,
+  options: { starvationSeconds?: number; maxSelected?: number } = {},
+): Promise<{ selected: string[]; reserved: string[]; skipped: number }> {
+  const treasury = await db.query<{ spendable: string }>(
+    `SELECT GREATEST(
+              t.confirmed_balance_atomic
+                - t.safety_reserve_atomic
+                - COALESCE((SELECT SUM(r.amount_atomic)
+                              FROM finance.liquidity_reservations r
+                             WHERE r.treasury_account_id = t.id AND r.status = 'ACTIVE'), 0),
+              0)::text AS spendable
+       FROM finance.treasury_accounts t
+      WHERE t.asset = 'GRAM'
+      LIMIT 1`,
+  );
+  const spendable = BigInt(treasury.rows[0]?.spendable ?? '0');
+  if (spendable <= 0n) return { selected: [], reserved: [], skipped: 0 };
+
+  const queued = await db.query<{
+    id: string;
+    merchant_id: string;
+    gram_amount_atomic: string;
+    age_seconds: string;
+  }>(
+    `SELECT id, merchant_id, gram_amount_atomic::text,
+            EXTRACT(EPOCH FROM (NOW() - created_at))::text AS age_seconds
+       FROM finance.payouts
+      WHERE status IN ('RATE_LOCKED','WAITING_LIQUIDITY')
+        AND gram_amount_atomic IS NOT NULL
+      ORDER BY created_at ASC
+      LIMIT 200`,
+  );
+
+  const candidates: LiquidityCandidate[] = queued.rows.map((row) => ({
+    payoutId: row.id,
+    merchantId: row.merchant_id,
+    gramAtomic: BigInt(row.gram_amount_atomic),
+    ageSeconds: Number(row.age_seconds),
+  }));
+
+  const chosen = selectByLiquidityFit(candidates, spendable, options);
+  const reserved: string[] = [];
+
+  for (const candidate of chosen) {
+    // Each reservation re-checks liquidity inside its own transaction, so a
+    // concurrent worker cannot cause an over-reservation even if both picked
+    // the same candidate.
+    try {
+      const result = await reservePayoutLiquidity(db, config, candidate.payoutId);
+      if (result.reserved) reserved.push(candidate.payoutId);
+    } catch {
+      // Already reserved, expired, or outrun by another worker: the next pass
+      // reconsiders it.
+    }
+  }
+
+  return {
+    selected: chosen.map((c) => c.payoutId),
+    reserved,
+    skipped: candidates.length - chosen.length,
+  };
+}

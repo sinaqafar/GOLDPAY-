@@ -19,6 +19,7 @@ import {
   signPayout,
   broadcastPayout,
   markConfirming,
+  reserveQueuedPayouts,
   settlePayout,
   reconcilePayout,
   expireStaleReservations,
@@ -72,7 +73,21 @@ export async function startWorker(container: Container, intervalMs = 5000): Prom
         }
       });
 
-      // 3. Advance every payout through its pipeline stage.
+      // 3. Reserve liquidity across the WHOLE queue, not merchant by merchant.
+      //    Per-merchant reservation in arrival order strands liquidity: with
+      //    1000 spendable and payouts of 900/600/400 it pays one and leaves
+      //    100 idle, where 600+400 pays two.
+      await safely('payout.liquidity_fit', async () => {
+        const result = await reserveQueuedPayouts(db, config);
+        if (result.reserved.length > 0) {
+          logger.info('payouts.reserved', {
+            reserved: result.reserved.length,
+            skipped: result.skipped,
+          });
+        }
+      });
+
+      // 4. Advance every payout through its pipeline stage.
       await safely('payout.pipeline', () => advancePayouts(container));
 
       // 4. Resolve anything ambiguous against the chain.
