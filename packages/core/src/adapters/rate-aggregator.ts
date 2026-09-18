@@ -69,6 +69,8 @@ export interface RateAggregatorOptions {
   maxDeviationPercent?: number;
   /** Injectable clock for tests. */
   now?: () => Date;
+  /** Returns the last good TOMAN/GRAM rate, so the guard survives a restart. */
+  loadBaseline?: () => Promise<string | null>;
 }
 
 export class RateAggregator implements RateProvider {
@@ -81,6 +83,15 @@ export class RateAggregator implements RateProvider {
   #maxDeviationPercent: number;
   #now: () => Date;
   #lastScaled: bigint | null = null;
+  /**
+   * Supplies the last good rate from storage.
+   *
+   * Without it the first quote after a restart has nothing to compare against,
+   * so the deviation guard is silently disabled exactly when a bad feed is
+   * most likely to slip through.
+   */
+  #loadBaseline?: () => Promise<string | null>;
+  #baselineLoaded = false;
 
   constructor(options: RateAggregatorOptions) {
     if (options.cryptoSources.length === 0 || options.fxSources.length === 0) {
@@ -97,9 +108,24 @@ export class RateAggregator implements RateProvider {
     this.#maxScaled = toScaled(options.maxTomanPerGram ?? '1000000000', 'maxTomanPerGram');
     this.#maxDeviationPercent = options.maxDeviationPercent ?? 25;
     this.#now = options.now ?? (() => new Date());
+    if (options.loadBaseline) this.#loadBaseline = options.loadBaseline;
+  }
+
+  /** Load the persisted baseline once, so a restart does not reset the guard. */
+  async #ensureBaseline(): Promise<void> {
+    if (this.#baselineLoaded || !this.#loadBaseline) return;
+    this.#baselineLoaded = true;
+    try {
+      const last = await this.#loadBaseline();
+      if (last && /^\d+(\.\d+)?$/.test(last)) this.#lastScaled = toScaled(last, 'baseline');
+    } catch {
+      // A missing baseline must not stop settlement; the guard simply has
+      // nothing to compare against until the next quote.
+    }
   }
 
   async getQuote(): Promise<RateQuote> {
+    await this.#ensureBaseline();
     const now = this.#now();
 
     const gramUsd = await this.#firstUsable(
@@ -128,6 +154,18 @@ export class RateAggregator implements RateProvider {
       source: `${gramUsd.source}*${usdToman.source}`,
       createdAt: now,
       expiresAt: new Date(now.getTime() + this.#ttlSeconds * 1000),
+      legs: {
+        cryptoUsd: {
+          value: gramUsd.value,
+          source: gramUsd.source,
+          observedAt: gramUsd.observedAt,
+        },
+        usdToman: {
+          value: usdToman.value,
+          source: usdToman.source,
+          observedAt: usdToman.observedAt,
+        },
+      },
     };
   }
 

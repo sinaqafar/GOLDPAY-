@@ -274,9 +274,25 @@ export async function lockPayoutRate(
 
     // Persist the quote so the snapshot is auditable.
     await tx.query(
-      `INSERT INTO finance.rate_quotes(id, base_currency, quote_asset, rate, source, expires_at)
-       VALUES ($1,'TOMAN','GRAM',$2,$3,$4) ON CONFLICT DO NOTHING`,
-      [quote.id, rate.toDbString(), quote.source, quote.expiresAt.toISOString()],
+      `INSERT INTO finance.rate_quotes
+          (id, base_currency, quote_asset, rate, source, expires_at,
+           crypto_value, crypto_source, crypto_observed_at,
+           fx_value, fx_source, fx_observed_at, calculated_at)
+       VALUES ($1,'TOMAN','GRAM',$2,$3,$4,$5,$6,$7,$8,$9,$10,NOW())
+       ON CONFLICT DO NOTHING`,
+      [
+        quote.id,
+        rate.toDbString(),
+        quote.source,
+        quote.expiresAt.toISOString(),
+        // Both legs, so this settlement can be explained months from now.
+        quote.legs?.cryptoUsd.value ?? null,
+        quote.legs?.cryptoUsd.source ?? null,
+        quote.legs?.cryptoUsd.observedAt.toISOString() ?? null,
+        quote.legs?.usdToman.value ?? null,
+        quote.legs?.usdToman.source ?? null,
+        quote.legs?.usdToman.observedAt.toISOString() ?? null,
+      ],
     );
 
     await transitionState(tx, {

@@ -71,7 +71,7 @@ export async function createContainer(
     ? new InMemoryTonAdapter({ autoConfirm: true })
     : new TonAdapter(config.ton);
 
-  const rates = buildRateProvider(config, options.env ?? process.env);
+  const rates = buildRateProvider(config, options.env ?? process.env, db);
   const signer = buildSigner(config, options.env ?? process.env);
   const queue = buildQueue(config, options.env ?? process.env);
   // A missing bot token degrades to a no-op sender rather than failing: the
@@ -117,7 +117,11 @@ export async function createContainer(
  * Production refuses the static provider outright: settling real GRAM against
  * a hardcoded rate would send the wrong amount the moment the market moved.
  */
-function buildRateProvider(config: Config, env: NodeJS.ProcessEnv): RateProvider {
+function buildRateProvider(
+  config: Config,
+  env: NodeJS.ProcessEnv,
+  db?: ConcreteDatabase,
+): RateProvider {
   const fxUrl = env['FX_USD_TOMAN_URL'];
   const ttlSeconds = config.settlement.quoteTtlSeconds;
 
@@ -139,6 +143,20 @@ function buildRateProvider(config: Config, env: NodeJS.ProcessEnv): RateProvider
       minTomanPerGram: env['RATE_MIN_TOMAN_PER_GRAM'] ?? '1',
       maxTomanPerGram: env['RATE_MAX_TOMAN_PER_GRAM'] ?? '1000000000',
       maxDeviationPercent: Number(env['RATE_MAX_DEVIATION_PERCENT'] ?? 25),
+      // Survives a restart: without a persisted baseline the first quote after
+      // a deploy is compared to nothing and any move is accepted.
+      ...(db
+        ? {
+            loadBaseline: async () => {
+              const r = await db.query<{ rate: string }>(
+                `SELECT rate::text FROM finance.rate_quotes
+                  WHERE base_currency = 'TOMAN' AND quote_asset = 'GRAM'
+                  ORDER BY created_at DESC LIMIT 1`,
+              );
+              return r.rows[0]?.rate ?? null;
+            },
+          }
+        : {}),
     });
   }
 

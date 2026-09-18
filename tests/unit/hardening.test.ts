@@ -293,3 +293,58 @@ describe('RateAggregator (GRAM/USD × USD/TOMAN)', () => {
     ).toThrow(/at least one crypto source/);
   });
 });
+
+describe('rate baseline survives a restart', () => {
+  const at = (iso: string) => () => new Date(iso);
+  const NOW = '2026-01-01T12:00:00.000Z';
+
+  it('compares the first quote after a restart to the persisted rate', async () => {
+    // Without a loaded baseline, the first quote after a deploy has nothing to
+    // compare against — so the deviation guard is off exactly when a bad feed
+    // is most likely to slip through.
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('1', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      maxDeviationPercent: 25,
+      now: at(NOW),
+      loadBaseline: async () => '200000',
+    });
+
+    // 100,000 against a persisted 200,000 is a 50% move: refused.
+    await expect(aggregator.getQuote()).rejects.toThrow(/moved implausibly far/);
+  });
+
+  it('still works when no baseline has been stored yet', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('2', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      now: at(NOW),
+      loadBaseline: async () => null,
+    });
+    expect((await aggregator.getQuote()).tomanPerGram).toBe('200000');
+  });
+
+  it('does not let a failing baseline lookup stop settlement', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('2', { now: at(NOW) })],
+      fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      now: at(NOW),
+      loadBaseline: async () => {
+        throw new Error('database unavailable');
+      },
+    });
+    expect((await aggregator.getQuote()).tomanPerGram).toBe('200000');
+  });
+
+  it('reports both legs so a settlement can be explained later', async () => {
+    const aggregator = new RateAggregator({
+      cryptoSources: [new StaticCryptoMarketProvider('2.5', { name: 'CG', now: at(NOW) })],
+      fxSources: [new StaticFxProvider('80000', { name: 'FX', now: at(NOW) })],
+      now: at(NOW),
+    });
+
+    const quote = await aggregator.getQuote();
+    expect(quote.legs?.cryptoUsd).toMatchObject({ value: '2.5', source: 'CG' });
+    expect(quote.legs?.usdToman).toMatchObject({ value: '80000', source: 'FX' });
+  });
+});
