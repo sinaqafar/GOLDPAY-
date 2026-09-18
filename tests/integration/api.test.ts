@@ -768,3 +768,33 @@ describe('merchant SDK (SPEC 1778/1779)', () => {
     ).toBe(false);
   });
 });
+
+describe('metrics endpoint', () => {
+  it('exposes Prometheus text with the figures an operator pages on', async () => {
+    const res = await fetch(`${baseUrl}/metrics`);
+    expect(res.status).toBe(200);
+    expect(res.headers.get('content-type')).toContain('text/plain');
+
+    const body = await res.text();
+    // Counters incremented by the requests these tests already made.
+    expect(body).toContain('gram_http_requests_total');
+    expect(body).toContain('gram_http_request_duration_ms_bucket');
+    // Figures read live from the database, which are the ones that matter:
+    // a growing queue means the treasury needs funding.
+    expect(body).toContain('gram_payouts_by_status');
+    expect(body).toContain('gram_treasury_balance_nanogram');
+    expect(body).toContain('gram_financial_freeze');
+    expect(body).toContain('gram_oldest_unknown_payout_seconds');
+  });
+
+  it('keeps route labels low-cardinality', async () => {
+    // A raw path would make every invoice id its own time series and take the
+    // metrics backend down.
+    const created = await call(keyA.token, 'POST', '/v1/invoices', { amount: '70000' });
+    await call(keyA.token, 'GET', `/v1/invoices/${created.body.id}`);
+
+    const body = await (await fetch(`${baseUrl}/metrics`)).text();
+    expect(body).toContain('route="/v1/invoices/:id"');
+    expect(body).not.toContain(`route="/v1/invoices/${created.body.id}"`);
+  });
+});

@@ -1,0 +1,126 @@
+# CI — SPEC 117.66/117.67.
+#
+# The quality gate a change must pass before it can merge. Ordered cheapest
+# first so an obvious failure reports in seconds rather than minutes.
+
+name: CI
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+
+# A new push supersedes an in-flight run on the same ref; no point finishing a
+# build for a commit nobody will merge.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        # ci, not install: the lockfile is the source of truth for a build.
+        run: npm ci --no-audit --no-fund
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Tests
+        run: npm test
+
+      - name: Migrations apply from scratch
+        # Catches a migration that only works against an already-populated
+        # database — which is exactly the one that fails on a fresh deploy.
+        run: |
+          rm -rf .ci-db
+          DATABASE_URL="pglite:.ci-db" npm run db:migrate
+          DATABASE_URL="pglite:.ci-db" npm run db:seed
+          rm -rf .ci-db
+
+      - name: Admin panel builds
+        run: node apps/admin/build.mjs
+
+  # Financial invariants that must never regress, asserted against the source
+  # rather than at runtime. Cheap, and each one has cost a real system money
+  # somewhere.
+  invariants:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No automated treasury funding (SPEC 3755)
+        run: |
+          if grep -rniE '(auto_buy|auto_fund|auto_swap|auto_exchange|auto_bridge)[^=]*=[^=]*true' \
+               --include='*.ts' --include='*.sql' packages apps db scripts; then
+            echo "::error::automated treasury funding is forbidden"
+            exit 1
+          fi
+
+      - name: No floating point money
+        run: |
+          if grep -rnE '(REAL|DOUBLE PRECISION|FLOAT)' db/migrations/*.sql; then
+            echo "::error::money columns must never be floating point"
+            exit 1
+          fi
+
+      - name: Ledger posting stays behind post()
+        run: |
+          # Only the ledger service may write journal entries.
+          offenders=$(grep -rln 'INSERT INTO finance.journal_entries' \
+            --include='*.ts' packages apps | grep -v 'packages/ledger/src/' || true)
+          if [ -n "$offenders" ]; then
+            echo "::error::journal entries may only be written by the ledger service: $offenders"
+            exit 1
+          fi
+
+      - name: GRAM is native, not a jetton
+        run: |
+          # Comments explaining WHY GRAM is not a jetton are welcome; code that
+          # treats it as one is not. Match identifiers and endpoints only.
+          if grep -rnE 'jetton_(master|wallet|address)|jettonMaster|/jetton/' \
+               --include='*.ts' --include='*.sql' packages apps db; then
+            echo "::error::GRAM is TON's native currency; jetton handling is wrong"
+            exit 1
+          fi
+
+  security:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      - name: Install
+        run: npm ci --no-audit --no-fund
+
+      - name: Dependency audit
+        # Advisory: a transitive advisory should surface without blocking an
+        # unrelated fix from shipping.
+        run: npm audit --audit-level=high || true
+
+      - name: No committed secrets
+        run: |
+          if grep -rnE '(BEGIN [A-Z ]*PRIVATE KEY|xox[baprs]-|sk_live_)' \
+               --include='*.ts' --include='*.sql' --include='*.json' --include='*.yml' \
+               packages apps db scripts infra .github; then
+            echo "::error::a credential appears to be committed"
+            exit 1
+          fi

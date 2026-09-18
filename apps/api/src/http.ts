@@ -16,6 +16,7 @@ import {
   type TokenBucketRateLimiter,
 } from '../../../packages/core/src/rate-limit.ts';
 import { createHash } from 'node:crypto';
+import { metrics, routeLabel } from '../../../packages/core/src/observability.ts';
 import type { Logger } from '../../../packages/core/src/logger.ts';
 
 export interface RequestContext {
@@ -199,6 +200,15 @@ export function createHttpServer(options: ServerOptions): Server {
         ...result.headers,
       });
       res.end(payload);
+      // Low-cardinality route label: a raw path would make every invoice id
+      // its own time series.
+      const route = routeLabel(url.pathname);
+      metrics.httpRequests.inc({
+        method: req.method ?? 'GET',
+        route,
+        status: String(result.status),
+      });
+      metrics.httpDuration.observe(Date.now() - started, { route });
       logger.info('http.request', {
         method: req.method,
         path: url.pathname,
@@ -281,6 +291,7 @@ export function createHttpServer(options: ServerOptions): Server {
         const decision = rateLimiter.check(`${identity}:${name}`, rule);
 
         if (!decision.allowed) {
+          metrics.rateLimited.inc({ bucket: name });
           logger.warn('http.rate_limited', { path: url.pathname, bucket: name, requestId });
           send({
             status: 429,

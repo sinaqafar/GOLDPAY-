@@ -16,6 +16,7 @@ import { authenticateApiKey, authenticateTelegram, assertTenant } from './auth.t
 import { registerAdminRoutes } from './admin-routes.ts';
 import { readPageRequest, buildPage } from './pagination.ts';
 import { renderCheckout } from './checkout.ts';
+import { renderMetrics } from '../../../packages/core/src/observability.ts';
 import {
   requestRefund,
   refundableAmount,
@@ -42,6 +43,19 @@ export function buildRouter(container: Container): Router {
   // --- health ---------------------------------------------------------------
 
   router.get('/health/live', () => ({ status: 200, body: { status: 'ok' } }));
+
+  /**
+   * Prometheus exposition.
+   *
+   * Not on the public internet: the figures here (treasury balance, queue
+   * depth) are operational intelligence. In production this is reached over
+   * the private network or behind the edge's own auth.
+   */
+  router.get('/metrics', async () => ({
+    status: 200,
+    headers: { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' },
+    body: await renderMetrics(db),
+  }));
 
   router.get('/health/ready', async () => {
     try {
