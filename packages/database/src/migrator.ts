@@ -13,7 +13,26 @@ import type { ConcreteDatabase } from './client.ts';
 import { AppError } from '../../errors/src/index.ts';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-export const DEFAULT_MIGRATIONS_DIR = join(HERE, '..', '..', '..', 'db', 'migrations');
+
+/**
+ * Where the .sql files live.
+ *
+ * Resolved relative to this module, which sits at a different depth once the
+ * project is compiled into dist/ — so the same relative walk finds nothing
+ * there. MIGRATIONS_DIR overrides it; otherwise both layouts are tried, with
+ * the compiled one first since that is the production path.
+ */
+export const DEFAULT_MIGRATIONS_DIR =
+  process.env['MIGRATIONS_DIR'] ?? join(HERE, '..', '..', '..', 'db', 'migrations');
+
+/** Candidate locations, in the order they should be attempted. */
+function candidateDirs(dir: string): string[] {
+  return [
+    dir,
+    // Compiled: dist/packages/database/src -> repository root/db/migrations
+    join(HERE, '..', '..', '..', '..', 'db', 'migrations'),
+  ];
+}
 
 export interface Migration {
   version: string;
@@ -22,10 +41,28 @@ export interface Migration {
 }
 
 export async function loadMigrations(dir = DEFAULT_MIGRATIONS_DIR): Promise<Migration[]> {
-  const files = (await readdir(dir)).filter((f) => f.endsWith('.sql')).sort();
+  let resolved: string | null = null;
+  for (const candidate of candidateDirs(dir)) {
+    try {
+      await readdir(candidate);
+      resolved = candidate;
+      break;
+    } catch {
+      // try the next layout
+    }
+  }
+  if (!resolved) {
+    throw new AppError(
+      'MIGRATIONS_NOT_FOUND',
+      'CONFIG',
+      `no migrations directory found (looked in: ${candidateDirs(dir).join(', ')})`,
+    );
+  }
+
+  const files = (await readdir(resolved)).filter((f) => f.endsWith('.sql')).sort();
   const migrations: Migration[] = [];
   for (const file of files) {
-    const sql = await readFile(join(dir, file), 'utf8');
+    const sql = await readFile(join(resolved, file), 'utf8');
     migrations.push({
       version: file.replace(/\.sql$/, ''),
       sql,

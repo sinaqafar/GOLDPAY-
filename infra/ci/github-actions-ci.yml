@@ -51,6 +51,25 @@ jobs:
       - name: Admin panel builds
         run: node apps/admin/build.mjs
 
+      - name: Compiles to runnable JavaScript
+        # Production runs compiled output, not --experimental-strip-types, so
+        # the emit itself must be verified — including that each entrypoint
+        # actually starts.
+        run: |
+          npm run build
+          for svc in api worker scheduler bot mini-app admin; do
+            output=$(APP_ENV=development DATABASE_URL="pglite:.ci-dist" \
+              CUBEPAY_SANDBOX=true TON_MOCK=true TELEGRAM_BOT_TOKEN=000:test \
+              timeout 20 node --input-type=module \
+              -e "await import('./dist/apps/$svc/src/main.js')" 2>&1 || true)
+            if echo "$output" | grep -qE "Cannot find|SyntaxError|ERR_MODULE"; then
+              echo "::error::dist/apps/$svc does not run"
+              echo "$output" | head -20
+              exit 1
+            fi
+          done
+          rm -rf .ci-dist
+
       - name: Every service loads under bare Node
         # tsc and vitest both transpile, so neither catches TypeScript that
         # node --experimental-strip-types refuses (parameter properties, enums,

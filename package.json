@@ -2,7 +2,7 @@
   "name": "goldpay-gateway",
   "private": true,
   "version": "1.0.0",
-  "description": "GRAM Gateway — Toman-in / GRAM-on-TON-out payment gateway (CubePay VIP provider, Telegram Bot + Mini App)",
+  "description": "GRAM Gateway \u2014 Toman-in / GRAM-on-TON-out payment gateway (CubePay VIP provider, Telegram Bot + Mini App)",
   "type": "module",
   "engines": {
     "node": ">=20.11"
@@ -12,7 +12,7 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "tsc -b",
+    "build": "tsc --project tsconfig.build.json",
     "typecheck": "tsc -b --pretty",
     "clean": "rm -rf dist **/dist **/*.tsbuildinfo",
     "db:migrate": "node --experimental-strip-types scripts/migrate.ts",
@@ -28,7 +28,8 @@
     "health-check": "node --experimental-strip-types scripts/health-check.ts",
     "create-admin": "node --experimental-strip-types scripts/create-admin.ts",
     "admin:build": "node apps/admin/build.mjs",
-    "admin": "node --experimental-strip-types apps/admin/src/main.ts"
+    "admin": "node --experimental-strip-types apps/admin/src/main.ts",
+    "build:all": "npm run build && node apps/admin/build.mjs"
   },
   "dependencies": {
     "@electric-sql/pglite": "^0.3.11",
