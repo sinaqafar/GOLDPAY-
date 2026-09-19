@@ -40,6 +40,12 @@ export interface RateLimitRule {
    * which is a full window's worth.
    */
   burst?: number;
+  /**
+   * Whether this route category must fail-closed if Redis is unavailable.
+   * Sensitive credentials, wallet modifications, and admin endpoints fail closed.
+   * Read-only and webhook endpoints fail open to preserve merchant availability.
+   */
+  failClosed?: boolean;
 }
 
 interface Bucket {
@@ -119,18 +125,18 @@ export class TokenBucketRateLimiter {
  * are what a brute-force attempt targets. Read endpoints are loosest.
  */
 export const RATE_LIMITS: Record<string, RateLimitRule> = {
-  /** Anonymous callers, identified only by IP. */
-  PUBLIC: { limit: 60, windowSeconds: 60 },
-  /** Authenticated merchant API. SPEC 253: 100 req/min. */
-  MERCHANT: { limit: 100, windowSeconds: 60, burst: 120 },
-  /** Creating money-moving resources. */
-  MERCHANT_WRITE: { limit: 30, windowSeconds: 60 },
-  /** Credential issuance and revocation. */
-  SENSITIVE: { limit: 5, windowSeconds: 60 },
-  /** Provider callbacks: generous, since the provider retries legitimately. */
-  WEBHOOK: { limit: 300, windowSeconds: 60 },
-  /** Admin operations. */
-  ADMIN: { limit: 120, windowSeconds: 60 },
+  /** Anonymous callers, identified only by IP. Fail-open to avoid full outage. */
+  PUBLIC: { limit: 60, windowSeconds: 60, failClosed: false },
+  /** Authenticated merchant API (read). SPEC 253: 100 req/min. Fail-open for reads. */
+  MERCHANT: { limit: 100, windowSeconds: 60, burst: 120, failClosed: false },
+  /** Creating money-moving resources. Fail-closed on Redis outage. */
+  MERCHANT_WRITE: { limit: 30, windowSeconds: 60, failClosed: true },
+  /** Credential issuance and revocation, wallet modification. Fail-closed. */
+  SENSITIVE: { limit: 5, windowSeconds: 60, failClosed: true },
+  /** Provider callbacks: generous and fail-open since provider retries legitimately. */
+  WEBHOOK: { limit: 300, windowSeconds: 60, failClosed: false },
+  /** Admin operations. Fail-closed for security. */
+  ADMIN: { limit: 120, windowSeconds: 60, failClosed: true },
 };
 
 /** Pick the rule for a request. */
@@ -244,7 +250,8 @@ export class RedisRateLimiter implements RateLimiter {
         limit: rule.limit,
       };
     } catch {
-      if (!this.#failOpen) {
+      const shouldFailOpen = rule.failClosed === true ? false : this.#failOpen;
+      if (!shouldFailOpen) {
         return { allowed: false, remaining: 0, retryAfterSeconds: 1, limit: rule.limit };
       }
       return { allowed: true, remaining: capacity, retryAfterSeconds: 0, limit: rule.limit };

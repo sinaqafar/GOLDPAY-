@@ -15,7 +15,12 @@ import { TonAdapter, InMemoryTonAdapter } from '../../ton/src/adapter.ts';
 import { StubSigner, KmsSigner } from '../../ton/src/signer.ts';
 import { TestOnlyStaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
 import { RateAggregator } from './adapters/rate-aggregator.ts';
-import { CoinGeckoCryptoProvider, TindexFxProvider } from './adapters/market-sources.ts';
+import {
+  CoinGeckoCryptoProvider,
+  CoinPaprikaCryptoProvider,
+  TindexFxProvider,
+  GenericFxProvider,
+} from './adapters/market-sources.ts';
 import { createLogger, type Logger } from './logger.ts';
 import type { PaymentProviderPort } from './ports/payment-provider.ts';
 import type { BlockchainPayoutPort } from './ports/blockchain.ts';
@@ -132,8 +137,17 @@ function buildRateProvider(
         coinId: env['GRAM_COIN_ID'] ?? 'the-open-network',
         apiKey: env['COINGECKO_API_KEY'] ?? null,
       }),
+      new CoinPaprikaCryptoProvider({
+        baseUrl: env['COINPAPRIKA_BASE_URL'],
+        coinId: env['COINPAPRIKA_COIN_ID'] ?? 'ton-the-open-network',
+      }),
     ];
-    const fxSources = [new TindexFxProvider({ url: fxUrl, apiKey: env['FX_API_KEY'] ?? null })];
+    const fxSources = [
+      new TindexFxProvider({ url: fxUrl, apiKey: env['FX_API_KEY'] ?? null }),
+      ...(env['FX_FALLBACK_URL']
+        ? [new GenericFxProvider({ url: env['FX_FALLBACK_URL'], name: 'FX_FALLBACK' })]
+        : []),
+    ];
 
     return new RateAggregator({
       cryptoSources,

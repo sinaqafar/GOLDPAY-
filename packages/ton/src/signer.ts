@@ -112,6 +112,8 @@ export class StubSigner implements SignerPort {
  * The endpoint is expected to enforce its own authorisation policy — being able
  * to reach the signer must not by itself be enough to move money.
  */
+export { AwsKmsEd25519Signer, type AwsKmsClientLike, type AwsKmsSignerOptions } from './aws-kms-signer.ts';
+
 export class KmsSigner implements SignerPort {
   readonly name = 'KMS_SIGNER';
   #config: TonConfig;
