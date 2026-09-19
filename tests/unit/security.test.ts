@@ -23,10 +23,11 @@ import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/
 import { TEST_ENV } from '../helpers/harness.ts';
 import { StubSigner, AwsKmsEd25519Signer } from '../../packages/ton/src/signer.ts';
 import {
-  parseTonAddress,
   buildCanonicalTonSigningPayload,
   assembleSignedTonExternalMessage,
 } from '../../packages/ton/src/ton-wallet-message.ts';
+import { TonSeqnoManager } from '../../packages/ton/src/seqno-manager.ts';
+import { keyPairFromSeed, sign, signVerify } from '@ton/crypto';
 import {
   RateAggregator,
   StaticCryptoMarketProvider,
@@ -308,35 +309,92 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   describe('Canonical TON Wallet Message Construction', () => {
-    it('parses valid friendly TON address and validates CRC16', () => {
-      // Valid standard testnet/bounceable address
-      const addr = 'EQD__________________________________________0vo';
-      const parsed = parseTonAddress(addr);
-      expect(parsed.workchain).toBeDefined();
-      expect(parsed.accountId).toHaveLength(32);
-    });
-
-    it('rejects an address with corrupted CRC16 checksum', () => {
-      const corrupted = 'EQD__________________________________________0va';
-      expect(() => parseTonAddress(corrupted)).toThrow(/Invalid checksum|INVALID_TON_ADDRESS/);
-    });
-
-    it('builds canonical 32-byte representation hash and packages Ed25519 signature', () => {
+    it('builds canonical 32-byte representation hash and packages valid Ed25519 signature', () => {
       const canonical = buildCanonicalTonSigningPayload({
+        walletAddress: 'EQD__________________________________________0vo',
+        destinationAddress: 'UQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAZAm',
+        amountNanograms: 10_000_000_000n,
         seqno: 5,
         validUntil: 1800000000,
-        destinationAddress: 'EQD__________________________________________0vo',
-        amountNanograms: 10_000_000_000n,
       });
 
       expect(canonical.digest).toHaveLength(32);
       expect(canonical.digestHex).toHaveLength(64);
 
-      const fakeSig = Buffer.alloc(64, 0xef);
-      const assembled = assembleSignedTonExternalMessage(canonical.canonicalBytes, fakeSig);
+      // Verify Ed25519 signature verification against the representation hash
+      const seed = Buffer.alloc(32, 0x55);
+      const keyPair = keyPairFromSeed(seed);
+      const realSig = sign(Buffer.from(canonical.digest), keyPair.secretKey);
+      expect(realSig).toHaveLength(64);
+
+      const isValid = signVerify(Buffer.from(canonical.digest), realSig, keyPair.publicKey);
+      expect(isValid).toBe(true);
+
+      const assembled = assembleSignedTonExternalMessage(canonical, realSig);
       expect(assembled.signatureHex).toHaveLength(128);
-      expect(assembled.signedPayloadHex.length).toBeGreaterThan(128);
-      expect(assembled.signingReference).toMatch(/^ton-ext-msg:/);
+      expect(assembled.bocBase64.length).toBeGreaterThan(50);
+      expect(assembled.signingReference).toMatch(/^ton-boc:/);
+    });
+  });
+
+  describe('TonSeqnoManager sequence reservation', () => {
+    it('allocates strictly monotonic sequence numbers for concurrent payouts', async () => {
+      const dbSequences = new Map<string, any>();
+      const dbAllocations = new Map<string, any>();
+
+      const mockDb: any = {
+        query: async (sql: string, params?: any[]) => {
+          if (sql.includes('FROM finance.payout_seqno_allocations')) {
+            const row = dbAllocations.get(params?.[0]);
+            return { rows: row ? [row] : [] };
+          }
+          if (sql.includes('FROM finance.treasury_wallet_sequences')) {
+            const addr = params?.[0];
+            const row = dbSequences.get(addr);
+            return { rows: row ? [row] : [] };
+          }
+          if (sql.includes('INSERT INTO finance.treasury_wallet_sequences')) {
+            const addr = params?.[0];
+            if (!dbSequences.has(addr)) {
+              dbSequences.set(addr, {
+                current_onchain_seqno: params?.[1],
+                next_allocated_seqno: params?.[2],
+                confirmed_seqno: params?.[1],
+              });
+            }
+            return { rowCount: 1 };
+          }
+          if (sql.includes('UPDATE finance.treasury_wallet_sequences')) {
+            const addr = params?.[0];
+            const nextSeq = params?.[1];
+            const row = dbSequences.get(addr);
+            if (row) row.next_allocated_seqno = nextSeq + 1;
+            return { rowCount: 1 };
+          }
+          if (sql.includes('INSERT INTO finance.payout_seqno_allocations')) {
+            const payoutId = params?.[1];
+            dbAllocations.set(payoutId, {
+              allocated_seqno: params?.[3],
+              status: params?.[4],
+            });
+            return { rowCount: 1 };
+          }
+          return { rows: [] };
+        },
+      };
+
+      const wallet = 'EQD__________________________________________0vo';
+      const seq1 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
+      const seq2 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-2', 10);
+      const seq3 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-3', 10);
+
+      expect(seq1).toBe(11);
+      expect(seq2).toBe(12);
+      expect(seq3).toBe(13);
+
+      // Repeated call for payout-1 returns same seqno
+      const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
+      expect(seq1Repeat).toBe(11);
     });
   });
 
@@ -364,7 +422,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
 
       const signed = await signer.sign(request);
       expect(signed.signer).toBe('AWS_KMS_ED25519');
-      expect(signed.signingReference).toMatch(/^ton-ext-msg:/);
+      expect(signed.signingReference).toMatch(/^ton-boc:/);
       expect(signed.unsignedHash).toBeDefined();
     });
 
@@ -376,24 +434,23 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
             const row = mockDbRecords.get(params?.[0]);
             return { rows: row ? [row] : [] };
           }
-          if (sql.includes('INSERT')) {
+          if (sql.includes('INSERT INTO system.signing_requests')) {
             const signReqId = params?.[1];
-            if (mockDbRecords.has(signReqId)) {
-              throw new Error('ux_signing_requests_idempotency duplicate');
-            }
             mockDbRecords.set(signReqId, {
               status: 'PENDING',
               unsigned_hash: params?.[5],
+              created_at: new Date(),
             });
             return { rowCount: 1 };
           }
-          if (sql.includes('UPDATE')) {
-            const id = params?.[3];
-            for (const [key, val] of mockDbRecords.entries()) {
-              val.status = 'COMPLETED';
-              val.signing_reference = params?.[0];
-              val.raw_signature = params?.[1];
-              val.signed_at = params?.[2];
+          if (sql.includes('UPDATE system.signing_requests')) {
+            const signReqId = params?.[3];
+            const row = mockDbRecords.get(signReqId);
+            if (row) {
+              row.status = 'COMPLETED';
+              row.signing_reference = params?.[0];
+              row.raw_signature = params?.[1];
+              row.signed_at = params?.[2];
             }
             return { rowCount: 1 };
           }
@@ -413,6 +470,37 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
 
       expect(first.signingReference).toBe(second.signingReference);
       expect(first.unsignedHash).toBe(second.unsignedHash);
+    });
+
+    it('rejects duplicate signRequestId with mismatched payload', async () => {
+      const mockDbRecords = new Map<string, any>();
+      mockDbRecords.set(request.signRequestId, {
+        status: 'COMPLETED',
+        unsigned_hash: 'different_hash_from_another_transaction',
+        signing_reference: 'ref-1',
+        signed_at: new Date(),
+      });
+
+      const mockDb: any = {
+        query: async (sql: string) => {
+          if (sql.includes('finance.payout_seqno_allocations') || sql.includes('finance.treasury_wallet_sequences')) {
+            return { rows: [{ allocated_seqno: 1, current_onchain_seqno: 1, next_allocated_seqno: 2 }] };
+          }
+          if (sql.includes('system.signing_requests')) {
+            return { rows: [mockDbRecords.get(request.signRequestId)] };
+          }
+          return { rows: [] };
+        },
+      };
+
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'test-key-id',
+        kmsClient: mockKmsClient,
+        db: mockDb,
+      });
+
+      await expect(signer.sign(request)).rejects.toThrow(/previously registered for a different transaction payload/);
     });
 
     it('handles KMS transient failures with retryable IntegrationError', async () => {
@@ -445,14 +533,13 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       });
 
       const quote = await aggregator.getQuote();
-      // Median between 1.50 and 1.52 is 1.52
       expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeCloseTo(1.52, 2);
       expect(quote.source).toContain('COINGECKO+COINPAPRIKA');
     });
 
     it('rejects quotes when two sources diverge beyond the consensus threshold', async () => {
       const sourceA = new StaticCryptoMarketProvider('1.00', { name: 'COINGECKO' });
-      const sourceB = new StaticCryptoMarketProvider('2.00', { name: 'DIVERGENT_SOURCE' }); // 100% diff
+      const sourceB = new StaticCryptoMarketProvider('2.00', { name: 'DIVERGENT_SOURCE' });
       const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
 
       const aggregator = new RateAggregator({
@@ -464,10 +551,10 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       await expect(aggregator.getQuote()).rejects.toThrow(/cross-source divergence/);
     });
 
-    it('filters out an extreme outlier when 3+ sources are available', async () => {
+    it('filters out an extreme outlier when 3+ sources are available and 2+ agree', async () => {
       const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'SRC_A' });
       const sourceB = new StaticCryptoMarketProvider('1.51', { name: 'SRC_B' });
-      const sourceOutlier = new StaticCryptoMarketProvider('5.00', { name: 'SRC_OUTLIER' }); // Extreme outlier
+      const sourceOutlier = new StaticCryptoMarketProvider('5.00', { name: 'SRC_OUTLIER' });
       const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
 
       const aggregator = new RateAggregator({
@@ -480,6 +567,21 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeLessThan(2.0);
       expect(quote.source).toContain('SRC_A+SRC_B');
       expect(quote.source).not.toContain('SRC_OUTLIER');
+    });
+
+    it('rejects when 3 sources are all mutually divergent and no quorum is reached', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.00', { name: 'SRC_A' });
+      const sourceB = new StaticCryptoMarketProvider('1.80', { name: 'SRC_B' });
+      const sourceC = new StaticCryptoMarketProvider('3.00', { name: 'SRC_C' });
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB, sourceC],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/fewer than 2 independent sources reached consensus/);
     });
   });
 });

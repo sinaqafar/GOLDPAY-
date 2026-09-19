@@ -235,10 +235,11 @@ export class RateAggregator implements RateProvider {
         return (diff * 100n) / medianScaled <= BigInt(this.#maxCrossSourceDeviationPercent);
       });
 
-      if (accepted.length === 0) {
-        throw new IntegrationError('RATE_DISCREPANCY', `sources diverged beyond consensus on ${leg}`, {
+      // Production Quorum requirement: must have at least 2 independent sources agreeing
+      if (accepted.length < 2) {
+        throw new IntegrationError('RATE_DISCREPANCY', `fewer than 2 independent sources reached consensus on ${leg}`, {
           retryable: true,
-          details: { leg, divergencePercent: crossDivergence.toString() },
+          details: { leg, divergencePercent: crossDivergence.toString(), acceptedSources: accepted.map(a => a.obs.source) },
         });
       }
 

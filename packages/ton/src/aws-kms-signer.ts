@@ -4,12 +4,12 @@
  * Implements SignerPort using AWS KMS with KeySpec: ECC_NIST_EDWARDS25519.
  * Private key material never leaves the AWS KMS HSM boundary.
  *
- * Requirements:
- * - AWS KMS Key with KeyUsage = SIGN_VERIFY and CustomerMasterKeySpec = ECC_NIST_EDWARDS25519
- * - MessageType = RAW
- * - SigningAlgorithm = ED25519_SHA_512
- * - Canonical TON Wallet V4R2 message structure
- * - Persistent atomic idempotency store to defend against double-authorization
+ * Features:
+ * - Official AWS KMS algorithm: ED25519_SHA_512 with MessageType = RAW
+ * - Canonical TON Wallet V4R2 TL-B Cell representation hashing
+ * - Persistent DB-backed signing idempotency bound to canonical payload hash
+ * - Real atomic seqno allocation via TonSeqnoManager
+ * - Crash recovery and lease timeout defense
  */
 
 import { randomUUID } from 'node:crypto';
@@ -26,6 +26,7 @@ import {
   buildCanonicalTonSigningPayload,
   assembleSignedTonExternalMessage,
 } from './ton-wallet-message.ts';
+import { TonSeqnoManager } from './seqno-manager.ts';
 
 export interface AwsKmsClientLike {
   sign(params: {
@@ -48,6 +49,7 @@ export interface AwsKmsSignerOptions {
   db?: Database;
   region?: string;
   walletId?: number;
+  initialSeqno?: number;
 }
 
 export class AwsKmsEd25519Signer implements SignerPort {
@@ -58,6 +60,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
   #db?: Database;
   #region: string;
   #walletId?: number;
+  #initialSeqno: number;
 
   constructor(options: AwsKmsSignerOptions) {
     this.#config = options.config;
@@ -66,6 +69,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
     this.#db = options.db;
     this.#region = options.region ?? 'us-east-1';
     this.#walletId = options.walletId;
+    this.#initialSeqno = options.initialSeqno ?? 0;
 
     if (!this.#keyId || !this.#keyId.trim()) {
       throw new SecurityError('KMS_KEY_ID_REQUIRED', 'AWS KMS key ID must be provided');
@@ -73,18 +77,44 @@ export class AwsKmsEd25519Signer implements SignerPort {
   }
 
   async sign(request: SignTransferRequest): Promise<SignedTransfer> {
-    // 1. Independent security validation
+    // 1. Independent security validation of caller inputs
     assertSignable(request, this.#config);
 
-    // 2. Persistent atomic idempotency check if DB is available
+    // 2. Allocate real monotonic seqno
+    let seqno = 1;
+    if (this.#db && request.fromAddress) {
+      seqno = await TonSeqnoManager.allocate(
+        this.#db,
+        request.fromAddress,
+        request.payoutId,
+        this.#initialSeqno,
+      );
+    }
+
+    // 3. Build canonical TON Wallet message payload
+    const nowSec = Math.floor(Date.now() / 1000);
+    const canonical = buildCanonicalTonSigningPayload({
+      walletAddress: request.fromAddress,
+      destinationAddress: request.destinationAddress,
+      amountNanograms: BigInt(request.amountAtomic),
+      seqno,
+      validUntil: nowSec + 600,
+      walletId: this.#walletId,
+      bounce: false,
+      comment: `payout:${request.payoutId.slice(0, 8)}`,
+    });
+
+    // 4. Persistent atomic idempotency check bound to canonical payload hash
     if (this.#db) {
       const existing = await this.#db.query<{
+        id: string;
         signing_reference: string;
         unsigned_hash: string;
         signed_at: Date;
         status: string;
+        created_at: Date;
       }>(
-        `SELECT signing_reference, unsigned_hash, signed_at, status
+        `SELECT id, signing_reference, unsigned_hash, signed_at, status, created_at
            FROM system.signing_requests
           WHERE sign_request_id = $1`,
         [request.signRequestId],
@@ -92,6 +122,14 @@ export class AwsKmsEd25519Signer implements SignerPort {
 
       const record = existing.rows[0];
       if (record) {
+        // Enforce payload binding: same ID with different payload is forbidden
+        if (record.unsigned_hash !== canonical.digestHex) {
+          throw new SecurityError(
+            'SIGN_REQUEST_PAYLOAD_MISMATCH',
+            `signRequestId ${request.signRequestId} was previously registered for a different transaction payload`,
+          );
+        }
+
         if (record.status === 'COMPLETED' && record.signing_reference) {
           return {
             signingReference: record.signing_reference,
@@ -100,7 +138,10 @@ export class AwsKmsEd25519Signer implements SignerPort {
             signer: this.name,
           };
         }
-        if (record.status === 'PENDING') {
+
+        // Lease check: if PENDING for less than 30s, reject in-flight concurrency
+        const ageMs = Date.now() - new Date(record.created_at).getTime();
+        if (record.status === 'PENDING' && ageMs < 30_000) {
           throw new SecurityError(
             'SIGN_REQUEST_IN_FLIGHT',
             `A signing operation for signRequestId ${request.signRequestId} is already in progress`,
@@ -109,50 +150,32 @@ export class AwsKmsEd25519Signer implements SignerPort {
       }
     }
 
-    // 3. Build canonical TON Wallet message payload
-    const nowSec = Math.floor(Date.now() / 1000);
-    const canonical = buildCanonicalTonSigningPayload({
-      walletId: this.#walletId,
-      seqno: 1, // Determined by payout sequence manager
-      validUntil: nowSec + 600, // 10 minutes validity
-      destinationAddress: request.destinationAddress,
-      amountNanograms: BigInt(request.amountAtomic),
-      bounce: false,
-      comment: `payout:${request.payoutId.slice(0, 8)}`,
-    });
-
     const signingRequestId = randomUUID();
 
-    // 4. Atomically insert PENDING state into persistent DB store
+    // 5. Register PENDING state into DB
     if (this.#db) {
-      try {
-        await this.#db.query(
-          `INSERT INTO system.signing_requests
-            (id, sign_request_id, payout_id, signer_name, key_reference, unsigned_hash, status)
-           VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')`,
-          [
-            signingRequestId,
-            request.signRequestId,
-            request.payoutId,
-            this.name,
-            this.#keyId,
-            canonical.digestHex,
-          ],
-        );
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : String(err);
-        if (message.includes('unique') || message.includes('ux_signing_requests_idempotency')) {
-          throw new SecurityError(
-            'SIGN_REQUEST_ALREADY_CONSUMED',
-            `signRequestId ${request.signRequestId} has already been registered`,
-          );
-        }
-        throw err;
-      }
+      await this.#db.query(
+        `INSERT INTO system.signing_requests
+          (id, sign_request_id, payout_id, signer_name, key_reference, unsigned_hash, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'PENDING')
+         ON CONFLICT (sign_request_id) DO UPDATE
+            SET status = 'PENDING',
+                unsigned_hash = $6,
+                created_at = NOW()
+          WHERE system.signing_requests.status IN ('PENDING', 'FAILED')`,
+        [
+          signingRequestId,
+          request.signRequestId,
+          request.payoutId,
+          this.name,
+          this.#keyId,
+          canonical.digestHex,
+        ],
+      );
     }
 
     try {
-      // 5. Invoke AWS KMS with official algorithm: ED25519_SHA_512 & MessageType: RAW
+      // 6. Invoke AWS KMS with official algorithm: ED25519_SHA_512 & MessageType: RAW
       const response = await this.#kms.sign({
         KeyId: this.#keyId,
         Message: canonical.digest,
@@ -175,11 +198,11 @@ export class AwsKmsEd25519Signer implements SignerPort {
         rawSigBuffer = Buffer.from(new Uint8Array(response.Signature as ArrayBuffer));
       }
 
-      // 6. Assemble signed TON external message
-      const assembled = assembleSignedTonExternalMessage(canonical.canonicalBytes, rawSigBuffer);
+      // 7. Assemble signed TON external message BoC
+      const assembled = assembleSignedTonExternalMessage(canonical, rawSigBuffer);
       const signedAt = new Date();
 
-      // 7. Atomically persist completed signing evidence
+      // 8. Atomically persist completed signing evidence
       if (this.#db) {
         await this.#db.query(
           `UPDATE system.signing_requests
@@ -187,8 +210,8 @@ export class AwsKmsEd25519Signer implements SignerPort {
                   signing_reference = $1,
                   raw_signature = $2,
                   signed_at = $3
-            WHERE id = $4`,
-          [assembled.signingReference, assembled.signatureHex, signedAt, signingRequestId],
+            WHERE sign_request_id = $4`,
+          [assembled.signingReference, assembled.signatureHex, signedAt, request.signRequestId],
         );
       }
 
@@ -201,8 +224,8 @@ export class AwsKmsEd25519Signer implements SignerPort {
     } catch (err) {
       if (this.#db) {
         await this.#db.query(
-          `UPDATE system.signing_requests SET status = 'FAILED' WHERE id = $1`,
-          [signingRequestId],
+          `UPDATE system.signing_requests SET status = 'FAILED' WHERE sign_request_id = $1`,
+          [request.signRequestId],
         ).catch(() => undefined);
       }
 
