@@ -17,11 +17,7 @@ let shared: Redis | null = null;
 export function createRedisClient(url: string): RedisLike {
   if (!shared) {
     shared = new Redis(url, {
-      // The limiter must not queue commands while disconnected: a request
-      // waiting on a rate-limit check is a request not being served. Failing
-      // fast lets the limiter fall open instead.
       maxRetriesPerRequest: 1,
-      enableOfflineQueue: false,
       lazyConnect: false,
     });
 
