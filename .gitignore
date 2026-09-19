@@ -1,0 +1,20 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+.pgdata/
+.demo/
+.verify/
+coverage/
+*.log
+.DS_Store
+
+# Built admin bundle — produced by `npm run admin:build`
+apps/admin/public/assets/admin.js
+apps/admin/public/assets/admin.js.map
+
+# Python bytecode from running the example client
+__pycache__/
+*.pyc

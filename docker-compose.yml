@@ -1,0 +1,166 @@
+# Local and staging stack.
+#
+# Production secrets do not belong here: every value below is either a
+# development default or read from the environment. The real deployment injects
+# them from a secret manager (SPEC 103759).
+
+name: gram-gateway
+
+x-app: &app
+  build:
+    context: .
+    dockerfile: infra/docker/Dockerfile
+  restart: unless-stopped
+  environment: &app-env
+    NODE_ENV: production
+    APP_ENV: ${APP_ENV:-staging}
+    DATABASE_URL: postgres://gram:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/gram
+    REDIS_URL: redis://redis:6379
+
+    TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+    CUBEPAY_BASE_URL: ${CUBEPAY_BASE_URL:-}
+    CUBEPAY_API_KEY: ${CUBEPAY_API_KEY:-}
+    CUBEPAY_WEBHOOK_SECRET: ${CUBEPAY_WEBHOOK_SECRET:-}
+
+    TON_NETWORK: ${TON_NETWORK:-TON_MAINNET}
+    GRAM_ASSET: GRAM
+    GRAM_NETWORK: ${GRAM_NETWORK:-TON_MAINNET}
+    GRAM_DECIMALS: "9"
+    TREASURY_ADDRESS: ${TREASURY_ADDRESS:-}
+    PAYOUT_WALLET_ADDRESS: ${PAYOUT_WALLET_ADDRESS:-}
+    SIGNER_ENDPOINT: ${SIGNER_ENDPOINT:-}
+    TON_SIGNER_REFERENCE: ${TON_SIGNER_REFERENCE:-}
+
+    # SPEC 3755 — the treasury is funded manually by the owner, always.
+    # Startup aborts with FORBIDDEN_TREASURY_AUTOMATION if any of these is true.
+    AUTO_FUNDING: "false"
+    AUTO_BUY: "false"
+    AUTO_SWAP: "false"
+    AUTO_EXCHANGE: "false"
+    AUTO_BRIDGE: "false"
+
+    PLATFORM_FEE_PERCENT: "15"
+    PROVIDER_FEE_PERCENT: "9"
+    PAYOUT_HOLD_HOURS: "48"
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gram
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-devpassword}
+      POSTGRES_DB: gram
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # Dependants wait for readiness, not merely for the container to exist.
+      test: ["CMD-SHELL", "pg_isready -U gram -d gram"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # noeviction is mandatory: if Redis evicts keys it silently drops jobs, and
+    # a dropped payout job is money that never moves while every dashboard says
+    # the work is queued. appendonly survives a restart.
+    command: >
+      redis-server
+      --appendonly yes
+      --maxmemory-policy noeviction
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  migrate:
+    <<: *app
+    restart: "no"
+    command: ["sh", "-c", "node --experimental-strip-types scripts/migrate.ts"]
+
+  api:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: api
+      PORT: "3000"
+    ports:
+      - "${API_PORT:-3000}:3000"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  worker:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: worker
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  scheduler:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: scheduler
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  bot:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: bot
+    depends_on:
+      api:
+        condition: service_healthy
+
+  mini-app:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: mini-app
+      MINI_APP_PORT: "3002"
+      API_HOST: api
+      API_PORT: "3000"
+    ports:
+      - "${MINI_APP_PORT:-3002}:3002"
+    depends_on:
+      api:
+        condition: service_healthy
+
+  admin:
+    <<: *app
+    environment:
+      <<: *app-env
+      SERVICE: admin
+      ADMIN_PORT: "3003"
+      API_HOST: api
+      API_PORT: "3000"
+    ports:
+      # Bound to loopback by default: the admin panel is not a public surface.
+      - "127.0.0.1:${ADMIN_PORT:-3003}:3003"
+    depends_on:
+      api:
+        condition: service_healthy
+
+volumes:
+  postgres-data:
+  redis-data:

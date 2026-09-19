@@ -1,0 +1,280 @@
+/**
+ * Worker — runs the background pipeline on a fixed cadence.
+ *
+ * SPEC 117.56 queues: payment.release, payout.selection, payout.broadcast,
+ * payout.reconciliation, webhook.delivery, reconciliation, maintenance.
+ *
+ * Every job is wrapped so one failing stage can never stop the loop, and the
+ * process shuts down cleanly on SIGTERM without abandoning an in-flight job.
+ */
+
+import { createContainer, type Container } from '../../../packages/core/src/container.ts';
+import { dispatchOutbox } from '../../../packages/core/src/dispatcher.ts';
+import { dispatchWebhooks } from '../../../packages/core/src/webhooks.ts';
+import { releaseEligiblePayments } from '../../../packages/core/src/use-cases/release-payment.ts';
+import {
+  queuePayoutForMerchant,
+  lockPayoutRate,
+  reservePayoutLiquidity,
+  signPayout,
+  broadcastPayout,
+  markConfirming,
+  reserveQueuedPayouts,
+  settlePayout,
+  reconcilePayout,
+  expireStaleReservations,
+} from '../../../packages/core/src/use-cases/payout.ts';
+import { expireStaleInvoices } from '../../../packages/core/src/use-cases/create-invoice.ts';
+import { purgeExpired } from '../../../packages/core/src/idempotency.ts';
+import { isFinanciallyFrozen } from '../../../packages/core/src/admin/operations.ts';
+
+export interface WorkerHandle {
+  stop(): Promise<void>;
+  runOnce(): Promise<void>;
+}
+
+export async function startWorker(container: Container, intervalMs = 5000): Promise<WorkerHandle> {
+  const { db, config, logger, chain, rates } = container;
+  let stopping = false;
+  let current: Promise<void> = Promise.resolve();
+
+  async function safely(name: string, fn: () => Promise<unknown>): Promise<void> {
+    try {
+      await fn();
+    } catch (e) {
+      logger.error('worker.job_failed', {
+        job: name,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+
+  async function runOnce(): Promise<void> {
+    // A financial freeze halts everything that moves money, but leaves the
+    // read-only and delivery work running so operators keep their visibility
+    // while they investigate (SPEC 119.58).
+    const frozen = await isFinanciallyFrozen(db);
+    if (frozen) {
+      logger.warn('worker.financial_freeze_active', {
+        message: 'skipping release, payout and reconciliation stages',
+      });
+    }
+
+    if (!frozen) {
+      // 1. Release payments whose 48h hold has elapsed.
+      await safely('payment.release', async () => {
+        const result = await releaseEligiblePayments(db, { limit: 100 });
+        if (result.released > 0) {
+          logger.info('payments.released', { count: result.released });
+          // 2. A release makes a merchant payable: queue their payout.
+          for (const merchantId of result.merchantIds) {
+            await safely('payout.selection', () => queuePayoutForMerchant(db, config, merchantId));
+          }
+        }
+      });
+
+      // 3. Reserve liquidity across the WHOLE queue, not merchant by merchant.
+      //    Per-merchant reservation in arrival order strands liquidity: with
+      //    1000 spendable and payouts of 900/600/400 it pays one and leaves
+      //    100 idle, where 600+400 pays two.
+      await safely('payout.liquidity_fit', async () => {
+        const result = await reserveQueuedPayouts(db, config);
+        if (result.reserved.length > 0) {
+          logger.info('payouts.reserved', {
+            reserved: result.reserved.length,
+            skipped: result.skipped,
+          });
+        }
+      });
+
+      // 4. Advance every payout through its pipeline stage.
+      await safely('payout.pipeline', () => advancePayouts(container));
+
+      // 4. Resolve anything ambiguous against the chain.
+      await safely('payout.reconciliation', async () => {
+        const unknown = await db.query<{ id: string }>(
+          `SELECT id FROM finance.payouts
+            WHERE status = 'UNKNOWN' AND updated_at < NOW() - INTERVAL '30 seconds'
+            ORDER BY updated_at ASC LIMIT 20`,
+        );
+        for (const row of unknown.rows) {
+          await safely('reconcile', () => reconcilePayout(db, chain, row.id, config));
+        }
+      });
+    }
+
+    // 5. Publish domain events, then deliver merchant webhooks.
+    await safely('outbox.dispatch', () =>
+      dispatchOutbox(db, logger, { telegram: container.telegram }),
+    );
+    await safely('webhook.delivery', () =>
+      dispatchWebhooks(db, {
+        timeoutMs: config.security.webhookTimeoutMs,
+        maxAttempts: config.security.webhookMaxRetries,
+        allowedSchemes: config.security.allowedWebhookSchemes,
+        allowPrivate: !config.app.isProduction,
+      }),
+    );
+
+    // 6. Maintenance.
+    await safely('maintenance', async () => {
+      await expireStaleReservations(db);
+      await expireStaleInvoices(db);
+      await purgeExpired(db);
+    });
+  }
+
+  const timer = setInterval(() => {
+    if (stopping) return;
+    current = runOnce();
+  }, intervalMs);
+  // Do not hold the event loop open on this timer alone.
+  timer.unref?.();
+
+  logger.info('worker.started', { intervalMs });
+
+  return {
+    runOnce,
+    async stop() {
+      stopping = true;
+      clearInterval(timer);
+      // Let the in-flight cycle finish so no job is torn in half.
+      await current.catch(() => undefined);
+      logger.info('worker.stopped');
+    },
+  };
+}
+
+/**
+ * Drive each payout one step further. Each stage is attempted independently so
+ * a single stuck payout cannot block the others.
+ */
+async function advancePayouts(container: Container): Promise<void> {
+  const { db, config, logger, chain, rates, signer } = container;
+
+  const pending = await db.query<{ id: string; status: string }>(
+    `SELECT id, status FROM finance.payouts
+      WHERE status IN ('QUEUED','RATE_LOCKED','WAITING_LIQUIDITY','RESERVED','SIGNED','BROADCASTED','CONFIRMING')
+      ORDER BY created_at ASC
+      LIMIT 25`,
+  );
+
+  for (const payout of pending.rows) {
+    try {
+      switch (payout.status) {
+        case 'QUEUED':
+        case 'WAITING_LIQUIDITY':
+          await lockPayoutRate(db, config, rates, payout.id);
+          break;
+
+        case 'RATE_LOCKED':
+          await reservePayoutLiquidity(db, config, payout.id);
+          break;
+
+        // SPEC 90.10 — sign and broadcast are separate stages, so a crash
+        // between them leaves a state that describes what actually happened.
+        case 'RESERVED':
+          await signPayout(db, chain, config, payout.id, signer);
+          break;
+
+        case 'SIGNED':
+          await broadcastPayout(db, chain, payout.id);
+          break;
+
+        case 'BROADCASTED':
+        case 'CONFIRMING': {
+          // Only settle once the chain actually confirms (SPEC 124.168).
+          const row = await db.query<{
+            transaction_hash: string | null;
+            gram_amount_atomic: string;
+            destination_address: string;
+            destination_network: string;
+          }>(
+            `SELECT transaction_hash, gram_amount_atomic::text,
+                    destination_address, destination_network
+               FROM finance.payouts WHERE id = $1`,
+            [payout.id],
+          );
+          const record = row.rows[0];
+          if (!record) break;
+
+          const status = await chain.getTransferStatus({
+            idempotencyKey: `payout:${payout.id}`,
+            txHash: record.transaction_hash,
+            to: record.destination_address,
+            amountAtomic: BigInt(record.gram_amount_atomic ?? '0'),
+          });
+
+          // Settle only on evidence read back FROM the chain. settlePayout
+          // re-checks every field itself; passing them through unchanged keeps
+          // the worker from being the component that decides what is true.
+          // Seen on chain but not yet final: record the distinction so a
+          // stalled transfer is visible rather than looking freshly sent.
+          if (
+            status.state === 'PENDING' &&
+            status.txHash &&
+            payout.status === 'BROADCASTED'
+          ) {
+            await markConfirming(db, payout.id, {
+              txHash: status.txHash,
+              confirmations: status.confirmations ?? 0,
+            });
+          }
+
+          if (
+            status.state === 'CONFIRMED' &&
+            status.txHash &&
+            status.onChainAmountAtomic !== undefined &&
+            status.onChainDestination !== undefined
+          ) {
+            await settlePayout(
+              db,
+              payout.id,
+              {
+                txHash: status.txHash,
+                onChainAmountAtomic: status.onChainAmountAtomic,
+                onChainDestination: status.onChainDestination,
+                asset: config.ton.gramAsset,
+                network: record.destination_network,
+                confirmations: status.confirmations ?? 0,
+                ...(status.networkFeeAtomic !== undefined
+                  ? { networkFeeAtomic: status.networkFeeAtomic }
+                  : {}),
+              },
+              { minConfirmations: config.ton.minConfirmations },
+            );
+          }
+          break;
+        }
+      }
+    } catch (e) {
+      logger.warn('payout.stage_failed', {
+        payoutId: payout.id,
+        status: payout.status,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    }
+  }
+}
+
+// --- entrypoint ------------------------------------------------------------
+
+if (import.meta.url === `file://${process.argv[1]}`) {
+  const container = await createContainer({ service: 'worker' });
+  const worker = await startWorker(
+    container,
+    Number.parseInt(process.env['WORKER_INTERVAL_MS'] ?? '5000', 10),
+  );
+
+  const shutdown = async (signal: string) => {
+    container.logger.info('worker.shutdown', { signal });
+    await worker.stop();
+    await container.shutdown();
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => void shutdown('SIGTERM'));
+  process.on('SIGINT', () => void shutdown('SIGINT'));
+
+  // Keep the process alive.
+  await new Promise(() => {});
+}

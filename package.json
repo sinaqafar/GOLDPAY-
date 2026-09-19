@@ -1,0 +1,51 @@
+{
+  "name": "goldpay-gateway",
+  "private": true,
+  "version": "1.0.0",
+  "description": "GRAM Gateway \u2014 Toman-in / GRAM-on-TON-out payment gateway (CubePay VIP provider, Telegram Bot + Mini App)",
+  "type": "module",
+  "engines": {
+    "node": ">=20.11"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "tsc --project tsconfig.build.json",
+    "typecheck": "tsc -b --pretty",
+    "clean": "rm -rf dist **/dist **/*.tsbuildinfo",
+    "db:migrate": "node --experimental-strip-types scripts/migrate.ts",
+    "db:seed": "node --experimental-strip-types scripts/seed.ts",
+    "db:reset": "node --experimental-strip-types scripts/reset.ts",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "node --experimental-strip-types apps/api/src/main.ts",
+    "worker": "node --experimental-strip-types apps/worker/src/main.ts",
+    "scheduler": "node --experimental-strip-types apps/scheduler/src/main.ts",
+    "bot": "node --experimental-strip-types apps/bot/src/main.ts",
+    "mini-app": "node --experimental-strip-types apps/mini-app/src/main.ts",
+    "health-check": "node --experimental-strip-types scripts/health-check.ts",
+    "create-admin": "node --experimental-strip-types scripts/create-admin.ts",
+    "admin:build": "node apps/admin/build.mjs",
+    "admin": "node --experimental-strip-types apps/admin/src/main.ts",
+    "build:all": "npm run build && node apps/admin/build.mjs"
+  },
+  "dependencies": {
+    "@electric-sql/pglite": "^0.3.11",
+    "@types/react": "^18.3.31",
+    "@types/react-dom": "^18.3.7",
+    "bullmq": "^6.3.7",
+    "esbuild": "^0.28.2",
+    "ioredis": "^6.0.0",
+    "pg": "^8.16.3",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pg": "^8.11.10",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.4"
+  }
+}

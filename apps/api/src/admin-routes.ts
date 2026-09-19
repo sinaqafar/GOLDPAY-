@@ -1,0 +1,808 @@
+/**
+ * Internal admin API — SPEC 117.70: /internal/admin/*.
+ *
+ * Separate from the merchant API in every way that matters:
+ *  - a different credential (admin key, not a merchant API key)
+ *  - a different identity table (core.admin_users)
+ *  - permission-checked per route, and audited on every write
+ *
+ * A merchant credential can never reach these routes, because authentication
+ * resolves against a table merchants have no rows in.
+ */
+
+import { randomUUID } from 'node:crypto';
+import type { Router, RequestContext } from './http.ts';
+import type { Container } from '../../../packages/core/src/container.ts';
+import {
+  verifyApiSecret,
+  parseApiToken,
+  sha256Hex,
+} from '../../../packages/crypto/src/index.ts';
+import { randomBytes } from 'node:crypto';
+
+/** Name of the admin session cookie. */
+const ADMIN_SESSION_COOKIE = 'gram_admin_session';
+const SESSION_TTL_HOURS = 8;
+import {
+  AuthError,
+  ValidationError,
+  SecurityError,
+  NotFoundError,
+} from '../../../packages/errors/src/index.ts';
+import {
+  assertPermission,
+  isAdminRole,
+  ROLE_PERMISSIONS,
+  type AdminRole,
+} from '../../../packages/core/src/admin/rbac.ts';
+import {
+  requestTreasuryFunding,
+  approveTreasuryFunding,
+  rejectApproval,
+  freezeFinancialOperations,
+  unfreezeFinancialOperations,
+  suspendMerchant,
+  activateMerchant,
+  resolveException,
+  isFinanciallyFrozen,
+  type AdminActor,
+  auditAdminAction,
+} from '../../../packages/core/src/admin/operations.ts';
+import { verifyGlobalBalance } from '../../../packages/ledger/src/ledger-service.ts';
+import { releaseHold } from '../../../packages/core/src/risk.ts';
+import { resolveDispute } from '../../../packages/core/src/use-cases/dispute.ts';
+import {
+  getTicket,
+  replyToTicket,
+  setTicketStatus,
+} from '../../../packages/core/src/use-cases/support.ts';
+import type { Database } from '../../../packages/database/src/client.ts';
+
+/**
+ * Authenticate an admin from `Authorization: Bearer <prefix>.<secret>`.
+ *
+ * Uses the same hashing as merchant keys, but resolves against
+ * core.admin_users. A dummy comparison runs when the admin is unknown so the
+ * response time does not reveal whether a prefix exists.
+ */
+/** Read one cookie from the request header. */
+function cookie(ctx: RequestContext, name: string): string | null {
+  const header = ctx.headers['cookie'];
+  if (!header) return null;
+  for (const part of header.split(';')) {
+    const [key, ...rest] = part.trim().split('=');
+    if (key === name) return decodeURIComponent(rest.join('='));
+  }
+  return null;
+}
+
+/**
+ * Resolve an admin from a session cookie.
+ *
+ * Preferred over the bearer credential for the panel: an HttpOnly cookie is
+ * not readable by JavaScript, so a script injected into the admin origin
+ * cannot exfiltrate it the way it could a token held in sessionStorage. Only
+ * the hash is stored, so the database alone cannot be replayed as a login.
+ */
+async function authenticateAdminSession(
+  db: Database,
+  ctx: RequestContext,
+): Promise<AdminActor | null> {
+  const token = cookie(ctx, ADMIN_SESSION_COOKIE);
+  if (!token) return null;
+
+  const r = await db.query<{ admin_id: string; role: string; status: string }>(
+    `SELECT s.admin_id, a.role, a.status
+       FROM core.admin_sessions s
+       JOIN core.admin_users a ON a.id = s.admin_id
+      WHERE s.token_hash = $1
+        AND s.revoked_at IS NULL
+        AND s.expires_at > NOW()`,
+    [sha256Hex(token)],
+  );
+  const row = r.rows[0];
+  if (!row) return null;
+
+  if (row.status !== 'ACTIVE') {
+    throw new AuthError('ADMIN_NOT_ACTIVE', `admin account is ${row.status}`);
+  }
+  if (!isAdminRole(row.role)) {
+    throw new AuthError('INVALID_ADMIN_ROLE', 'admin has an unknown role');
+  }
+  return { adminId: row.admin_id, role: row.role };
+}
+
+async function authenticateAdmin(db: Database, ctx: RequestContext): Promise<AdminActor> {
+  // A session cookie takes precedence; the bearer credential remains for
+  // scripted and break-glass access.
+  const session = await authenticateAdminSession(db, ctx);
+  if (session) return session;
+
+  const header = ctx.headers['authorization'];
+  if (!header?.startsWith('Bearer ')) {
+    throw new AuthError('MISSING_ADMIN_KEY', 'an admin credential is required');
+  }
+
+  let parsed: { prefix: string; secret: string };
+  try {
+    parsed = parseApiToken(header.slice(7).trim());
+  } catch {
+    throw new AuthError('INVALID_ADMIN_KEY', 'malformed admin credential');
+  }
+
+  const r = await db.query<{ id: string; role: string; status: string; secret_hash: string }>(
+    'SELECT id, role, status, secret_hash FROM core.admin_users WHERE id::text = $1 OR email = $1',
+    [parsed.prefix],
+  );
+  const admin = r.rows[0];
+
+  if (!admin?.secret_hash) {
+    // Constant-ish work for an unknown admin.
+    verifyApiSecret(parsed.secret, 'scrypt$AAAAAAAAAAAAAAAAAAAAAA==$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=');
+    throw new AuthError('INVALID_ADMIN_KEY', 'admin credential is invalid');
+  }
+  if (!verifyApiSecret(parsed.secret, admin.secret_hash)) {
+    throw new AuthError('INVALID_ADMIN_KEY', 'admin credential is invalid');
+  }
+  if (admin.status !== 'ACTIVE') {
+    throw new AuthError('ADMIN_NOT_ACTIVE', `admin account is ${admin.status}`);
+  }
+  if (!isAdminRole(admin.role)) {
+    throw new SecurityError('UNKNOWN_ROLE', 'admin has an unrecognised role');
+  }
+
+  await db.query('UPDATE core.admin_users SET last_login_at = NOW() WHERE id = $1', [admin.id]);
+  return { adminId: admin.id, role: admin.role };
+}
+
+export function registerAdminRoutes(router: Router, container: Container): void {
+  const { db } = container;
+
+  const auth = async (ctx: RequestContext): Promise<AdminActor> => {
+    const actor = await authenticateAdmin(db, ctx);
+    ctx.auth = { kind: 'ADMIN', userId: actor.adminId };
+    return actor;
+  };
+
+  const body = (ctx: RequestContext): Record<string, unknown> => {
+    if (!ctx.body || typeof ctx.body !== 'object' || Array.isArray(ctx.body)) {
+      throw new ValidationError('INVALID_BODY', 'a JSON object body is required');
+    }
+    return ctx.body as Record<string, unknown>;
+  };
+
+  const str = (o: Record<string, unknown>, k: string): string => {
+    const v = o[k];
+    if (typeof v !== 'string' || !v.trim()) {
+      throw new ValidationError('MISSING_FIELD', `${k} is required`);
+    }
+    return v.trim();
+  };
+
+  // --- who am I -------------------------------------------------------------
+
+  /**
+   * Exchange an admin credential for a session cookie.
+   *
+   * The cookie is HttpOnly, Secure and SameSite=Strict:
+   *  - HttpOnly so injected script cannot read it, unlike sessionStorage;
+   *  - SameSite=Strict so another origin cannot drive the panel's endpoints,
+   *    which is the CSRF exposure cookie auth would otherwise introduce.
+   */
+  router.post('/internal/admin/session', async (ctx) => {
+    // Authenticates with the bearer credential, then issues the cookie.
+    const actor = await authenticateAdmin(db, ctx);
+
+    const token = randomBytes(32).toString('base64url');
+    const expiresAt = new Date(Date.now() + SESSION_TTL_HOURS * 3600 * 1000);
+
+    await db.query(
+      `INSERT INTO core.admin_sessions (id, admin_id, token_hash, ip_address, user_agent, expires_at)
+       VALUES ($1,$2,$3,$4,$5,$6)`,
+      [
+        randomUUID(),
+        actor.adminId,
+        // Only the hash is stored, so the table cannot be replayed as a login.
+        sha256Hex(token),
+        ctx.ip || null,
+        ctx.headers['user-agent'] ?? null,
+        expiresAt.toISOString(),
+      ],
+    );
+
+    return {
+      status: 200,
+      headers: {
+        'set-cookie':
+          `${ADMIN_SESSION_COOKIE}=${token}; HttpOnly; Secure; SameSite=Strict; ` +
+          `Path=/internal/admin; Max-Age=${SESSION_TTL_HOURS * 3600}`,
+      },
+      body: { role: actor.role, expires_at: expiresAt.toISOString() },
+    };
+  });
+
+  router.post('/internal/admin/session/revoke', async (ctx) => {
+    const token = cookie(ctx, ADMIN_SESSION_COOKIE);
+    if (token) {
+      await db.query(
+        `UPDATE core.admin_sessions SET revoked_at = NOW()
+          WHERE token_hash = $1 AND revoked_at IS NULL`,
+        [sha256Hex(token)],
+      );
+    }
+    return {
+      status: 200,
+      headers: {
+        'set-cookie':
+          `${ADMIN_SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Strict; ` +
+          `Path=/internal/admin; Max-Age=0`,
+      },
+      body: { revoked: true },
+    };
+  });
+
+  router.get('/internal/admin/me', async (ctx) => {
+    const actor = await auth(ctx);
+    return {
+      status: 200,
+      body: {
+        admin_id: actor.adminId,
+        role: actor.role,
+        permissions: ROLE_PERMISSIONS[actor.role],
+      },
+    };
+  });
+
+  // --- platform overview ----------------------------------------------------
+
+  router.get('/internal/admin/overview', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'ledger:read');
+
+    const [merchants, payouts, treasury, exceptions, balance, frozen] = await Promise.all([
+      db.query<{ status: string; count: string }>(
+        'SELECT status, COUNT(*)::text AS count FROM core.merchants GROUP BY status',
+      ),
+      db.query<{ status: string; count: string; total: string }>(
+        `SELECT status, COUNT(*)::text AS count, COALESCE(SUM(amount_toman),0)::text AS total
+           FROM finance.payouts GROUP BY status`,
+      ),
+      db.query<Record<string, unknown>>(
+        `SELECT id, asset, network, confirmed_balance_atomic::text, safety_reserve_atomic::text
+           FROM finance.treasury_accounts`,
+      ),
+      db.query<{ severity: string; count: string }>(
+        `SELECT severity, COUNT(*)::text AS count FROM system.reconciliation_exceptions
+          WHERE status <> 'RESOLVED' GROUP BY severity`,
+      ),
+      db.transaction((tx) => verifyGlobalBalance(tx)),
+      isFinanciallyFrozen(db),
+    ]);
+
+    return {
+      status: 200,
+      body: {
+        financial_freeze: frozen,
+        ledger_balanced: balance.balanced,
+        ledger_by_currency: balance.byCurrency,
+        merchants: merchants.rows,
+        payouts: payouts.rows,
+        treasury: treasury.rows,
+        open_exceptions: exceptions.rows,
+      },
+    };
+  });
+
+  // --- merchants ------------------------------------------------------------
+
+  router.get('/internal/admin/merchants', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'merchants:read');
+
+    const limit = Math.min(Number.parseInt(ctx.query.get('limit') ?? '50', 10) || 50, 200);
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT m.id, m.name, m.status, m.default_fee_mode, m.created_at,
+              COALESCE(b.available::text,'0') AS available,
+              COALESCE(b.pending::text,'0')   AS pending,
+              COALESCE(b.settling::text,'0')  AS settling
+         FROM core.merchants m
+         LEFT JOIN finance.ledger_accounts a
+                ON a.owner_type = 'MERCHANT' AND a.owner_id = m.id
+         LEFT JOIN finance.balances b ON b.account_id = a.id
+        ORDER BY m.created_at DESC
+        LIMIT $1`,
+      [limit],
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/merchants/:id/suspend', async (ctx) => {
+    const actor = await auth(ctx);
+    await suspendMerchant(db, actor, ctx.params['id'] as string, str(body(ctx), 'reason'));
+    return { status: 200, body: { status: 'SUSPENDED' } };
+  });
+
+  router.post('/internal/admin/merchants/:id/activate', async (ctx) => {
+    const actor = await auth(ctx);
+    await activateMerchant(db, actor, ctx.params['id'] as string, str(body(ctx), 'reason'));
+    return { status: 200, body: { status: 'ACTIVE' } };
+  });
+
+  // --- treasury (four eyes) -------------------------------------------------
+
+  router.get('/internal/admin/treasury', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'treasury:read');
+
+    const accounts = await db.query<Record<string, unknown>>(
+      `SELECT id, asset, network, address, confirmed_balance_atomic::text,
+              safety_reserve_atomic::text, updated_at
+         FROM finance.treasury_accounts`,
+    );
+    const reserved = await db.query<{ total: string }>(
+      `SELECT COALESCE(SUM(amount_atomic),0)::text AS total
+         FROM finance.liquidity_reservations WHERE status = 'ACTIVE'`,
+    );
+    const recent = await db.query<Record<string, unknown>>(
+      `SELECT id, direction, amount_atomic::text, source, status, external_tx_hash, confirmed_at
+         FROM finance.treasury_transactions ORDER BY detected_at DESC LIMIT 25`,
+    );
+
+    return {
+      status: 200,
+      body: {
+        accounts: accounts.rows,
+        active_reservations_atomic: reserved.rows[0]?.total ?? '0',
+        recent_transactions: recent.rows,
+        // Stated explicitly so no operator ever expects an auto-buy button.
+        funding_policy: 'MANUAL_ONLY',
+      },
+    };
+  });
+
+  router.post('/internal/admin/treasury/funding-requests', async (ctx) => {
+    const actor = await auth(ctx);
+    const b = body(ctx);
+    const result = await requestTreasuryFunding(db, actor, {
+      treasuryAccountId: str(b, 'treasury_account_id'),
+      amountAtomic: str(b, 'amount_atomic'),
+      txHash: str(b, 'tx_hash'),
+      reason: str(b, 'reason'),
+    });
+    return {
+      status: 201,
+      body: {
+        approval_id: result.approvalId,
+        status: 'PENDING',
+        note: 'a different admin must approve before the treasury is credited',
+      },
+    };
+  });
+
+  router.get('/internal/admin/approvals', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'treasury:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, operation, payload, requested_by, approved_by, status, reason,
+              created_at, decided_at, expires_at
+         FROM core.admin_approvals ORDER BY created_at DESC LIMIT 50`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/approvals/:id/approve', async (ctx) => {
+    const actor = await auth(ctx);
+    const result = await approveTreasuryFunding(db, actor, ctx.params['id'] as string);
+    return {
+      status: 200,
+      body: { status: 'EXECUTED', treasury_credited: result.recorded },
+    };
+  });
+
+  router.post('/internal/admin/approvals/:id/reject', async (ctx) => {
+    const actor = await auth(ctx);
+    await rejectApproval(db, actor, ctx.params['id'] as string, str(body(ctx), 'reason'));
+    return { status: 200, body: { status: 'REJECTED' } };
+  });
+
+  // --- financial freeze -----------------------------------------------------
+
+  router.post('/internal/admin/platform/freeze', async (ctx) => {
+    const actor = await auth(ctx);
+    await freezeFinancialOperations(db, actor, str(body(ctx), 'reason'));
+    return { status: 200, body: { financial_freeze: true } };
+  });
+
+  router.post('/internal/admin/platform/unfreeze', async (ctx) => {
+    const actor = await auth(ctx);
+    await unfreezeFinancialOperations(db, actor, str(body(ctx), 'reason'));
+    return { status: 200, body: { financial_freeze: false } };
+  });
+
+  // --- reconciliation exceptions -------------------------------------------
+
+  router.get('/internal/admin/exceptions', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'exceptions:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, kind, severity, entity_type, entity_id, details, status, created_at
+         FROM system.reconciliation_exceptions
+        WHERE status <> 'RESOLVED'
+        ORDER BY CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1
+                               WHEN 'MEDIUM' THEN 2 ELSE 3 END, created_at DESC
+        LIMIT 100`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/exceptions/:id/resolve', async (ctx) => {
+    const actor = await auth(ctx);
+    await resolveException(db, actor, ctx.params['id'] as string, str(body(ctx), 'resolution'));
+    return { status: 200, body: { status: 'RESOLVED' } };
+  });
+
+  // --- holds, disputes and risk ------------------------------------------------
+
+  router.get('/internal/admin/holds', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'risk:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT h.id, h.payment_id, h.merchant_id, h.source, h.reason, h.created_at,
+              m.name AS merchant_name, p.verified_amount::text AS amount
+         FROM finance.payment_holds h
+         JOIN core.merchants m ON m.id = h.merchant_id
+         JOIN core.payments p ON p.id = h.payment_id
+        WHERE h.status = 'ACTIVE'
+        ORDER BY h.created_at ASC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  /**
+   * Lift a hold.
+   *
+   * The only way money that risk or a dispute paused starts moving again. It is
+   * audited like every other consequential action, and it never itself moves
+   * anything: release simply resumes on the next worker pass.
+   */
+  router.post('/internal/admin/holds/:id/release', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'holds:release');
+
+    const reason = str(body(ctx), 'reason');
+    const released = await releaseHold(db, {
+      holdId: ctx.params['id'] as string,
+      releasedBy: actor.adminId,
+    });
+    if (!released) throw new NotFoundError('hold', ctx.params['id'] as string);
+
+    await auditAdminAction(db, {
+      actorId: actor.adminId,
+      action: 'HOLD_RELEASED',
+      resourceType: 'PAYMENT_HOLD',
+      resourceId: ctx.params['id'] as string,
+      reason,
+    });
+    return { status: 200, body: { status: 'RELEASED' } };
+  });
+
+  router.get('/internal/admin/disputes', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'disputes:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT d.id, d.payment_id, d.merchant_id, d.status, d.reason, d.resolution,
+              d.created_at, d.resolved_at, m.name AS merchant_name
+         FROM core.disputes d
+         JOIN core.merchants m ON m.id = d.merchant_id
+        ORDER BY
+          CASE WHEN d.status IN ('OPEN','UNDER_REVIEW','HOLD','ESCALATED') THEN 0 ELSE 1 END,
+          d.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/disputes/:id/resolve', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'disputes:resolve');
+
+    const payload = body(ctx);
+    const resolution = str(payload, 'resolution');
+    const allowed = ['UPHELD_MERCHANT', 'UPHELD_CUSTOMER', 'REFUND_REQUIRED', 'NO_ACTION'];
+    if (!allowed.includes(resolution)) {
+      throw new ValidationError('INVALID_RESOLUTION', `resolution must be one of ${allowed.join(', ')}`);
+    }
+
+    const result = await resolveDispute(db, {
+      disputeId: ctx.params['id'] as string,
+      resolution: resolution as never,
+      note: typeof payload['note'] === 'string' ? payload['note'] : undefined,
+      resolvedBy: actor.adminId,
+    });
+
+    await auditAdminAction(db, {
+      actorId: actor.adminId,
+      action: 'DISPUTE_RESOLVED',
+      resourceType: 'DISPUTE',
+      resourceId: ctx.params['id'] as string,
+      reason: resolution,
+    });
+    return { status: 200, body: result };
+  });
+
+  router.get('/internal/admin/risk', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'risk:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT a.id, a.entity_type, a.entity_id, a.merchant_id, a.score, a.level,
+              a.decision, a.signals, a.created_at, m.name AS merchant_name
+         FROM risk.assessments a
+         LEFT JOIN core.merchants m ON m.id = a.merchant_id
+        WHERE a.decision = 'REVIEW'
+        ORDER BY a.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  // --- support ------------------------------------------------------------------
+
+  router.get('/internal/admin/support/tickets', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT t.id, t.reference, t.subject, t.category, t.priority, t.status,
+              t.entity_type, t.entity_id, t.created_at, t.updated_at,
+              m.name AS merchant_name
+         FROM core.support_tickets t
+         JOIN core.merchants m ON m.id = t.merchant_id
+        ORDER BY
+          CASE WHEN t.status IN ('OPEN','WAITING_INTERNAL') THEN 0 ELSE 1 END,
+          CASE t.priority WHEN 'URGENT' THEN 0 WHEN 'HIGH' THEN 1
+                          WHEN 'NORMAL' THEN 2 ELSE 3 END,
+          t.created_at ASC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/support/tickets/:id', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:read');
+
+    // Staff see internal notes; merchants never do.
+    const ticket = await getTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      includeInternal: true,
+    });
+    return { status: 200, body: ticket };
+  });
+
+  router.post('/internal/admin/support/tickets/:id/reply', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:respond');
+
+    const payload = body(ctx);
+    const reply = await replyToTicket(db, {
+      ticketId: ctx.params['id'] as string,
+      body: str(payload, 'message'),
+      senderType: 'ADMIN',
+      senderId: actor.adminId,
+      internal: payload['internal'] === true,
+    });
+    return { status: 201, body: { id: reply.messageId } };
+  });
+
+  router.post('/internal/admin/support/tickets/:id/status', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'support:respond');
+
+    await setTicketStatus(db, {
+      ticketId: ctx.params['id'] as string,
+      status: str(body(ctx), 'status') as never,
+      actorId: actor.adminId,
+    });
+    return { status: 200, body: { status: 'UPDATED' } };
+  });
+
+  // --- payments, invoices, ledger, rates ----------------------------------------
+
+  router.get('/internal/admin/payments', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'payments:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT p.id, p.merchant_id, p.status, p.verified_amount::text AS amount,
+              p.verified_paid_at, p.release_at, p.released_at, p.mismatch_code,
+              p.provider_fee_status, p.created_at, m.name AS merchant_name
+         FROM core.payments p
+         JOIN core.merchants m ON m.id = p.merchant_id
+        ORDER BY p.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/invoices', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'payments:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT i.id, i.invoice_number, i.status, i.fee_mode,
+              i.base_amount::text, i.customer_total_amount::text,
+              i.created_at, m.name AS merchant_name
+         FROM core.invoices i
+         JOIN core.merchants m ON m.id = i.merchant_id
+        ORDER BY i.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  /**
+   * Ledger explorer.
+   *
+   * Read-only by construction: there is no endpoint that writes a journal
+   * entry, so the panel cannot edit the books even in principle.
+   */
+  router.get('/internal/admin/ledger', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'ledger:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT j.id, j.reference_type, j.reference_id, j.description, j.created_at,
+              a.account_code, a.currency, e.debit::text, e.credit::text, e.bucket
+         FROM finance.journal_entries e
+         JOIN finance.journals j ON j.id = e.journal_id
+         JOIN finance.ledger_accounts a ON a.id = e.account_id
+        ORDER BY j.created_at DESC
+        LIMIT 300`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/rates', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'treasury:read');
+
+    // Both legs, so a settlement's price can be explained after the fact.
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, rate::text, source, expires_at, created_at,
+              crypto_value::text, crypto_source, crypto_observed_at,
+              fx_value::text, fx_source, fx_observed_at
+         FROM finance.rate_quotes
+        ORDER BY created_at DESC
+        LIMIT 100`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/security', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'audit:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, event_type, severity, actor_id, created_at, metadata
+         FROM audit.security_events
+        ORDER BY created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.get('/internal/admin/webhooks', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'merchants:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT d.id, d.status, d.attempts, d.next_attempt_at, d.last_error,
+              d.created_at, e.event_type
+         FROM integration.webhook_deliveries d
+         LEFT JOIN integration.webhook_events e ON e.id = d.event_id
+        ORDER BY d.created_at DESC
+        LIMIT 200`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  // --- payouts --------------------------------------------------------------
+
+  router.get('/internal/admin/payouts', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'payouts:read');
+
+    const status = ctx.query.get('status');
+    const params: unknown[] = [];
+    let where = '';
+    if (status) {
+      params.push(status);
+      where = 'WHERE p.status = $1';
+    }
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT p.id, p.merchant_id, m.name AS merchant_name, p.status,
+              p.amount_toman::text, p.gram_amount_atomic::text, p.rate::text,
+              p.destination_address, p.transaction_hash, p.failure_code, p.created_at
+         FROM finance.payouts p
+         JOIN core.merchants m ON m.id = p.merchant_id
+         ${where}
+        ORDER BY p.created_at DESC LIMIT 100`,
+      params,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  // --- audit trail ----------------------------------------------------------
+
+  router.get('/internal/admin/audit', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'audit:read');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, actor_type, actor_id, action, resource_type, resource_id,
+              reason, metadata, created_at
+         FROM audit.audit_logs ORDER BY created_at DESC LIMIT 100`,
+    );
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  // --- admin management -----------------------------------------------------
+
+  router.get('/internal/admin/admins', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'admins:manage');
+
+    const r = await db.query<Record<string, unknown>>(
+      `SELECT id, name, email, telegram_user_id, role, status, last_login_at, created_at
+         FROM core.admin_users ORDER BY created_at DESC`,
+    );
+    // secret_hash is never selected, so it can never be returned.
+    return { status: 200, body: { data: r.rows } };
+  });
+
+  router.post('/internal/admin/admins', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'admins:manage');
+
+    const b = body(ctx);
+    const role = str(b, 'role');
+    if (!isAdminRole(role)) {
+      throw new ValidationError('INVALID_ROLE', `unknown role: ${role}`);
+    }
+
+    const { generateApiKey } = await import('../../../packages/crypto/src/index.ts');
+    const credential = generateApiKey();
+    const id = randomUUID();
+
+    await db.transaction(async (tx) => {
+      await tx.query(
+        `INSERT INTO core.admin_users (id, name, email, role, status, secret_hash)
+         VALUES ($1,$2,$3,$4,'ACTIVE',$5)`,
+        [id, str(b, 'name'), str(b, 'email'), role, credential.secretHash],
+      );
+      await tx.query(
+        `INSERT INTO audit.audit_logs
+            (id, actor_type, actor_id, action, resource_type, resource_id, metadata)
+         VALUES ($1,'ADMIN',$2,'ADMIN_CREATED','ADMIN',$3,$4::jsonb)`,
+        [randomUUID(), actor.adminId, id, JSON.stringify({ role })],
+      );
+    });
+
+    return {
+      status: 201,
+      body: {
+        id,
+        role,
+        // Shown exactly once; only the hash is stored.
+        credential: `${id}.${credential.token.split('.')[1]}`,
+        warning: 'store this credential now; it cannot be retrieved again',
+      },
+    };
+  });
+}
