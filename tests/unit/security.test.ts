@@ -23,6 +23,16 @@ import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/
 import { TEST_ENV } from '../helpers/harness.ts';
 import { StubSigner, AwsKmsEd25519Signer } from '../../packages/ton/src/signer.ts';
 import {
+  parseTonAddress,
+  buildCanonicalTonSigningPayload,
+  assembleSignedTonExternalMessage,
+} from '../../packages/ton/src/ton-wallet-message.ts';
+import {
+  RateAggregator,
+  StaticCryptoMarketProvider,
+  StaticFxProvider,
+} from '../../packages/core/src/adapters/rate-aggregator.ts';
+import {
   TokenBucketRateLimiter,
   RedisRateLimiter,
   ruleFor,
@@ -244,7 +254,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     payoutId: 'abc',
     asset: 'GRAM',
     network: 'TON_TESTNET',
-    destinationAddress: 'EQD__________________________________________1vo',
+    destinationAddress: 'UQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAZAm',
     amountAtomic: '10000000000',
     fromAddress: 'EQD__________________________________________0vo',
   };
@@ -297,9 +307,45 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     );
   });
 
+  describe('Canonical TON Wallet Message Construction', () => {
+    it('parses valid friendly TON address and validates CRC16', () => {
+      // Valid standard testnet/bounceable address
+      const addr = 'EQD__________________________________________0vo';
+      const parsed = parseTonAddress(addr);
+      expect(parsed.workchain).toBeDefined();
+      expect(parsed.accountId).toHaveLength(32);
+    });
+
+    it('rejects an address with corrupted CRC16 checksum', () => {
+      const corrupted = 'EQD__________________________________________0va';
+      expect(() => parseTonAddress(corrupted)).toThrow(/Invalid checksum|INVALID_TON_ADDRESS/);
+    });
+
+    it('builds canonical 32-byte representation hash and packages Ed25519 signature', () => {
+      const canonical = buildCanonicalTonSigningPayload({
+        seqno: 5,
+        validUntil: 1800000000,
+        destinationAddress: 'EQD__________________________________________0vo',
+        amountNanograms: 10_000_000_000n,
+      });
+
+      expect(canonical.digest).toHaveLength(32);
+      expect(canonical.digestHex).toHaveLength(64);
+
+      const fakeSig = Buffer.alloc(64, 0xef);
+      const assembled = assembleSignedTonExternalMessage(canonical.canonicalBytes, fakeSig);
+      expect(assembled.signatureHex).toHaveLength(128);
+      expect(assembled.signedPayloadHex.length).toBeGreaterThan(128);
+      expect(assembled.signingReference).toMatch(/^ton-ext-msg:/);
+    });
+  });
+
   describe('AwsKmsEd25519Signer', () => {
     const mockKmsClient = {
       sign: async (params: { KeyId: string; Message: Uint8Array; SigningAlgorithm: string }) => {
+        if (params.SigningAlgorithm !== 'ED25519_SHA_512') {
+          throw new Error(`Invalid KMS algorithm: ${params.SigningAlgorithm}`);
+        }
         return {
           Signature: new Uint8Array(64).fill(0xab),
           KeyId: params.KeyId,
@@ -308,7 +354,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       },
     };
 
-    it('signs payload via AWS KMS Ed25519 and outputs canonical signing reference', async () => {
+    it('signs canonical TON payload with official AWS algorithm ED25519_SHA_512', async () => {
       const signer = new AwsKmsEd25519Signer({
         config: tonConfig,
         keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
@@ -318,19 +364,55 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
 
       const signed = await signer.sign(request);
       expect(signed.signer).toBe('AWS_KMS_ED25519');
-      expect(signed.signingReference).toMatch(/^aws-kms:us-east-1:/);
+      expect(signed.signingReference).toMatch(/^ton-ext-msg:/);
       expect(signed.unsignedHash).toBeDefined();
     });
 
-    it('refuses duplicate sign requests to prevent double authorization', async () => {
+    it('persists and returns identical signature evidence on retry with DB idempotency', async () => {
+      const mockDbRecords = new Map<string, any>();
+      const mockDb: any = {
+        query: async (sql: string, params?: any[]) => {
+          if (sql.includes('SELECT')) {
+            const row = mockDbRecords.get(params?.[0]);
+            return { rows: row ? [row] : [] };
+          }
+          if (sql.includes('INSERT')) {
+            const signReqId = params?.[1];
+            if (mockDbRecords.has(signReqId)) {
+              throw new Error('ux_signing_requests_idempotency duplicate');
+            }
+            mockDbRecords.set(signReqId, {
+              status: 'PENDING',
+              unsigned_hash: params?.[5],
+            });
+            return { rowCount: 1 };
+          }
+          if (sql.includes('UPDATE')) {
+            const id = params?.[3];
+            for (const [key, val] of mockDbRecords.entries()) {
+              val.status = 'COMPLETED';
+              val.signing_reference = params?.[0];
+              val.raw_signature = params?.[1];
+              val.signed_at = params?.[2];
+            }
+            return { rowCount: 1 };
+          }
+          return { rows: [] };
+        },
+      };
+
       const signer = new AwsKmsEd25519Signer({
         config: tonConfig,
         keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
         kmsClient: mockKmsClient,
+        db: mockDb,
       });
 
-      await signer.sign(request);
-      await expect(signer.sign(request)).rejects.toThrow(/already been consumed/);
+      const first = await signer.sign(request);
+      const second = await signer.sign(request);
+
+      expect(first.signingReference).toBe(second.signingReference);
+      expect(first.unsignedHash).toBe(second.unsignedHash);
     });
 
     it('handles KMS transient failures with retryable IntegrationError', async () => {
@@ -347,6 +429,57 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       });
 
       await expect(signer.sign(request)).rejects.toThrow(/Failed to sign payload via AWS KMS/);
+    });
+  });
+
+  describe('RateAggregator multi-source consensus & outlier filtering', () => {
+    it('calculates median when multiple crypto sources agree within threshold', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'COINGECKO' });
+      const sourceB = new StaticCryptoMarketProvider('1.52', { name: 'COINPAPRIKA' });
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      const quote = await aggregator.getQuote();
+      // Median between 1.50 and 1.52 is 1.52
+      expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeCloseTo(1.52, 2);
+      expect(quote.source).toContain('COINGECKO+COINPAPRIKA');
+    });
+
+    it('rejects quotes when two sources diverge beyond the consensus threshold', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.00', { name: 'COINGECKO' });
+      const sourceB = new StaticCryptoMarketProvider('2.00', { name: 'DIVERGENT_SOURCE' }); // 100% diff
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/cross-source divergence/);
+    });
+
+    it('filters out an extreme outlier when 3+ sources are available', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'SRC_A' });
+      const sourceB = new StaticCryptoMarketProvider('1.51', { name: 'SRC_B' });
+      const sourceOutlier = new StaticCryptoMarketProvider('5.00', { name: 'SRC_OUTLIER' }); // Extreme outlier
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB, sourceOutlier],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      const quote = await aggregator.getQuote();
+      expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeLessThan(2.0);
+      expect(quote.source).toContain('SRC_A+SRC_B');
+      expect(quote.source).not.toContain('SRC_OUTLIER');
     });
   });
 });
