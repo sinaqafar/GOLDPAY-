@@ -131,5 +131,31 @@ describe('Real Redis 7: BullMQ & Distributed Rate Limiting', () => {
       const decision = await limiter.check('key', RATE_LIMITS['PUBLIC'] as RateLimitRule);
       expect(decision.allowed).toBe(true);
     });
+
+    it('fails closed on sensitive/admin rules even when default failOpen is true', async () => {
+      const brokenRedis = {
+        eval: async () => {
+          throw new Error('Redis connection lost');
+        },
+      };
+
+      const limiter = new RedisRateLimiter({
+        redis: brokenRedis,
+        failOpen: true,
+      });
+
+      const sensitiveDecision = await limiter.check('key', RATE_LIMITS['SENSITIVE'] as RateLimitRule);
+      expect(sensitiveDecision.allowed).toBe(false);
+      expect(sensitiveDecision.retryAfterSeconds).toBeGreaterThan(0);
+
+      const adminDecision = await limiter.check('key', RATE_LIMITS['ADMIN'] as RateLimitRule);
+      expect(adminDecision.allowed).toBe(false);
+
+      const merchantWriteDecision = await limiter.check('key', RATE_LIMITS['MERCHANT_WRITE'] as RateLimitRule);
+      expect(merchantWriteDecision.allowed).toBe(false);
+
+      const webhookDecision = await limiter.check('key', RATE_LIMITS['WEBHOOK'] as RateLimitRule);
+      expect(webhookDecision.allowed).toBe(true);
+    });
   });
 });

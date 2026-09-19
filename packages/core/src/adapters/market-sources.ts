@@ -51,21 +51,9 @@ async function fetchJson(
 }
 
 /**
- * Read a price as an exact decimal string.
- *
- * JSON.parse turns every number into a float, so by the time a value is a
- * `number` its precision is already fixed. The only way to avoid that is to
- * take the digits out of the RAW body before parsing — which this does when the
- * upstream sends a number, falling back to the parsed float only when the shape
- * is unexpected.
- *
- * Market rates are not amounts of money, so a last-digit difference does not
- * mint or destroy anything. But the rate multiplies into a GRAM amount that IS
- * money, and the project forbids floats in that path, so the exact digits are
- * preserved wherever they are available.
+ * Read a price as an exact decimal string without floating-point precision loss.
  */
 function readDecimal(raw: unknown, rawBody: string, field: string): string | null {
-  // Preferred: pull the literal digits straight out of the response text.
   const literal = new RegExp(`"${field}"\\s*:\\s*(-?\\d+(?:\\.\\d+)?)`).exec(rawBody);
   if (literal?.[1]) return literal[1];
 
@@ -73,17 +61,13 @@ function readDecimal(raw: unknown, rawBody: string, field: string): string | nul
 
   if (typeof raw === 'number') {
     if (!Number.isFinite(raw) || raw <= 0) return null;
-    // Scientific notation would be rejected downstream, so render plainly.
     return raw.toFixed(12).replace(/0+$/, '').replace(/\.$/, '');
   }
   return null;
 }
 
 /**
- * GRAM/USD from a CoinGecko-style simple price endpoint.
- *
- * Expected shape:
- *   { "<coinId>": { "usd": 1.23, "last_updated_at": 1700000000 } }
+ * Primary: GRAM/USD from CoinGecko.
  */
 export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
   readonly name: string;
@@ -127,7 +111,6 @@ export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
     }
 
     const updatedAt = entry?.['last_updated_at'];
-    // Fall back to "now" only when the upstream publishes no timestamp at all.
     const observedAt =
       typeof updatedAt === 'number' ? new Date(updatedAt * 1000) : new Date();
 
@@ -136,10 +119,56 @@ export class CoinGeckoCryptoProvider implements CryptoMarketProvider {
 }
 
 /**
- * USD/TOMAN from a Tindex-style endpoint.
- *
- * Expected shape (tolerant about exact field names):
- *   { "price": 123456, "updated_at": "2026-01-01T00:00:00Z" }
+ * Secondary: GRAM/USD from CoinPaprika.
+ */
+export class CoinPaprikaCryptoProvider implements CryptoMarketProvider {
+  readonly name: string;
+  #url: string;
+  #coinId: string;
+  #timeoutMs: number;
+
+  constructor(options: {
+    baseUrl?: string;
+    coinId?: string;
+    timeoutMs?: number;
+    name?: string;
+  } = {}) {
+    const base = options.baseUrl ?? 'https://api.coinpaprika.com/v1';
+    this.#coinId = options.coinId ?? 'ton-the-open-network';
+    this.#url = `${base}/tickers/${encodeURIComponent(this.#coinId)}`;
+    this.#timeoutMs = options.timeoutMs ?? 5000;
+    this.name = options.name ?? 'COINPAPRIKA';
+  }
+
+  async getGramUsd(): Promise<MarketObservation> {
+    const { body, rawBody } = await fetchJson({
+      url: this.#url,
+      timeoutMs: this.#timeoutMs,
+      name: this.name,
+    });
+
+    const quotes = body['quotes'] as Record<string, unknown> | undefined;
+    const usdQuote = quotes?.['USD'] as Record<string, unknown> | undefined;
+    const usd = readDecimal(usdQuote?.['price'], rawBody, 'price');
+    if (!usd) {
+      throw new IntegrationError('MARKET_INVALID_VALUE', 'no usd price in coinpaprika response', {
+        retryable: false,
+        details: { source: this.name, coinId: this.#coinId },
+      });
+    }
+
+    const lastUpdated = body['last_updated'] ?? usdQuote?.['last_updated'];
+    const observedAt =
+      typeof lastUpdated === 'string' && !Number.isNaN(Date.parse(lastUpdated))
+        ? new Date(lastUpdated)
+        : new Date();
+
+    return { value: usd, source: this.name, observedAt };
+  }
+}
+
+/**
+ * Primary: USD/TOMAN from Tindex.
  */
 export class TindexFxProvider implements FxProvider {
   readonly name: string;
@@ -181,7 +210,61 @@ export class TindexFxProvider implements FxProvider {
     if (typeof updated === 'string' && !Number.isNaN(Date.parse(updated))) {
       observedAt = new Date(updated);
     } else if (typeof updated === 'number') {
-      // Seconds or milliseconds, depending on the upstream.
+      observedAt = new Date(updated > 1e12 ? updated : updated * 1000);
+    }
+
+    return { value, source: this.name, observedAt };
+  }
+}
+
+/**
+ * Secondary: Generic FX Provider for fallback USD/TOMAN feeds.
+ */
+export class GenericFxProvider implements FxProvider {
+  readonly name: string;
+  #url: string;
+  #timeoutMs: number;
+  #headers: Record<string, string>;
+
+  constructor(options: {
+    url: string;
+    timeoutMs?: number;
+    headers?: Record<string, string>;
+    name?: string;
+  }) {
+    this.#url = options.url;
+    this.#timeoutMs = options.timeoutMs ?? 5000;
+    this.#headers = options.headers ?? {};
+    this.name = options.name ?? 'GENERIC_FX';
+  }
+
+  async getUsdToman(): Promise<MarketObservation> {
+    const { body, rawBody } = await fetchJson({
+      url: this.#url,
+      timeoutMs: this.#timeoutMs,
+      name: this.name,
+      headers: this.#headers,
+    });
+
+    let value: string | null = null;
+    for (const field of ['usd_irr', 'usd_toman', 'price', 'rate', 'value']) {
+      if (body[field] === undefined) continue;
+      value = readDecimal(body[field], rawBody, field);
+      if (value) break;
+    }
+
+    if (!value) {
+      throw new IntegrationError('MARKET_INVALID_VALUE', 'no usable USD/TOMAN price from fallback source', {
+        retryable: false,
+        details: { source: this.name },
+      });
+    }
+
+    const updated = body['updated_at'] ?? body['time'] ?? body['timestamp'];
+    let observedAt = new Date();
+    if (typeof updated === 'string' && !Number.isNaN(Date.parse(updated))) {
+      observedAt = new Date(updated);
+    } else if (typeof updated === 'number') {
       observedAt = new Date(updated > 1e12 ? updated : updated * 1000);
     }
 

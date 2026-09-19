@@ -37,13 +37,13 @@ export interface FeeConfig {
   readonly policyVersion: string;
   readonly defaultFeeMode: 'CUSTOMER' | 'MERCHANT' | 'SPLIT';
   /**
-   * The payment provider's own cut of what it collects (CubePay ≈ 9%).
+   * The expected payment provider fee (CubePay configured estimate, e.g. 9%).
    *
-   * This is a platform COST, never shown to or charged to the merchant, and
-   * never added to platformFeePercent to form one headline rate. It exists so
-   * the ledger can record real platform margin instead of flattering itself.
-   * SPEC 103.26: the value must come from configuration, never a hardcoded
-   * constant buried in the code.
+   * This is an EXPECTED platform cost, never shown to or charged to the merchant,
+   * and never added to platformFeePercent. It serves as the baseline to compare
+   * against actual provider fees. If the provider reports an actual fee that
+   * diverges from this expected figure, the actual amount is posted and a
+   * RECONCILIATION_EXCEPTION is flagged for financial audit.
    */
   readonly providerFeePercent: Percentage;
 }

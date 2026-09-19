@@ -21,7 +21,7 @@ import { loadConfig, assertTreasuryManualOnly } from '../../packages/config/src/
 import { SecurityError, ConfigError } from '../../packages/errors/src/index.ts';
 import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/webhooks.ts';
 import { TEST_ENV } from '../helpers/harness.ts';
-import { StubSigner } from '../../packages/ton/src/signer.ts';
+import { StubSigner, AwsKmsEd25519Signer } from '../../packages/ton/src/signer.ts';
 import {
   TokenBucketRateLimiter,
   RedisRateLimiter,
@@ -295,6 +295,59 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     expect(() => new StubSigner(tonConfig, { isProduction: true })).toThrow(
       /never be used in production/,
     );
+  });
+
+  describe('AwsKmsEd25519Signer', () => {
+    const mockKmsClient = {
+      sign: async (params: { KeyId: string; Message: Uint8Array; SigningAlgorithm: string }) => {
+        return {
+          Signature: new Uint8Array(64).fill(0xab),
+          KeyId: params.KeyId,
+          SigningAlgorithm: params.SigningAlgorithm,
+        };
+      },
+    };
+
+    it('signs payload via AWS KMS Ed25519 and outputs canonical signing reference', async () => {
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        kmsClient: mockKmsClient,
+        region: 'us-east-1',
+      });
+
+      const signed = await signer.sign(request);
+      expect(signed.signer).toBe('AWS_KMS_ED25519');
+      expect(signed.signingReference).toMatch(/^aws-kms:us-east-1:/);
+      expect(signed.unsignedHash).toBeDefined();
+    });
+
+    it('refuses duplicate sign requests to prevent double authorization', async () => {
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        kmsClient: mockKmsClient,
+      });
+
+      await signer.sign(request);
+      await expect(signer.sign(request)).rejects.toThrow(/already been consumed/);
+    });
+
+    it('handles KMS transient failures with retryable IntegrationError', async () => {
+      const failingKms = {
+        sign: async () => {
+          throw new Error('KMS service throttled');
+        },
+      };
+
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'test-key-id',
+        kmsClient: failingKms,
+      });
+
+      await expect(signer.sign(request)).rejects.toThrow(/Failed to sign payload via AWS KMS/);
+    });
   });
 });
 
