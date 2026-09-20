@@ -34,6 +34,9 @@ interface SandboxRecord {
   amountToman: string;
   payAmountRial?: string | null;
   payAmountToman?: string | null;
+  orderId?: string | null;
+  matchConfidence?: number | null;
+  matchFlags?: string[] | null;
   status: 'PAID' | 'FAILED' | 'PENDING';
   paidAt: string | null;
   providerFee?: string | null;
@@ -61,6 +64,9 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
         amountToman: request.amount,
         payAmountRial: amountRial,
         payAmountToman: request.amount,
+        orderId: request.internalInvoiceId,
+        matchConfidence: 100,
+        matchFlags: [],
         status: 'PENDING',
         paidAt: null,
       });
@@ -159,6 +165,10 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
           externalPaymentId,
           status: 'UNKNOWN',
           paidAmount: null,
+          paidAmountRial: null,
+          orderId: null,
+          matchConfidence: null,
+          matchFlags: null,
           providerFeeAmount: null,
           paidAt: null,
           raw: { sandbox: true, found: false },
@@ -168,6 +178,10 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
         externalPaymentId,
         status: record.status,
         paidAmount: record.status === 'PAID' ? (record.payAmountToman ?? record.amountToman) : null,
+        paidAmountRial: record.status === 'PAID' ? (record.payAmountRial ?? `${BigInt(record.amountToman) * 10n}`) : null,
+        orderId: record.orderId ?? record.internalInvoiceId,
+        matchConfidence: record.matchConfidence ?? 100,
+        matchFlags: record.matchFlags ?? [],
         providerFeeAmount: record.status === 'PAID' ? (record.providerFee ?? null) : null,
         paidAt: record.paidAt,
         raw: { sandbox: true, ...record },
@@ -183,16 +197,27 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
 
     const normalizedStatus = normaliseStandardStatus(res.status ?? (res.success ? 'verified' : 'failed'));
 
-    // Convert returned Rials back to Toman using BigInt integer division (Rials / 10n)
+    // Preserve exact raw Rial amount without silent division truncation
+    let rawAmountRial: string | null = null;
     let paidAmountToman: string | null = null;
     if (res.amount !== undefined && res.amount !== null) {
-      paidAmountToman = (BigInt(String(res.amount)) / 10n).toString();
+      try {
+        rawAmountRial = BigInt(String(res.amount)).toString();
+        paidAmountToman = (BigInt(String(res.amount)) / 10n).toString();
+      } catch {
+        rawAmountRial = null;
+        paidAmountToman = null;
+      }
     }
 
     return {
       externalPaymentId,
       status: normalizedStatus,
       paidAmount: normalizedStatus === 'PAID' ? paidAmountToman : null,
+      paidAmountRial: normalizedStatus === 'PAID' ? rawAmountRial : null,
+      orderId: typeof res.order_id === 'string' ? res.order_id : null,
+      matchConfidence: typeof res.match_confidence === 'number' ? res.match_confidence : null,
+      matchFlags: Array.isArray(res.match_flags) ? res.match_flags : null,
       providerFeeAmount: null, // CubePay Standard does not report actual deducted fee in response
       paidAt: res.paid_at ?? (normalizedStatus === 'PAID' ? new Date().toISOString() : null),
       raw: res as unknown as Record<string, unknown>,
@@ -211,11 +236,14 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
 
     const authority = typeof body['authority'] === 'string' ? body['authority'] : '';
     const orderId = typeof body['order_id'] === 'string' ? body['order_id'] : '';
+    let amountRial: string | null = null;
     let amountToman: string | null = null;
     if (body['amount'] !== undefined && body['amount'] !== null) {
       try {
+        amountRial = BigInt(String(body['amount'])).toString();
         amountToman = (BigInt(String(body['amount'])) / 10n).toString();
       } catch {
+        amountRial = null;
         amountToman = null;
       }
     }
@@ -228,6 +256,8 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
         externalPaymentId: authority,
         status: 'UNKNOWN', // Must be re-verified with verifyPayment(authority)
         paidAmount: amountToman,
+        paidAmountRial: amountRial,
+        orderId: orderId || null,
         providerFeeAmount: null,
         paidAt: new Date().toISOString(),
         raw: body,
@@ -306,6 +336,20 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
     if (!record) throw new Error(`unknown sandbox payment ${externalPaymentId}`);
     record.payAmountToman = payAmountToman;
     record.payAmountRial = payAmountRial ?? String(BigInt(payAmountToman) * 10n);
+    record.amountToman = payAmountToman;
+  }
+
+  sandboxSetOrderId(externalPaymentId: string, orderId: string): void {
+    const record = this.#sandbox.get(externalPaymentId);
+    if (!record) throw new Error(`unknown sandbox payment ${externalPaymentId}`);
+    record.orderId = orderId;
+  }
+
+  sandboxSetMatchEvidence(externalPaymentId: string, matchConfidence: number | null, matchFlags?: string[]): void {
+    const record = this.#sandbox.get(externalPaymentId);
+    if (!record) throw new Error(`unknown sandbox payment ${externalPaymentId}`);
+    record.matchConfidence = matchConfidence;
+    record.matchFlags = matchFlags ?? [];
   }
 
   sandboxSetProviderFee(externalPaymentId: string, feeToman: string | null): void {

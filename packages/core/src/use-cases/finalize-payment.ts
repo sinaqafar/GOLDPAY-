@@ -35,6 +35,14 @@ export interface ProviderEvidence {
   externalPaymentId: string;
   /** Amount the provider says was actually collected, in TOMAN atomic units. */
   paidAmount: string;
+  /** Raw amount in RIALS when reported by the provider (e.g. CubePay Standard). */
+  paidAmountRial?: string | null;
+  /** Verified order_id returned by provider (e.g. CubePay Standard). */
+  orderId?: string | null;
+  /** Match confidence score (0-100) returned by provider. */
+  matchConfidence?: number | null;
+  /** Anomaly or audit flags returned by provider. */
+  matchFlags?: string[] | null;
   /**
    * Fee the provider reports it deducted, in TOMAN atomic units, or null when
    * the provider does not report one. Null means unknown, never zero.
@@ -134,6 +142,16 @@ export async function finalizePayment(
         };
       }
 
+      // 2.5 Order ID binding verification (SPEC 103790):
+      // Provider verified order_id must match the internal invoice ID.
+      const verifiedOrderId = evidence.orderId ?? (typeof evidence.raw['order_id'] === 'string' ? evidence.raw['order_id'] : null);
+      if (verifiedOrderId && verifiedOrderId !== invoice.id) {
+        throw new ValidationError('VERIFY_ORDER_ID_MISMATCH', `CubePay verified order_id does not match invoice id: ${verifiedOrderId} vs ${invoice.id}`, {
+          verifiedOrderId,
+          invoiceId: invoice.id,
+        });
+      }
+
       const paymentId = randomUUID();
       // Match against exact provider payable snapshot if offset was applied, else customer total
       const expectedTotal = invoice.provider_pay_amount_toman
@@ -166,7 +184,68 @@ export async function finalizePayment(
         return { paymentId, status, credited: false, releaseAt: null, merchantNet: null };
       }
 
-      // 4. Validate the amount against the invoice snapshot.
+      // 4. Validate exact raw Rial amount without silent division truncation
+      const rawRial = evidence.paidAmountRial ?? (evidence.raw['amount'] !== undefined && evidence.raw['amount'] !== null ? String(evidence.raw['amount']) : null);
+      if (rawRial !== null && invoice.provider_pay_amount_rial) {
+        let evidenceRial: bigint;
+        let expectedRial: bigint;
+        try {
+          evidenceRial = BigInt(rawRial);
+          expectedRial = BigInt(invoice.provider_pay_amount_rial);
+        } catch {
+          evidenceRial = 0n;
+          expectedRial = 1n;
+        }
+
+        if (evidenceRial !== expectedRial) {
+          const mismatchCode = evidenceRial < expectedRial ? 'UNDERPAYMENT' : 'OVERPAYMENT';
+          await insertPayment(tx, {
+            paymentId,
+            invoice,
+            evidence,
+            status: 'MISMATCH',
+            verifiedAmount: evidence.paidAmount,
+            verifiedPaidAt: null,
+            releaseAt: null,
+            mismatchCode,
+            failureCode: null,
+          });
+          await storeEvidence(tx, paymentId, evidence);
+          await recordTransition(tx, {
+            entityType: 'PAYMENT',
+            entityId: paymentId,
+            fromState: null,
+            event: 'AMOUNT_MISMATCH',
+            toState: 'MISMATCH',
+            actorType: 'PROVIDER',
+            metadata: { expectedRial: expectedRial.toString(), paidRial: evidenceRial.toString() },
+          });
+          await tx.query(
+            `INSERT INTO system.reconciliation_exceptions
+               (id, kind, severity, entity_type, entity_id, details)
+             VALUES ($1,'AMOUNT_MISMATCH','HIGH','PAYMENT',$2,$3::jsonb)`,
+            [
+              randomUUID(),
+              paymentId,
+              JSON.stringify({
+                expectedRial: expectedRial.toString(),
+                paidRial: evidenceRial.toString(),
+                mismatchCode,
+              }),
+            ],
+          );
+          return {
+            paymentId,
+            status: 'MISMATCH',
+            credited: false,
+            releaseAt: null,
+            merchantNet: null,
+            mismatchCode,
+          };
+        }
+      }
+
+      // 4b. Validate the amount in Toman against the invoice snapshot.
       const paidAmount = Money.toman(evidence.paidAmount);
       if (!paidAmount.equals(expectedTotal)) {
         // SPEC 119.37-119.39: over/underpayment never auto-credits.
@@ -374,13 +453,16 @@ export async function finalizePayment(
           assessment,
         });
 
-        if (assessment.decision === 'REVIEW') {
+        if (assessment.decision === 'REVIEW' || (evidence.matchConfidence !== null && evidence.matchConfidence !== undefined && evidence.matchConfidence < 80) || (evidence.matchFlags && evidence.matchFlags.length > 0)) {
+          const reason = assessment.decision === 'REVIEW'
+            ? `risk score ${assessment.score}: ${assessment.signals.map((s) => s.code).join(', ')}`
+            : `provider match review (confidence: ${evidence.matchConfidence ?? 'unknown'}%, flags: ${(evidence.matchFlags || []).join(', ')})`;
           await placeHold(tx, {
             paymentId,
             merchantId: invoice.merchant_id,
             source: 'RISK',
             sourceId: assessmentId,
-            reason: `risk score ${assessment.score}: ${assessment.signals.map((s) => s.code).join(', ')}`,
+            reason,
           });
         }
       }

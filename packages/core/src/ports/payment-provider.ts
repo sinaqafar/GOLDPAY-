@@ -26,6 +26,10 @@ export interface ProviderPaymentStatus {
   externalPaymentId: string;
   status: 'PAID' | 'FAILED' | 'PENDING' | 'UNKNOWN';
   paidAmount: string | null;
+  paidAmountRial?: string | null;
+  orderId?: string | null;
+  matchConfidence?: number | null;
+  matchFlags?: string[] | null;
   paidAt: string | null;
   /**
    * The fee the provider actually deducted, in TOMAN atomic units, when the

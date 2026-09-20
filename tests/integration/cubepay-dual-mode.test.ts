@@ -537,4 +537,353 @@ describe('CubePay Dual-Mode: VIP & Standard Official Contract Integration', () =
     expect(second.credited).toBe(false);
     expect(second.status).toBe('VERIFIED');
   });
+
+  // 19. Exact Rial verification: snapshot 500,750 Rial + verify 500,750 Rial -> PASS
+  it('19. Exact Rial verification: snapshot 500,750 Rial and verify 500,750 Rial passes', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const standardConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, standardConfig, {
+      merchantId,
+      baseAmount: '50000',
+    });
+
+    const authority = 'auth_exact_rial_500750';
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = $2,
+              provider_pay_amount_toman = '50075',
+              provider_pay_amount_rial = '500750'
+        WHERE id = $1`,
+      [inv.invoiceId, authority],
+    );
+
+    const finRes = await finalizePayment(h.db, standardConfig, {
+      invoiceId: inv.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: authority,
+        paidAmount: '50075',
+        paidAmountRial: '500750',
+        orderId: inv.invoiceId,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: { authority, amount: 500750 },
+      },
+    });
+
+    expect(finRes.status).toBe('VERIFIED');
+    expect(finRes.credited).toBe(true);
+  });
+
+  // 20. Exact Rial verification: snapshot 500,750 Rial + verify 500,751 Rial -> FAIL (AMOUNT_MISMATCH)
+  it('20. Exact Rial verification: snapshot 500,750 Rial and verify 500,751 (+1 Rial) fails with AMOUNT_MISMATCH', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const standardConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, standardConfig, {
+      merchantId,
+      baseAmount: '50000',
+    });
+
+    const authority = 'auth_rial_mismatch_500751';
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = $2,
+              provider_pay_amount_toman = '50075',
+              provider_pay_amount_rial = '500750'
+        WHERE id = $1`,
+      [inv.invoiceId, authority],
+    );
+
+    // 500751 Rials (would divide to 50075 Toman if truncated, but exact Rial must fail closed!)
+    const finRes = await finalizePayment(h.db, standardConfig, {
+      invoiceId: inv.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: authority,
+        paidAmount: '50075',
+        paidAmountRial: '500751',
+        orderId: inv.invoiceId,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: { authority, amount: 500751 },
+      },
+    });
+
+    expect(finRes.status).toBe('MISMATCH');
+    expect(finRes.credited).toBe(false);
+    expect(finRes.mismatchCode).toBe('OVERPAYMENT');
+  });
+
+  // 21. Exact Rial verification: snapshot 500,750 Rial + verify 500,749 Rial -> FAIL (AMOUNT_MISMATCH)
+  it('21. Exact Rial verification: snapshot 500,750 Rial and verify 500,749 (-1 Rial) fails with AMOUNT_MISMATCH', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const standardConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, standardConfig, {
+      merchantId,
+      baseAmount: '50000',
+    });
+
+    const authority = 'auth_rial_mismatch_500749';
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = $2,
+              provider_pay_amount_toman = '50075',
+              provider_pay_amount_rial = '500750'
+        WHERE id = $1`,
+      [inv.invoiceId, authority],
+    );
+
+    const finRes = await finalizePayment(h.db, standardConfig, {
+      invoiceId: inv.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: authority,
+        paidAmount: '50074',
+        paidAmountRial: '500749',
+        orderId: inv.invoiceId,
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: { authority, amount: 500749 },
+      },
+    });
+
+    expect(finRes.status).toBe('MISMATCH');
+    expect(finRes.credited).toBe(false);
+    expect(finRes.mismatchCode).toBe('UNDERPAYMENT');
+  });
+
+  // 22. Callback with odd Rial amount preserves raw Rial and does not truncate silently
+  it('22. Webhook parser preserves exact raw Rial amount without silent division truncation', () => {
+    const standardAdapter = new CubePayStandardAdapter({
+      baseUrl: 'https://cubevps.ir/smspay',
+      apiToken: 'std_test_token_123',
+      webhookSecret: null,
+      timeoutMs: 10000,
+      sandbox: false,
+    });
+
+    const parsed = standardAdapter.parseWebhook({
+      rawBody: JSON.stringify({
+        success: true,
+        status: 'paid',
+        authority: 'auth_odd_rial_999',
+        order_id: 'ORD_ODD_999',
+        amount: 500757, // Odd Rial amount ending in 7
+      }),
+      headers: { 'content-type': 'application/json' },
+    });
+
+    expect(parsed.payment?.paidAmountRial).toBe('500757');
+    expect(parsed.payment?.paidAmount).toBe('50075');
+  });
+
+  // 23. Verify order_id binding mismatch throws VERIFY_ORDER_ID_MISMATCH
+  it('23. Verify order_id mismatch rejects payment with VERIFY_ORDER_ID_MISMATCH', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const standardConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, standardConfig, {
+      merchantId,
+      baseAmount: '50000',
+    });
+
+    await expect(
+      finalizePayment(h.db, standardConfig, {
+        invoiceId: inv.invoiceId,
+        evidence: {
+          provider: 'CUBEPAY',
+          externalPaymentId: 'auth_order_mismatch',
+          paidAmount: inv.customerTotal,
+          orderId: 'DIFFERENT_INVOICE_ID_123', // Does not match inv.invoiceId!
+          status: 'PAID',
+          paidAt: new Date().toISOString(),
+          raw: { order_id: 'DIFFERENT_INVOICE_ID_123' },
+        },
+      }),
+    ).rejects.toThrow(ValidationError);
+  });
+
+  // 24. Low match confidence or abnormal flags places a risk hold
+  it('24. Low match confidence (< 80) or abnormal flags places a risk hold', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const standardConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, standardConfig, {
+      merchantId,
+      baseAmount: '100000',
+    });
+
+    const authority = 'auth_risk_flag_123';
+    const finRes = await finalizePayment(h.db, standardConfig, {
+      invoiceId: inv.invoiceId,
+      evidence: {
+        provider: 'CUBEPAY',
+        externalPaymentId: authority,
+        paidAmount: inv.customerTotal,
+        orderId: inv.invoiceId,
+        matchConfidence: 70, // Below 80!
+        matchFlags: ['SUSPICIOUS_CARD_NAME_MISMATCH'],
+        status: 'PAID',
+        paidAt: new Date().toISOString(),
+        raw: { match_confidence: 70, match_flags: ['SUSPICIOUS_CARD_NAME_MISMATCH'] },
+      },
+    });
+
+    expect(finRes.status).toBe('VERIFIED');
+    expect(finRes.credited).toBe(true);
+
+    // Verify a risk hold was created
+    const holds = await h.db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM finance.payment_holds WHERE payment_id = $1 AND status = 'ACTIVE'`,
+      [finRes.paymentId],
+    );
+    expect(holds.rows[0]?.count).toBe('1');
+  });
+
+  // 25. Missed callback is recovered by independent status polling
+  it('25. Missed callback: independent status polling discovers completed payment and finalizes ledger', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const resolver = new CubePayProviderResolver(loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any));
+    const stdConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, stdConfig, {
+      merchantId,
+      baseAmount: '250000',
+      feeMode: 'MERCHANT', // 15% fee = 37,500 Toman -> merchant net = 212,500 Toman
+    });
+
+    // Create provider invoice in Standard adapter
+    const stdAdapter = resolver.resolveForMode('STANDARD') as CubePayStandardAdapter;
+    const provInv = await stdAdapter.createInvoice({
+      internalInvoiceId: inv.invoiceId,
+      amount: inv.customerTotal,
+      callbackUrl: 'https://gateway.goldpay.ir/v1/webhooks/cubepay',
+    });
+
+    // Save provider snapshot on invoice
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = $2,
+              provider_pay_amount_toman = $3,
+              provider_pay_amount_rial = $4
+        WHERE id = $1`,
+      [inv.invoiceId, provInv.externalInvoiceId, provInv.providerPayAmountToman, provInv.providerPayAmountRial],
+    );
+
+    // Customer completes payment, but webhook is lost/missed!
+    stdAdapter.sandboxMarkPaid(provInv.externalInvoiceId);
+
+    // Run independent status polling
+    const { pollPendingInvoices } = await import('../../packages/core/src/use-cases/poll-pending-invoices.ts');
+    const pollResult = await pollPendingInvoices(h.db, stdConfig, resolver);
+
+    expect(pollResult.polled).toBe(1);
+    expect(pollResult.verified).toBe(1);
+
+    // Verify invoice is marked PAID and ledger credited
+    const invRow = (await h.db.query<{ status: string }>(
+      `SELECT status FROM core.invoices WHERE id = $1`,
+      [inv.invoiceId],
+    )).rows[0]!;
+    expect(invRow.status).toBe('PAID');
+
+    const mBal = await h.db.query<{ pending: string }>(
+      `SELECT b.pending::text FROM finance.balances b
+         JOIN finance.ledger_accounts a ON a.id = b.account_id
+        WHERE a.owner_id = $1`,
+      [merchantId],
+    );
+    expect(mBal.rows[0]?.pending).toBe('212500'); // 250,000 * 85%
+  });
+
+  // 26. Concurrent callback + polling produces exactly ONE ledger credit
+  it('26. Concurrent callback + status polling produces exactly ONE ledger credit', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const resolver = new CubePayProviderResolver(loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any));
+    const stdConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, stdConfig, {
+      merchantId,
+      baseAmount: '100000',
+    });
+
+    const stdAdapter = resolver.resolveForMode('STANDARD') as CubePayStandardAdapter;
+    const provInv = await stdAdapter.createInvoice({
+      internalInvoiceId: inv.invoiceId,
+      amount: inv.customerTotal,
+      callbackUrl: 'https://gateway.goldpay.ir/v1/webhooks/cubepay',
+    });
+
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = $2,
+              provider_pay_amount_toman = $3,
+              provider_pay_amount_rial = $4
+        WHERE id = $1`,
+      [inv.invoiceId, provInv.externalInvoiceId, provInv.providerPayAmountToman, provInv.providerPayAmountRial],
+    );
+
+    stdAdapter.sandboxMarkPaid(provInv.externalInvoiceId);
+
+    // Run callback finalization and polling concurrently
+    const { pollPendingInvoices } = await import('../../packages/core/src/use-cases/poll-pending-invoices.ts');
+    const [finResult, pollResult] = await Promise.all([
+      finalizePayment(h.db, stdConfig, {
+        invoiceId: inv.invoiceId,
+        evidence: {
+          provider: 'CUBEPAY',
+          externalPaymentId: provInv.externalInvoiceId,
+          paidAmount: provInv.providerPayAmountToman!,
+          paidAmountRial: provInv.providerPayAmountRial,
+          orderId: inv.invoiceId,
+          status: 'PAID',
+          paidAt: new Date().toISOString(),
+          raw: {},
+        },
+      }),
+      pollPendingInvoices(h.db, stdConfig, resolver),
+    ]);
+
+    // Exactly one operation should have credited the ledger
+    const journals = await h.db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM finance.journals WHERE description LIKE $1`,
+      [`%payment verified for invoice ${inv.invoiceId}%`],
+    );
+    expect(journals.rows[0]?.count).toBe('1');
+  });
+
+  // 27. Pending invoice until TTL is expired by polling
+  it('27. Pending invoice until TTL is marked EXPIRED by polling', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const resolver = new CubePayProviderResolver(loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any));
+    const stdConfig = loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
+
+    const inv = await createInvoice(h.db, stdConfig, {
+      merchantId,
+      baseAmount: '50000',
+    });
+
+    // Backdate expires_at to 10 minutes ago
+    await h.db.query(
+      `UPDATE core.invoices
+          SET provider_invoice_id = 'auth_expired_123',
+              expires_at = NOW() - INTERVAL '10 minutes'
+        WHERE id = $1`,
+      [inv.invoiceId],
+    );
+
+    const { pollPendingInvoices } = await import('../../packages/core/src/use-cases/poll-pending-invoices.ts');
+    const pollResult = await pollPendingInvoices(h.db, stdConfig, resolver);
+
+    expect(pollResult.expired).toBe(1);
+
+    const invRow = (await h.db.query<{ status: string }>(
+      `SELECT status FROM core.invoices WHERE id = $1`,
+      [inv.invoiceId],
+    )).rows[0]!;
+    expect(invRow.status).toBe('EXPIRED');
+  });
 });

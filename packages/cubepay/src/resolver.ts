@@ -61,6 +61,12 @@ export class CubePayProviderResolver {
   }
 
   /** Resolve adapter matching the immutable snapshot of an existing invoice. */
+  resolveForInvoice(invoice: { provider_mode?: string | null; providerMode?: string | null }): CubePayProviderPort {
+    const mode = invoice.provider_mode ?? invoice.providerMode ?? this.#activeMode;
+    return this.resolveForMode(mode);
+  }
+
+  /** Resolve adapter matching the immutable snapshot of an existing invoice. */
   resolveForMode(mode: CubePayMode | string): CubePayProviderPort {
     const normalized = (mode ?? '').toUpperCase();
     if (normalized === 'VIP') {
