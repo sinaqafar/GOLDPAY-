@@ -30,6 +30,7 @@
     "admin:build": "node apps/admin/build.mjs",
     "admin": "node --experimental-strip-types apps/admin/src/main.ts",
     "diagnose:cubepay": "node --experimental-strip-types packages/cubepay/src/network-diagnostic.ts",
+    "gate:cubepay": "node --experimental-strip-types packages/cubepay/src/compatibility-gate.ts",
     "build:all": "npm run build && node apps/admin/build.mjs"
   },
   "dependencies": {
