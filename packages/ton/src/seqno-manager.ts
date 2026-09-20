@@ -7,15 +7,16 @@
  *    broadcast ONLY IF (confirmed_seqno == S - 1) AND (current_onchain_seqno == S)
  *    AND all predecessors are CONFIRMED without gaps or failures.
  * 3. Strict Confirmation Validation: confirm() validates supplied seqno matches allocated seqno.
- * 4. Crash-after-broadcast Recovery: Reconciles stuck RESERVED/BROADCASTED allocations when
- *    on-chain seqno advances past them, verifying transaction evidence.
+ * 4. Structured Evidence Reconciliation: Reconciles stuck RESERVED/BROADCASTED allocations
+ *    strictly on verified cryptographic/chain evidence (source, seqno, destination, amount, txHash).
+ *    Never assumes success without evidence.
  *
  * Prevents TON Exit Code 33 (msg_seqno != stored_seqno) failures under high concurrency.
  */
 
 import { randomUUID } from 'node:crypto';
 import type { Database, TransactionContext } from '../../database/src/client.ts';
-import { SecurityError } from '../../errors/src/index.ts';
+import { SecurityError, FinancialError } from '../../errors/src/index.ts';
 
 export type DatabaseOrTx = Database | TransactionContext;
 
@@ -25,6 +26,21 @@ export interface SeqnoAllocation {
   treasuryAddress: string;
   allocatedSeqno: number;
   status: 'RESERVED' | 'BROADCASTED' | 'CONFIRMED' | 'EXPIRED' | 'FAILED';
+  transactionHash?: string | null;
+  evidenceJson?: Record<string, unknown> | null;
+}
+
+export interface ChainExecutionEvidence {
+  sourceWallet: string;
+  seqno: number;
+  destination: string;
+  amountAtomic: string | bigint;
+  asset?: string;
+  network?: string;
+  txHash: string;
+  success: boolean;
+  confirmations?: number;
+  observedAt?: Date;
 }
 
 export interface BroadcastGateResult {
@@ -298,6 +314,7 @@ export class TonSeqnoManager {
     treasuryAddress: string,
     payoutId: string,
     suppliedSeqno: number,
+    txHash?: string,
   ): Promise<void> {
     const run = async (tx: TransactionContext | Database) => {
       const allocRow = await tx.query<{
@@ -337,9 +354,10 @@ export class TonSeqnoManager {
       await tx.query(
         `UPDATE finance.payout_seqno_allocations
             SET status = 'CONFIRMED',
-                confirmed_at = NOW()
+                confirmed_at = NOW(),
+                transaction_hash = COALESCE($2, transaction_hash)
           WHERE payout_id = $1`,
-        [payoutId],
+        [payoutId, txHash ?? null],
       );
 
       await tx.query(
@@ -378,6 +396,7 @@ export class TonSeqnoManager {
 
   /**
    * Sync wallet sequence with live on-chain seqno reported by RPC.
+   * Only records observed on-chain seqno; does NOT automatically confirm unverified payouts.
    */
   static async syncOnChain(
     db: DatabaseOrTx,
@@ -391,26 +410,30 @@ export class TonSeqnoManager {
        ON CONFLICT (address) DO UPDATE
           SET current_onchain_seqno = GREATEST(finance.treasury_wallet_sequences.current_onchain_seqno, $2),
               next_allocated_seqno = GREATEST(finance.treasury_wallet_sequences.next_allocated_seqno, $2),
-              confirmed_seqno = GREATEST(finance.treasury_wallet_sequences.confirmed_seqno, $2 - 1),
               updated_at = NOW()`,
       [treasuryAddress, onChainSeqno, onChainSeqno - 1],
     );
   }
 
   /**
-   * Crash-after-broadcast & sequence gap recovery.
+   * Structured Evidence-Based Crash Recovery & Reconciliation.
    *
-   * Scans for stuck RESERVED or BROADCASTED allocations with allocated_seqno < actualOnChainSeqno
-   * (e.g., when a broadcast succeeded but the worker crashed before DB status could update).
-   * Unblocks the chain by reconciling them against on-chain evidence, advancing confirmed_seqno,
-   * and invalidating un-broadcast allocations >= actualOnChainSeqno.
+   * Scans for stuck RESERVED or BROADCASTED allocations with allocated_seqno < actualOnChainSeqno.
+   * Strictly requires positive chain execution evidence to mark a payout CONFIRMED:
+   * - Destination address, amount, seqno, and treasury source wallet MUST match exactly.
+   * - External/unmatched transactions mark allocation FAILED and raise a reconciliation exception.
+   * - Absence of evidence leaves status UNCONFIRMED, keeping subsequent payouts safely blocked.
    */
   static async reconcileSequenceGap(
     db: DatabaseOrTx,
     treasuryAddress: string,
     actualOnChainSeqno: number,
-    evidenceFinder?: (payoutId: string, seqno: number) => Promise<{ confirmed: boolean; txHash?: string }>,
-  ): Promise<{ resolvedCount: number; expiredCount: number }> {
+    evidenceFinder?: (
+      payoutId: string,
+      seqno: number,
+      expected: { destination: string; amountAtomic: string },
+    ) => Promise<ChainExecutionEvidence | null>,
+  ): Promise<{ resolvedCount: number; failedCount: number; expiredCount: number }> {
     const run = async (tx: TransactionContext | Database) => {
       // 1. Find all unconfirmed allocations with seqno < actualOnChainSeqno
       const stuckRes = await tx.query<{
@@ -418,43 +441,96 @@ export class TonSeqnoManager {
         payout_id: string;
         allocated_seqno: number;
         status: string;
+        destination_address: string;
+        gram_amount_atomic: string;
       }>(
-        `SELECT id, payout_id, allocated_seqno, status
-           FROM finance.payout_seqno_allocations
-          WHERE treasury_address = $1
-            AND allocated_seqno < $2
-            AND status IN ('RESERVED', 'BROADCASTED')
-          ORDER BY allocated_seqno ASC
-          FOR UPDATE`,
+        `SELECT a.id, a.payout_id, a.allocated_seqno, a.status,
+                p.destination_address, p.gram_amount_atomic::text
+           FROM finance.payout_seqno_allocations a
+           JOIN finance.payouts p ON p.id = a.payout_id
+          WHERE a.treasury_address = $1
+            AND a.allocated_seqno < $2
+            AND a.status IN ('RESERVED', 'BROADCASTED')
+          ORDER BY a.allocated_seqno ASC
+          FOR UPDATE OF a`,
         [treasuryAddress, actualOnChainSeqno],
       );
 
       let resolvedCount = 0;
+      let failedCount = 0;
+
       for (const stuck of stuckRes.rows) {
-        let confirmed = true;
-        if (evidenceFinder) {
-          const evidence = await evidenceFinder(stuck.payout_id, stuck.allocated_seqno);
-          confirmed = evidence.confirmed;
+        if (!evidenceFinder) {
+          // Invariant: Never assume success without verified chain evidence
+          continue;
         }
 
-        if (confirmed) {
-          // The on-chain seqno progressed past this seqno; mark it CONFIRMED
+        const evidence = await evidenceFinder(stuck.payout_id, stuck.allocated_seqno, {
+          destination: stuck.destination_address,
+          amountAtomic: stuck.gram_amount_atomic,
+        });
+
+        if (!evidence) {
+          // No evidence found: leave unconfirmed
+          continue;
+        }
+
+        const isExactMatch =
+          evidence.sourceWallet === treasuryAddress &&
+          evidence.seqno === stuck.allocated_seqno &&
+          evidence.destination === stuck.destination_address &&
+          BigInt(evidence.amountAtomic) === BigInt(stuck.gram_amount_atomic) &&
+          evidence.success === true;
+
+        if (isExactMatch) {
+          // Positive verified match: promote to CONFIRMED and record immutable evidence
           await tx.query(
             `UPDATE finance.payout_seqno_allocations
                 SET status = 'CONFIRMED',
-                    confirmed_at = NOW()
+                    confirmed_at = NOW(),
+                    transaction_hash = $2,
+                    evidence_json = $3::jsonb
               WHERE id = $1`,
-            [stuck.id],
+            [stuck.id, evidence.txHash, JSON.stringify(evidence)],
           );
+
+          await tx.query(
+            `UPDATE finance.treasury_wallet_sequences
+                SET confirmed_seqno = GREATEST(confirmed_seqno, $2),
+                    updated_at = NOW()
+              WHERE address = $1`,
+            [treasuryAddress, stuck.allocated_seqno],
+          );
+
           resolvedCount++;
         } else {
-          // External transaction consumed this seqno; mark FAILED
+          // External transaction or payload mismatch: mark FAILED and record exception
           await tx.query(
             `UPDATE finance.payout_seqno_allocations
-                SET status = 'FAILED'
+                SET status = 'FAILED',
+                    evidence_json = $2::jsonb
               WHERE id = $1`,
-            [stuck.id],
+            [stuck.id, JSON.stringify({ reason: 'EXTERNAL_OR_MISMATCHED_TX', evidence })],
           );
+
+          await tx.query(
+            `INSERT INTO system.reconciliation_exceptions
+                (id, kind, severity, entity_type, entity_id, details)
+             VALUES ($1, 'STATE_MISMATCH', 'HIGH', 'PAYOUT', $2, $3::jsonb)`,
+            [
+              randomUUID(),
+              stuck.payout_id,
+              JSON.stringify({
+                reason: 'SEQUENCE_COLLISION_EXTERNAL_TX',
+                allocatedSeqno: stuck.allocated_seqno,
+                expectedDestination: stuck.destination_address,
+                expectedAmount: stuck.gram_amount_atomic,
+                evidence,
+              }),
+            ],
+          );
+
+          failedCount++;
         }
       }
 
@@ -463,7 +539,6 @@ export class TonSeqnoManager {
         `UPDATE finance.treasury_wallet_sequences
             SET current_onchain_seqno = $2,
                 next_allocated_seqno = GREATEST(next_allocated_seqno, $2),
-                confirmed_seqno = GREATEST(confirmed_seqno, $2 - 1),
                 updated_at = NOW()
           WHERE address = $1`,
         [treasuryAddress, actualOnChainSeqno],
@@ -479,7 +554,7 @@ export class TonSeqnoManager {
         [treasuryAddress, actualOnChainSeqno],
       );
 
-      return { resolvedCount, expiredCount: expRes.rowCount };
+      return { resolvedCount, failedCount, expiredCount: expRes.rowCount };
     };
 
     if ('transaction' in db && typeof (db as Database).transaction === 'function') {

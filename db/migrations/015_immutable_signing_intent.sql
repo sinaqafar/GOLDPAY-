@@ -3,7 +3,7 @@
 -- Binds sign_request_id strictly to a deterministic intent_hash covering:
 -- (network, asset, key_reference, wallet_id, from_address, destination_address, amount_atomic, seqno, valid_until, send_mode, bounce, comment, unsigned_hash).
 -- Preserves valid_until, seqno, and unsigned_hash identically across logical retries,
--- and adds lease_expires_at to prevent permanent deadlocks on worker crashes.
+-- and adds lease_expires_at and claim_token to prevent deadlocks and stale-worker race conditions.
 
 ALTER TABLE system.signing_requests
     ADD COLUMN IF NOT EXISTS network VARCHAR(32),
@@ -20,7 +20,8 @@ ALTER TABLE system.signing_requests
     ADD COLUMN IF NOT EXISTS comment VARCHAR(128),
     ADD COLUMN IF NOT EXISTS intent_hash VARCHAR(64),
     ADD COLUMN IF NOT EXISTS boc_base64 TEXT,
-    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
+    ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ,
+    ADD COLUMN IF NOT EXISTS claim_token UUID;
 
 -- Update status constraint to support CLAIMED and FAILED_RETRYABLE
 ALTER TABLE system.signing_requests DROP CONSTRAINT IF EXISTS signing_requests_status_check;

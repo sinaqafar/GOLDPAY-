@@ -674,6 +674,7 @@ export async function broadcastPayout(
           gateReason: gate.reason,
           predecessorSeqno: gate.predecessorSeqno,
           treasuryAddress: allocRow.rows[0].treasury_address,
+          expectedSeqno: gate.expectedSeqno,
         };
       }
     }

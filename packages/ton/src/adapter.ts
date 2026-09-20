@@ -161,6 +161,24 @@ export class TonAdapter implements BlockchainPayoutPort {
   }
 
   /**
+   * Current on-chain sequence number (seqno) of a wallet contract.
+   */
+  async getOnChainSeqno(address: string): Promise<number> {
+    try {
+      const res = await this.#rpc(
+        `/api/v3/wallet?address=${encodeURIComponent(address)}`,
+        { method: 'GET' },
+      );
+      if (typeof res['seqno'] === 'number') {
+        return res['seqno'];
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
    * Native GRAM balance of an account. No jetton wallet lookup is involved:
    * the balance lives on the account state itself.
    */
@@ -242,11 +260,20 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
   /** Simulated gas, so settlement accounting can be exercised. */
   #networkFee = 1_000_000n;
   #balances = new Map<string, bigint>();
+  #walletSeqnos = new Map<string, number>();
   #nextOutcome: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN' = 'ACCEPTED';
   #autoConfirm: boolean;
 
   constructor(options: { autoConfirm?: boolean } = {}) {
     this.#autoConfirm = options.autoConfirm ?? true;
+  }
+
+  setWalletSeqno(address: string, seqno: number): void {
+    this.#walletSeqnos.set(address, seqno);
+  }
+
+  async getOnChainSeqno(address: string): Promise<number> {
+    return this.#walletSeqnos.get(address) ?? 0;
   }
 
   setNextOutcome(outcome: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN'): void {

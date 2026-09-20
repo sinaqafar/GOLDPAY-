@@ -61,4 +61,6 @@ export interface BlockchainPayoutPort {
   getBalance(address: string): Promise<bigint>;
   /** Address format validation for the configured network. */
   isValidAddress(address: string, network: string): boolean;
+  /** Current on-chain sequence number (seqno) of a wallet. */
+  getOnChainSeqno?(address: string): Promise<number>;
 }

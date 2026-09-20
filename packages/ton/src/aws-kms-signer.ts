@@ -11,7 +11,8 @@
  *   covering (network, asset, key_reference, wallet_id, from_address, destination_address,
  *   amount_atomic, seqno, valid_until, send_mode, bounce, comment, unsigned_hash).
  * - Guaranteed invariant canonical digest across logical retries.
- * - Atomic DB claim with 30s lease expiration to recover safely from worker crashes.
+ * - Stale-Worker Fencing: Each claim generates a unique claim_token; worker mutations
+ *   require matching claim_token to prevent expired workers from overwriting completed results.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -88,6 +89,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
 
     const comment = `payout:${request.payoutId.slice(0, 8)}`;
     const leaseSeconds = this.#config.signingLeaseSeconds ?? 30;
+    const claimToken = randomUUID();
     let canonical: CanonicalTonSigningPayload;
 
     // 2. Atomic claim and immutable intent verification inside single DB transaction
@@ -109,10 +111,11 @@ export class AwsKmsEd25519Signer implements SignerPort {
           signed_at: Date | null;
           status: string;
           lease_expires_at: Date | null;
+          claim_token: string | null;
         }>(
           `SELECT id, network, asset, from_address, destination_address, amount_atomic,
                   seqno, valid_until, unsigned_hash, intent_hash, signing_reference,
-                  boc_base64, signed_at, status, lease_expires_at
+                  boc_base64, signed_at, status, lease_expires_at, claim_token
              FROM system.signing_requests
             WHERE sign_request_id = $1
               FOR UPDATE`,
@@ -186,16 +189,17 @@ export class AwsKmsEd25519Signer implements SignerPort {
             );
           }
 
-          // Extend lease and proceed to sign with identical invariant payload
+          // Extend lease and acquire fresh fencing claim_token
           await tx.query(
             `UPDATE system.signing_requests
                 SET status = 'CLAIMED',
-                    lease_expires_at = NOW() + ($2 * INTERVAL '1 second')
+                    claim_token = $2,
+                    lease_expires_at = NOW() + ($3 * INTERVAL '1 second')
               WHERE sign_request_id = $1`,
-            [request.signRequestId, leaseSeconds],
+            [request.signRequestId, claimToken, leaseSeconds],
           );
 
-          return { type: 'CLAIMED' as const, canonical: reconstructed };
+          return { type: 'CLAIMED' as const, canonical: reconstructed, claimToken };
         }
 
         // Fresh sign request: allocate seqno and register immutable intent
@@ -240,8 +244,8 @@ export class AwsKmsEd25519Signer implements SignerPort {
               (id, sign_request_id, payout_id, signer_name, key_reference,
                network, asset, from_address, destination_address, amount_atomic,
                seqno, valid_until, wallet_id, send_mode, bounce, comment,
-               unsigned_hash, intent_hash, status, lease_expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'CLAIMED', NOW() + ($19 * INTERVAL '1 second'))`,
+               unsigned_hash, intent_hash, status, claim_token, lease_expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'CLAIMED', $19, NOW() + ($20 * INTERVAL '1 second'))`,
           [
             randomUUID(),
             request.signRequestId,
@@ -261,11 +265,12 @@ export class AwsKmsEd25519Signer implements SignerPort {
             comment,
             freshCanonical.digestHex,
             intentHash,
+            claimToken,
             leaseSeconds,
           ],
         );
 
-        return { type: 'CLAIMED' as const, canonical: freshCanonical };
+        return { type: 'CLAIMED' as const, canonical: freshCanonical, claimToken };
       });
 
       if (claimOutcome.type === 'COMPLETED') {
@@ -316,7 +321,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
       const assembled = assembleSignedTonExternalMessage(canonical, rawSigBuffer);
       const signedAt = new Date();
 
-      // 5. Atomically persist completed signing evidence
+      // 5. Atomically persist completed signing evidence with Fencing Token
       if (this.#db) {
         await this.#db.query(
           `UPDATE system.signing_requests
@@ -325,13 +330,16 @@ export class AwsKmsEd25519Signer implements SignerPort {
                   raw_signature = $2,
                   boc_base64 = $3,
                   signed_at = $4
-            WHERE sign_request_id = $5`,
+            WHERE sign_request_id = $5
+              AND (claim_token = $6 OR claim_token IS NULL)
+              AND status = 'CLAIMED'`,
           [
             assembled.signingReference,
             assembled.signatureHex,
             assembled.bocBase64,
             signedAt,
             request.signRequestId,
+            claimToken,
           ],
         );
       }
@@ -345,9 +353,14 @@ export class AwsKmsEd25519Signer implements SignerPort {
       };
     } catch (err) {
       if (this.#db) {
+        // Fenced failure update: only mark failed if this worker still holds the claim
         await this.#db.query(
-          `UPDATE system.signing_requests SET status = 'FAILED_RETRYABLE' WHERE sign_request_id = $1`,
-          [request.signRequestId],
+          `UPDATE system.signing_requests
+              SET status = 'FAILED_RETRYABLE'
+            WHERE sign_request_id = $1
+              AND claim_token = $2
+              AND status = 'CLAIMED'`,
+          [request.signRequestId, claimToken],
         ).catch(() => undefined);
       }
 

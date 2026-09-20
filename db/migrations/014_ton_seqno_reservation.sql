@@ -19,6 +19,8 @@ CREATE TABLE IF NOT EXISTS finance.payout_seqno_allocations (
     status VARCHAR(32) NOT NULL CHECK (status IN ('RESERVED', 'BROADCASTED', 'CONFIRMED', 'EXPIRED', 'FAILED')),
     allocated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     confirmed_at TIMESTAMPTZ,
+    transaction_hash VARCHAR(128),
+    evidence_json JSONB,
     CONSTRAINT ux_seqno_per_payout UNIQUE (payout_id)
 );
 
