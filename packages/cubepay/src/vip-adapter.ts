@@ -62,9 +62,11 @@ export class CubePayVipAdapter implements CubePayProviderPort {
       };
     }
 
+    const amountToman = BigInt(request.amount).toString();
+
     const body = JSON.stringify({
       order_id: request.internalInvoiceId,
-      amount_toman: Number(request.amount),
+      amount_toman: amountToman,
       callback_url: request.callbackUrl,
       customer_ref: request.description ?? undefined,
     });

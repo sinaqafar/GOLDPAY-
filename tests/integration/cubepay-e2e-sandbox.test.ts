@@ -43,7 +43,7 @@ import { CubePayStandardAdapter } from '../../packages/cubepay/src/standard-adap
 import { SecurityError, ValidationError, NotFoundError } from '../../packages/errors/src/index.ts';
 import { loadConfig } from '../../packages/config/src/index.ts';
 
-describe('CubePay End-to-End Sandbox Gate Validations', () => {
+describe('Internal CubePay Sandbox Simulation Gate Validations', () => {
   let h: Harness;
 
   beforeEach(async () => {
@@ -54,8 +54,8 @@ describe('CubePay End-to-End Sandbox Gate Validations', () => {
     await h.close();
   });
 
-  // 1. Full Real VIP Sandbox Flow
-  it('1. Real VIP E2E: create-order -> status check -> HMAC webhook -> verify -> ledger -> 48h release', async () => {
+  // 1. Full VIP Sandbox Simulation Flow
+  it('1. Internal VIP Sandbox Simulation: create-order -> status check -> HMAC webhook -> verify -> ledger -> 48h release', async () => {
     const { merchantId } = await createMerchant(h.db);
     const vipConfig = loadConfig({ ...h.config.app, CUBEPAY_ACTIVE_MODE: 'VIP' } as any);
     const vipAdapter = new CubePayVipAdapter({
@@ -133,8 +133,8 @@ describe('CubePay End-to-End Sandbox Gate Validations', () => {
     expect(mBalAfter.rows[0]?.available).toBe('1000000');
   });
 
-  // 2. Full Real Standard Sandbox Flow
-  it('2. Real Standard E2E: create-payment -> authority -> callback -> verify -> ledger -> 48h release', async () => {
+  // 2. Full Standard Sandbox Simulation Flow
+  it('2. Internal Standard Sandbox Simulation: create-payment -> authority -> callback -> verify -> ledger -> 48h release', async () => {
     const { merchantId } = await createMerchant(h.db);
     const stdConfig = loadConfig({ ...h.config.app, CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any);
     const stdAdapter = new CubePayStandardAdapter({

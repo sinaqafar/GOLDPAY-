@@ -54,7 +54,7 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
   async createInvoice(request: CreateProviderInvoiceRequest): Promise<ProviderInvoice> {
     if (this.#config.sandbox) {
       const authority = `std_${randomUUID().replace(/-/g, '').slice(0, 32)}`;
-      const amountRial = String(BigInt(request.amount) * 10n);
+      const amountRial = (BigInt(request.amount) * 10n).toString();
       this.#sandbox.set(authority, {
         authority,
         internalInvoiceId: request.internalInvoiceId,
@@ -75,8 +75,8 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
       };
     }
 
-    // Amount in RIALS (1 Toman = 10 Rials)
-    const amountRial = Number(request.amount) * 10;
+    // Amount in RIALS (1 Toman = 10 Rials) via pure BigInt integer arithmetic
+    const amountRial = (BigInt(request.amount) * 10n).toString();
 
     const body = JSON.stringify({
       amount: amountRial,
@@ -101,14 +101,44 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
       );
     }
 
+    // Exact pay_amount validation - STRICTLY NO FALLBACK
+    if (
+      res.pay_amount === undefined ||
+      res.pay_amount === null ||
+      res.pay_amount_toman === undefined ||
+      res.pay_amount_toman === null
+    ) {
+      throw new IntegrationError(
+        'CUBEPAY_STANDARD_INVALID_RESPONSE',
+        'CubePay Standard create response missing required pay_amount or pay_amount_toman',
+        { retryable: false, details: res as unknown as Record<string, unknown> },
+      );
+    }
+
+    let payAmountRial: string;
+    let payAmountToman: string;
+    try {
+      payAmountRial = BigInt(String(res.pay_amount)).toString();
+      payAmountToman = BigInt(String(res.pay_amount_toman)).toString();
+    } catch {
+      throw new IntegrationError(
+        'CUBEPAY_STANDARD_INVALID_RESPONSE',
+        'CubePay Standard returned non-integer pay_amount or pay_amount_toman',
+        { retryable: false, details: res as unknown as Record<string, unknown> },
+      );
+    }
+
+    if (BigInt(payAmountRial) <= 0n || BigInt(payAmountToman) <= 0n) {
+      throw new IntegrationError(
+        'CUBEPAY_STANDARD_INVALID_RESPONSE',
+        'CubePay Standard returned non-positive pay_amount or pay_amount_toman',
+        { retryable: false, details: res as unknown as Record<string, unknown> },
+      );
+    }
+
     const expiresAt = res.expires_at ?? (res.expires_in_minutes
       ? new Date(Date.now() + res.expires_in_minutes * 60_000).toISOString()
       : null);
-
-    const payAmountRial = res.pay_amount ? String(res.pay_amount) : String(amountRial);
-    const payAmountToman = res.pay_amount_toman
-      ? String(res.pay_amount_toman)
-      : String(Math.floor(Number(payAmountRial) / 10));
 
     return {
       externalInvoiceId: res.authority,
@@ -153,10 +183,10 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
 
     const normalizedStatus = normaliseStandardStatus(res.status ?? (res.success ? 'verified' : 'failed'));
 
-    // Convert returned Rials back to Toman (Rials / 10)
+    // Convert returned Rials back to Toman using BigInt integer division (Rials / 10n)
     let paidAmountToman: string | null = null;
-    if (res.amount !== undefined) {
-      paidAmountToman = String(Math.floor(res.amount / 10));
+    if (res.amount !== undefined && res.amount !== null) {
+      paidAmountToman = (BigInt(String(res.amount)) / 10n).toString();
     }
 
     return {
@@ -181,8 +211,14 @@ export class CubePayStandardAdapter implements CubePayProviderPort {
 
     const authority = typeof body['authority'] === 'string' ? body['authority'] : '';
     const orderId = typeof body['order_id'] === 'string' ? body['order_id'] : '';
-    const amountRial = body['amount'];
-    const amountToman = typeof amountRial === 'number' ? String(Math.floor(amountRial / 10)) : null;
+    let amountToman: string | null = null;
+    if (body['amount'] !== undefined && body['amount'] !== null) {
+      try {
+        amountToman = (BigInt(String(body['amount'])) / 10n).toString();
+      } catch {
+        amountToman = null;
+      }
+    }
 
     return {
       externalEventId: authority || `std_evt_${randomUUID()}`,
