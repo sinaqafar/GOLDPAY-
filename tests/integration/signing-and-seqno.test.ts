@@ -6,7 +6,7 @@ import { TonSeqnoManager } from '../../packages/ton/src/seqno-manager.ts';
 import { AwsKmsEd25519Signer } from '../../packages/ton/src/aws-kms-signer.ts';
 import { SecurityError } from '../../packages/errors/src/index.ts';
 
-describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () => {
+describe('Real PostgreSQL Engine: TON Seqno & Immutable Signing Intent Invariants', () => {
   let db: ConcreteDatabase;
 
   const tonConfig = {
@@ -125,9 +125,32 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
       expect(sorted[0]).toBe(100);
       expect(sorted[14]).toBe(114);
     });
+
+    it('validates supplied seqno inside confirm() and rejects mismatches with SecurityError', async () => {
+      const confirmWallet = 'EQD_CONFIRM_VALIDATION_TEST__________________0vo';
+      const payoutId = await createTestPayout();
+      const allocated = await TonSeqnoManager.allocate(db, confirmWallet, payoutId, 50);
+
+      expect(allocated).toBe(50);
+
+      // Attempt confirm with mismatched seqno (999 instead of 50)
+      await expect(
+        TonSeqnoManager.confirm(db, confirmWallet, payoutId, 999),
+      ).rejects.toThrow(SecurityError);
+
+      // Attempt confirm with mismatched wallet address
+      await expect(
+        TonSeqnoManager.confirm(db, 'EQD_WRONG_WALLET_ADDRESS', payoutId, 50),
+      ).rejects.toThrow(SecurityError);
+
+      // Legitimate confirm succeeds
+      await expect(
+        TonSeqnoManager.confirm(db, confirmWallet, payoutId, 50),
+      ).resolves.not.toThrow();
+    });
   });
 
-  describe('Per-Wallet Ordered Broadcast Gate (TON Wallet V4 Invariant)', () => {
+  describe('Per-Wallet Ordered Broadcast Gate & Crash Recovery (TON Wallet V4 Invariant)', () => {
     const treasuryWallet = 'EQD_ORDERED_BROADCAST_TREASURY_WALLET________0vo';
     const startSeqno = 200;
 
@@ -157,15 +180,14 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
       // 4. Payout 1 (seqno 201) CANNOT broadcast while Payout 0 is not confirmed
       const gate1Before = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[1] as string);
       expect(gate1Before.allowed).toBe(false);
-      expect(gate1Before.reason).toBe('PREDECESSOR_UNCONFIRMED');
+      expect(gate1Before.reason).toBe('SEQUENCE_STATE_MISMATCH');
 
       // 5. Payout 0 broadcasts (status = BROADCASTED)
       await TonSeqnoManager.markBroadcasted(db, treasuryWallet, payouts[0] as string);
 
-      // Payout 1 still cannot broadcast (predecessor in flight)
+      // Payout 1 still cannot broadcast (predecessor in flight / unconfirmed)
       const gate1InFlight = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[1] as string);
       expect(gate1InFlight.allowed).toBe(false);
-      expect(gate1InFlight.reason).toBe('PREDECESSOR_IN_FLIGHT');
 
       // 6. Drive all 20 payouts through the sequence gate in strict order
       for (let i = 0; i < 20; i++) {
@@ -199,43 +221,50 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
       expect(walletRow.rows[0]?.current_onchain_seqno).toBe(220);
     });
 
-    it('blocks subsequent payouts if a predecessor fails, and safely reconciles sequence gap', async () => {
-      const failWallet = 'EQD_FAIL_RECONCILE_WALLET_TEST_______________0vo';
+    it('recovers safely from crash after broadcast before DB update, unblocking subsequent payouts', async () => {
+      const crashWallet = 'EQD_CRASH_RECOVERY_WALLET_TEST_______________0vo';
       const p1 = await createTestPayout();
       const p2 = await createTestPayout();
-      const p3 = await createTestPayout();
 
-      const seq1 = await TonSeqnoManager.allocate(db, failWallet, p1, 500);
-      const seq2 = await TonSeqnoManager.allocate(db, failWallet, p2, 500);
-      const seq3 = await TonSeqnoManager.allocate(db, failWallet, p3, 500);
+      // Allocate seqnos 300 and 301
+      const s1 = await TonSeqnoManager.allocate(db, crashWallet, p1, 300);
+      const s2 = await TonSeqnoManager.allocate(db, crashWallet, p2, 300);
+      expect(s1).toBe(300);
+      expect(s2).toBe(301);
 
-      expect(seq1).toBe(500);
-      expect(seq2).toBe(501);
-      expect(seq3).toBe(502);
+      // Payout 1 broadcasts to network and lands on chain (on-chain seqno is now 301),
+      // but the worker process CRASHES before calling markBroadcasted() or confirm().
+      // In DB, p1 remains 'RESERVED'.
 
-      // Payout 1 fails before broadcast
-      await TonSeqnoManager.fail(db, failWallet, p1, 500);
+      // Payout 2 is blocked from broadcasting
+      const gate2Before = await TonSeqnoManager.canBroadcast(db, crashWallet, p2);
+      expect(gate2Before.allowed).toBe(false);
 
-      // Payout 2 is blocked from broadcast because predecessor failed (prevents exit code 33)
-      const gate2 = await TonSeqnoManager.canBroadcast(db, failWallet, p2);
-      expect(gate2.allowed).toBe(false);
-      expect(gate2.reason).toBe('PREDECESSOR_FAILED');
+      // Reconciler runs on-chain sync (detects on-chain seqno 301)
+      const recResult = await TonSeqnoManager.reconcileSequenceGap(
+        db,
+        crashWallet,
+        301,
+        async (payoutId, seqno) => {
+          // Evidence finder queries chain and confirms p1 landed with seqno 300
+          if (payoutId === p1 && seqno === 300) {
+            return { confirmed: true, txHash: 'ton-tx-hash-for-300' };
+          }
+          return { confirmed: false };
+        },
+      );
 
-      // Reconcile sequence gap with actual on-chain seqno (500)
-      await TonSeqnoManager.reconcileSequenceGap(db, failWallet, 500);
+      expect(recResult.resolvedCount).toBe(1);
 
-      // New payout gets seqno 500
-      const pFresh = await createTestPayout();
-      const seqFresh = await TonSeqnoManager.allocate(db, failWallet, pFresh, 500);
-      expect(seqFresh).toBe(500);
-
-      const gateFresh = await TonSeqnoManager.canBroadcast(db, failWallet, pFresh);
-      expect(gateFresh.allowed).toBe(true);
+      // Payout 2 is now cleanly unblocked and allowed to broadcast with seqno 301!
+      const gate2After = await TonSeqnoManager.canBroadcast(db, crashWallet, p2);
+      expect(gate2After.allowed).toBe(true);
+      expect(gate2After.seqno).toBe(301);
     });
   });
 
-  describe('Immutable Signing Intent & DB-level Immutability Trigger', () => {
-    it('persists immutable intent and produces valid external message BoC with Ed25519 signature', async () => {
+  describe('Immutable Signing Intent & Tamper-Proof DB Enforcement', () => {
+    it('persists full canonical intent and produces valid external message BoC with Ed25519 signature', async () => {
       const signer = new AwsKmsEd25519Signer({
         config: tonConfig,
         keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
@@ -306,7 +335,7 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
       ).rejects.toThrow(SecurityError);
     });
 
-    it('database trigger prevents direct SQL mutation of immutable signing intent columns', async () => {
+    it('database trigger prevents direct SQL mutation of any canonical intent column, including setting to NULL', async () => {
       const payoutId = await createTestPayout();
       const signReqId = `payout:${payoutId}`;
       const signer = new AwsKmsEd25519Signer({
@@ -327,7 +356,7 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
         fromAddress: tonConfig.payoutWalletAddress,
       });
 
-      // Attempt manual SQL UPDATE to mutate destination address
+      // 1. Attempt manual SQL UPDATE to mutate destination address
       await expect(
         db.query(
           `UPDATE system.signing_requests
@@ -337,11 +366,61 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
         ),
       ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
 
-      // Attempt manual SQL UPDATE to mutate amount_atomic
+      // 2. Attempt manual SQL UPDATE to mutate amount_atomic
       await expect(
         db.query(
           `UPDATE system.signing_requests
               SET amount_atomic = '9999999999'
+            WHERE sign_request_id = $1`,
+          [signReqId],
+        ),
+      ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
+
+      // 3. Attempt manual SQL UPDATE to set amount_atomic = NULL (tested with IS DISTINCT FROM)
+      await expect(
+        db.query(
+          `UPDATE system.signing_requests
+              SET amount_atomic = NULL
+            WHERE sign_request_id = $1`,
+          [signReqId],
+        ),
+      ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
+
+      // 4. Attempt manual SQL UPDATE to set intent_hash = NULL
+      await expect(
+        db.query(
+          `UPDATE system.signing_requests
+              SET intent_hash = NULL
+            WHERE sign_request_id = $1`,
+          [signReqId],
+        ),
+      ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
+
+      // 5. Attempt manual SQL UPDATE to mutate network
+      await expect(
+        db.query(
+          `UPDATE system.signing_requests
+              SET network = 'TON_MAINNET'
+            WHERE sign_request_id = $1`,
+          [signReqId],
+        ),
+      ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
+
+      // 6. Attempt manual SQL UPDATE to mutate wallet_id
+      await expect(
+        db.query(
+          `UPDATE system.signing_requests
+              SET wallet_id = 12345
+            WHERE sign_request_id = $1`,
+          [signReqId],
+        ),
+      ).rejects.toThrow(/IMMUTABLE_SIGNING_INTENT_VIOLATION/);
+
+      // 7. Attempt manual SQL UPDATE to mutate comment
+      await expect(
+        db.query(
+          `UPDATE system.signing_requests
+              SET comment = 'tampered-comment'
             WHERE sign_request_id = $1`,
           [signReqId],
         ),

@@ -8,11 +8,16 @@
 ALTER TABLE system.signing_requests
     ADD COLUMN IF NOT EXISTS network VARCHAR(32),
     ADD COLUMN IF NOT EXISTS asset VARCHAR(16),
+    ADD COLUMN IF NOT EXISTS key_reference VARCHAR(256),
+    ADD COLUMN IF NOT EXISTS wallet_id INT DEFAULT 698983191,
     ADD COLUMN IF NOT EXISTS from_address VARCHAR(128),
     ADD COLUMN IF NOT EXISTS destination_address VARCHAR(128),
     ADD COLUMN IF NOT EXISTS amount_atomic VARCHAR(64),
     ADD COLUMN IF NOT EXISTS seqno INT,
     ADD COLUMN IF NOT EXISTS valid_until INT,
+    ADD COLUMN IF NOT EXISTS send_mode INT DEFAULT 3,
+    ADD COLUMN IF NOT EXISTS bounce BOOLEAN DEFAULT false,
+    ADD COLUMN IF NOT EXISTS comment VARCHAR(128),
     ADD COLUMN IF NOT EXISTS intent_hash VARCHAR(64),
     ADD COLUMN IF NOT EXISTS boc_base64 TEXT,
     ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ;
@@ -25,20 +30,27 @@ ALTER TABLE system.signing_requests ADD CONSTRAINT signing_requests_status_check
 CREATE INDEX IF NOT EXISTS ix_signing_requests_lease ON system.signing_requests (status, lease_expires_at);
 CREATE INDEX IF NOT EXISTS ix_signing_requests_intent_hash ON system.signing_requests (intent_hash);
 
--- Enforce immutability of intent parameters via trigger
+-- Enforce strict immutability of intent parameters via trigger using IS DISTINCT FROM
 CREATE OR REPLACE FUNCTION system.prevent_signing_intent_mutation()
 RETURNS TRIGGER AS $$
 BEGIN
     IF OLD.intent_hash IS NOT NULL AND (
-        NEW.intent_hash <> OLD.intent_hash OR
-        NEW.from_address <> OLD.from_address OR
-        NEW.destination_address <> OLD.destination_address OR
-        NEW.amount_atomic <> OLD.amount_atomic OR
-        NEW.seqno <> OLD.seqno OR
-        NEW.valid_until <> OLD.valid_until OR
-        NEW.unsigned_hash <> OLD.unsigned_hash
+        NEW.intent_hash IS DISTINCT FROM OLD.intent_hash OR
+        NEW.unsigned_hash IS DISTINCT FROM OLD.unsigned_hash OR
+        NEW.network IS DISTINCT FROM OLD.network OR
+        NEW.asset IS DISTINCT FROM OLD.asset OR
+        NEW.key_reference IS DISTINCT FROM OLD.key_reference OR
+        NEW.wallet_id IS DISTINCT FROM OLD.wallet_id OR
+        NEW.from_address IS DISTINCT FROM OLD.from_address OR
+        NEW.destination_address IS DISTINCT FROM OLD.destination_address OR
+        NEW.amount_atomic IS DISTINCT FROM OLD.amount_atomic OR
+        NEW.seqno IS DISTINCT FROM OLD.seqno OR
+        NEW.valid_until IS DISTINCT FROM OLD.valid_until OR
+        NEW.send_mode IS DISTINCT FROM OLD.send_mode OR
+        NEW.bounce IS DISTINCT FROM OLD.bounce OR
+        NEW.comment IS DISTINCT FROM OLD.comment
     ) THEN
-        RAISE EXCEPTION 'IMMUTABLE_SIGNING_INTENT_VIOLATION: signing request intent parameters cannot be altered once registered';
+        RAISE EXCEPTION 'IMMUTABLE_SIGNING_INTENT_VIOLATION: signing request intent parameters cannot be altered or set to NULL once registered';
     END IF;
     RETURN NEW;
 END;

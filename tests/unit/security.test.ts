@@ -362,8 +362,8 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
                 if (!dbSequences.has(addr)) {
                   dbSequences.set(addr, {
                     current_onchain_seqno: params?.[1],
-                    next_allocated_seqno: params?.[2],
-                    confirmed_seqno: params?.[1],
+                    next_allocated_seqno: params?.[1],
+                    confirmed_seqno: params?.[2],
                   });
                 }
                 return { rowCount: 1 };
@@ -474,8 +474,12 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
                   amount_atomic: params?.[9],
                   seqno: params?.[10],
                   valid_until: params?.[11],
-                  unsigned_hash: params?.[12],
-                  intent_hash: params?.[13],
+                  wallet_id: params?.[12],
+                  send_mode: params?.[13],
+                  bounce: params?.[14],
+                  comment: params?.[15],
+                  unsigned_hash: params?.[16],
+                  intent_hash: params?.[17],
                   created_at: new Date(),
                 });
                 return { rowCount: 1 };

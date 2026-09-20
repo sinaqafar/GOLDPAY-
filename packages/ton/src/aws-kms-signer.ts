@@ -239,8 +239,9 @@ export class AwsKmsEd25519Signer implements SignerPort {
           `INSERT INTO system.signing_requests
               (id, sign_request_id, payout_id, signer_name, key_reference,
                network, asset, from_address, destination_address, amount_atomic,
-               seqno, valid_until, unsigned_hash, intent_hash, status, lease_expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'CLAIMED', NOW() + ($15 * INTERVAL '1 second'))`,
+               seqno, valid_until, wallet_id, send_mode, bounce, comment,
+               unsigned_hash, intent_hash, status, lease_expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, 'CLAIMED', NOW() + ($19 * INTERVAL '1 second'))`,
           [
             randomUUID(),
             request.signRequestId,
@@ -254,6 +255,10 @@ export class AwsKmsEd25519Signer implements SignerPort {
             request.amountAtomic,
             seqno,
             validUntil,
+            this.#walletId,
+            DEFAULT_SEND_MODE,
+            false,
+            comment,
             freshCanonical.digestHex,
             intentHash,
             leaseSeconds,
