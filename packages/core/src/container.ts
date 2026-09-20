@@ -115,7 +115,7 @@ export async function createContainer(
  *
  * Preference order:
  *   1. RateAggregator — GRAM/USD × USD/TOMAN from real market sources. This is
- *      the production path: two independent legs, each with failover.
+ *      the production path: two independent legs, each with quorum and failover.
  *   2. HttpRateProvider — a single pre-computed TOMAN/GRAM endpoint.
  *   3. TestOnlyStaticRateProvider — a fixed number, for tests and local development.
  *
@@ -142,10 +142,19 @@ function buildRateProvider(
         coinId: env['COINPAPRIKA_COIN_ID'] ?? 'ton-the-open-network',
       }),
     ];
+
+    const fallbackFxUrl = env['FX_FALLBACK_URL'];
+    if (config.app.isProduction && !fallbackFxUrl) {
+      throw new ConfigError(
+        'MANDATORY_FX_QUORUM_MISSING',
+        'Production requires at least 2 independent FX sources for USD/TOMAN (FX_USD_TOMAN_URL and FX_FALLBACK_URL)',
+      );
+    }
+
     const fxSources = [
       new TindexFxProvider({ url: fxUrl, apiKey: env['FX_API_KEY'] ?? null }),
-      ...(env['FX_FALLBACK_URL']
-        ? [new GenericFxProvider({ url: env['FX_FALLBACK_URL'], name: 'FX_FALLBACK' })]
+      ...(fallbackFxUrl
+        ? [new GenericFxProvider({ url: fallbackFxUrl, name: 'FX_FALLBACK' })]
         : []),
     ];
 
@@ -157,6 +166,7 @@ function buildRateProvider(
       minTomanPerGram: env['RATE_MIN_TOMAN_PER_GRAM'] ?? '1',
       maxTomanPerGram: env['RATE_MAX_TOMAN_PER_GRAM'] ?? '1000000000',
       maxDeviationPercent: Number(env['RATE_MAX_DEVIATION_PERCENT'] ?? 25),
+      maxCrossSourceDeviationPercent: Number(env['RATE_MAX_CROSS_SOURCE_DEVIATION_PERCENT'] ?? 10),
       // Survives a restart: without a persisted baseline the first quote after
       // a deploy is compared to nothing and any move is accepted.
       ...(db

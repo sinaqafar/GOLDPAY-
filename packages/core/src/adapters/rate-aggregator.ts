@@ -4,12 +4,11 @@
  *
  *     GRAM/USD  ×  USD/TOMAN  =  TOMAN/GRAM
  *
- * When multiple sources are available for a leg:
- * 1. Concurrently queries all sources.
- * 2. Filters out stale, clock-skewed, or malformed observations.
- * 3. Compares sources: if divergence exceeds maxCrossSourceDeviationPercent,
- *    identifies and excludes outliers or flags a RATE_DISCREPANCY.
- * 4. Takes the consensus median value.
+ * Strict Production Quorum Rules:
+ * When multiple sources are configured for a leg (sources.length >= 2):
+ * - valid.length === 0 -> RATE_UNAVAILABLE
+ * - valid.length === 1 -> RATE_DISCREPANCY (minimum quorum of 2 independent sources required)
+ * - valid.length >= 2 -> cross-source divergence check and median consensus.
  *
  * Arithmetic is strictly integer-scaled (10^18 fixed-point). Zero floats.
  */
@@ -50,6 +49,8 @@ export interface RateAggregatorOptions {
   cryptoSources: readonly CryptoMarketProvider[];
   /** FX sources for USD/TOMAN. */
   fxSources: readonly FxProvider[];
+  /** Minimum number of valid concurring sources required for quorum. */
+  minQuorum?: number;
   /** How long a derived quote stays usable. */
   ttlSeconds?: number;
   /** How old an upstream observation may be before it is refused. */
@@ -70,6 +71,7 @@ export interface RateAggregatorOptions {
 export class RateAggregator implements RateProvider {
   #crypto: readonly CryptoMarketProvider[];
   #fx: readonly FxProvider[];
+  #minQuorum?: number;
   #ttlSeconds: number;
   #maxAgeSeconds: number;
   #minScaled: bigint;
@@ -90,6 +92,7 @@ export class RateAggregator implements RateProvider {
     }
     this.#crypto = options.cryptoSources;
     this.#fx = options.fxSources;
+    this.#minQuorum = options.minQuorum;
     this.#ttlSeconds = options.ttlSeconds ?? 60;
     this.#maxAgeSeconds = options.maxObservationAgeSeconds ?? 900;
     this.#minScaled = toScaled(options.minTomanPerGram ?? '1', 'minTomanPerGram');
@@ -154,7 +157,7 @@ export class RateAggregator implements RateProvider {
   }
 
   /**
-   * Concurrently queries all sources for a leg and performs cross-source validation.
+   * Concurrently queries all sources for a leg and performs cross-source validation and quorum enforcement.
    */
   async #resolveLegConsensus(
     sources: readonly { name: string; fetch: () => Promise<MarketObservation> }[],
@@ -189,11 +192,28 @@ export class RateAggregator implements RateProvider {
       }
     }
 
-    if (valid.length === 0) {
-      throw new IntegrationError('RATE_UNAVAILABLE', `no usable ${leg} source`, {
-        retryable: true,
-        details: { leg, failures },
-      });
+    const requiredQuorum = this.#minQuorum ?? (sources.length >= 2 ? 2 : 1);
+
+    if (valid.length < requiredQuorum) {
+      if (valid.length === 0) {
+        throw new IntegrationError('RATE_UNAVAILABLE', `no usable ${leg} source`, {
+          retryable: true,
+          details: { leg, failures },
+        });
+      }
+      throw new IntegrationError(
+        'RATE_DISCREPANCY',
+        `fewer than ${requiredQuorum} independent sources reached consensus on ${leg}; single unverified feed rejected`,
+        {
+          retryable: true,
+          details: {
+            leg,
+            validSource: valid[0]?.source,
+            failures,
+            threshold: this.#maxCrossSourceDeviationPercent,
+          },
+        },
+      );
     }
 
     if (valid.length === 1) {

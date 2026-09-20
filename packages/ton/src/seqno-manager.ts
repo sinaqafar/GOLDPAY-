@@ -58,11 +58,12 @@ export class TonSeqnoManager {
       );
 
       if (!seqRow.rows[0]) {
-        // First allocation must use exact on-chain seqno N, then next will be N + 1
+        // First allocation must use exact on-chain seqno N.
+        // Initialize next_allocated_seqno to N so the first allocation reads N.
         await tx.query(
           `INSERT INTO finance.treasury_wallet_sequences
               (address, current_onchain_seqno, next_allocated_seqno, confirmed_seqno)
-           VALUES ($1, $2, $2 + 1, $2)
+           VALUES ($1, $2, $2, $2)
            ON CONFLICT (address) DO NOTHING`,
           [treasuryAddress, initialOnChainSeqno],
         );
@@ -76,10 +77,8 @@ export class TonSeqnoManager {
         );
       }
 
-      // If existing sequence had next_allocated_seqno, allocate it;
-      // otherwise, allocate initial on-chain seqno N
       const allocated = seqRow.rows[0]?.next_allocated_seqno !== undefined
-        ? seqRow.rows[0].next_allocated_seqno
+        ? Number(seqRow.rows[0].next_allocated_seqno)
         : initialOnChainSeqno;
 
       // 3. Increment sequence counter to allocated + 1
@@ -154,10 +153,10 @@ export class TonSeqnoManager {
     await db.query(
       `INSERT INTO finance.treasury_wallet_sequences
           (address, current_onchain_seqno, next_allocated_seqno, confirmed_seqno)
-       VALUES ($1, $2, $2 + 1, $2)
+       VALUES ($1, $2, $2, $2)
        ON CONFLICT (address) DO UPDATE
           SET current_onchain_seqno = GREATEST(finance.treasury_wallet_sequences.current_onchain_seqno, $2),
-              next_allocated_seqno = GREATEST(finance.treasury_wallet_sequences.next_allocated_seqno, $2 + 1),
+              next_allocated_seqno = GREATEST(finance.treasury_wallet_sequences.next_allocated_seqno, $2),
               confirmed_seqno = GREATEST(finance.treasury_wallet_sequences.confirmed_seqno, $2),
               updated_at = NOW()`,
       [treasuryAddress, onChainSeqno],

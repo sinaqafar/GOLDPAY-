@@ -18,13 +18,16 @@ import {
 } from '../../packages/crypto/src/index.ts';
 import { createHmac } from 'node:crypto';
 import { loadConfig, assertTreasuryManualOnly } from '../../packages/config/src/index.ts';
-import { SecurityError, ConfigError } from '../../packages/errors/src/index.ts';
+import { SecurityError, ConfigError, IntegrationError } from '../../packages/errors/src/index.ts';
 import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/webhooks.ts';
 import { TEST_ENV } from '../helpers/harness.ts';
 import { StubSigner, AwsKmsEd25519Signer } from '../../packages/ton/src/signer.ts';
 import {
   buildCanonicalTonSigningPayload,
   assembleSignedTonExternalMessage,
+  computeTonSigningIntentHash,
+  DEFAULT_WALLET_V4_ID,
+  DEFAULT_SEND_MODE,
 } from '../../packages/ton/src/ton-wallet-message.ts';
 import { TonSeqnoManager } from '../../packages/ton/src/seqno-manager.ts';
 import { keyPairFromSeed, sign, signVerify } from '@ton/crypto';
@@ -359,7 +362,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
                 if (!dbSequences.has(addr)) {
                   dbSequences.set(addr, {
                     current_onchain_seqno: params?.[1],
-                    next_allocated_seqno: params?.[1],
+                    next_allocated_seqno: params?.[2],
                     confirmed_seqno: params?.[1],
                   });
                 }
@@ -391,7 +394,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       };
 
       const wallet = 'EQD__________________________________________0vo';
-      // First allocation starts at on-chain seqno N = 10
+      // First allocation starts at exact on-chain seqno N = 10
       const seq1 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
       const seq2 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-2', 10);
       const seq3 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-3', 10);
@@ -431,6 +434,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       const signed = await signer.sign(request);
       expect(signed.signer).toBe('AWS_KMS_ED25519');
       expect(signed.signingReference).toMatch(/^ton-boc:/);
+      expect(signed.bocBase64).toBeDefined();
       expect(signed.unsignedHash).toBeDefined();
     });
 
@@ -451,12 +455,15 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
                 const signReqId = params?.[1];
                 mockDbRecords.set(signReqId, {
                   status: 'CLAIMED',
-                  from_address: params?.[5],
-                  destination_address: params?.[6],
-                  amount_atomic: params?.[7],
-                  seqno: params?.[8],
-                  valid_until: params?.[9],
-                  unsigned_hash: params?.[10],
+                  network: params?.[5],
+                  asset: params?.[6],
+                  from_address: params?.[7],
+                  destination_address: params?.[8],
+                  amount_atomic: params?.[9],
+                  seqno: params?.[10],
+                  valid_until: params?.[11],
+                  unsigned_hash: params?.[12],
+                  intent_hash: params?.[13],
                   created_at: new Date(),
                 });
                 return { rowCount: 1 };
@@ -468,13 +475,14 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
         },
         query: async (sql: string, params?: any[]) => {
           if (sql.includes('UPDATE system.signing_requests')) {
-            const signReqId = params?.[3];
+            const signReqId = params?.[4];
             const row = mockDbRecords.get(signReqId);
             if (row) {
               row.status = 'COMPLETED';
               row.signing_reference = params?.[0];
               row.raw_signature = params?.[1];
-              row.signed_at = params?.[2];
+              row.boc_base64 = params?.[2];
+              row.signed_at = params?.[3];
             }
             return { rowCount: 1 };
           }
@@ -494,16 +502,22 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
 
       expect(first.signingReference).toBe(second.signingReference);
       expect(first.unsignedHash).toBe(second.unsignedHash);
+      expect(first.bocBase64).toBe(second.bocBase64);
     });
 
-    it('rejects duplicate signRequestId with mismatched payload', async () => {
+    it('rejects duplicate signRequestId with mismatched payload intent', async () => {
       const mockDbRecords = new Map<string, any>();
       mockDbRecords.set(request.signRequestId, {
         status: 'COMPLETED',
+        network: request.network,
+        asset: request.asset,
         from_address: request.fromAddress,
         destination_address: 'UQ_DIFFERENT_DESTINATION',
         amount_atomic: request.amountAtomic,
+        seqno: 10,
+        valid_until: 1800000000,
         unsigned_hash: 'different_hash_from_another_transaction',
+        intent_hash: 'intent_hash_for_other_destination',
         signing_reference: 'ref-1',
         signed_at: new Date(),
       });
@@ -532,7 +546,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
         db: mockDb,
       });
 
-      await expect(signer.sign(request)).rejects.toThrow(/previously registered for a different transaction payload/);
+      await expect(signer.sign(request)).rejects.toThrow(/previously registered with different transaction intent parameters/);
     });
 
     it('handles KMS transient failures with retryable IntegrationError', async () => {
@@ -552,21 +566,41 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     });
   });
 
-  describe('RateAggregator multi-source consensus & outlier filtering', () => {
+  describe('RateAggregator multi-source consensus & quorum enforcement', () => {
     it('calculates median when multiple crypto sources agree within threshold', async () => {
       const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'COINGECKO' });
       const sourceB = new StaticCryptoMarketProvider('1.52', { name: 'COINPAPRIKA' });
-      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+      const fxSourceA = new StaticFxProvider('100000', { name: 'TINDEX' });
+      const fxSourceB = new StaticFxProvider('100500', { name: 'NOBITEX' });
 
       const aggregator = new RateAggregator({
         cryptoSources: [sourceA, sourceB],
-        fxSources: [fxSource],
+        fxSources: [fxSourceA, fxSourceB],
         maxCrossSourceDeviationPercent: 10,
       });
 
       const quote = await aggregator.getQuote();
       expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeCloseTo(1.52, 2);
       expect(quote.source).toContain('COINGECKO+COINPAPRIKA');
+    });
+
+    it('rejects quotes when one source in a 2-source setup fails (strict quorum requirement)', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'COINGECKO' });
+      const failingSourceB = {
+        name: 'COINPAPRIKA',
+        getGramUsd: async () => {
+          throw new Error('503 Service Unavailable');
+        },
+      };
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, failingSourceB],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/fewer than 2 independent sources reached consensus/);
     });
 
     it('rejects quotes when two sources diverge beyond the consensus threshold', async () => {

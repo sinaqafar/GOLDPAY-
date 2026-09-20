@@ -16,6 +16,7 @@ import {
   storeMessage,
   type Cell,
 } from '@ton/core';
+import { createHash } from 'node:crypto';
 import { ValidationError } from '../../errors/src/index.ts';
 
 export interface TonTransferParams {
@@ -40,6 +41,7 @@ export interface CanonicalTonSigningPayload {
   validUntil: number;
   walletId: number;
   sendMode: number;
+  comment?: string;
 }
 
 export interface AssembledSignedTonMessage {
@@ -55,6 +57,45 @@ export const DEFAULT_WALLET_V4_ID = 698983191;
 
 /** Send mode: PAY_GAS_SEPARATELY (1) + IGNORE_ACTION_ERRORS (2) = 3 */
 export const DEFAULT_SEND_MODE = 3;
+
+/**
+ * Deterministically computes the full SHA-256 Intent Hash binding all transaction parameters.
+ */
+export function computeTonSigningIntentHash(params: {
+  signerVersion?: string;
+  network: string;
+  asset: string;
+  keyReference: string;
+  walletId: number;
+  fromAddress: string;
+  destinationAddress: string;
+  amountAtomic: string;
+  seqno: number;
+  validUntil: number;
+  sendMode: number;
+  bounce: boolean;
+  comment: string;
+  unsignedHash: string;
+}): string {
+  const payload = {
+    signerVersion: params.signerVersion ?? '1.0',
+    network: params.network,
+    asset: params.asset,
+    keyReference: params.keyReference,
+    walletId: params.walletId,
+    fromAddress: params.fromAddress,
+    destinationAddress: params.destinationAddress,
+    amountAtomic: params.amountAtomic,
+    seqno: params.seqno,
+    validUntil: params.validUntil,
+    sendMode: params.sendMode,
+    bounce: params.bounce,
+    comment: params.comment,
+    unsignedHash: params.unsignedHash,
+  };
+
+  return createHash('sha256').update(JSON.stringify(payload)).digest('hex');
+}
 
 /**
  * Builds the canonical Cell tree for a TON Wallet V4R2 transfer
@@ -119,6 +160,7 @@ export function buildCanonicalTonSigningPayload(params: TonTransferParams): Cano
     validUntil: params.validUntil,
     walletId,
     sendMode,
+    comment: params.comment,
   };
 }
 
@@ -153,7 +195,8 @@ export function assembleSignedTonExternalMessage(
   const bocBase64 = bocBuffer.toString('base64');
   const bocHex = bocBuffer.toString('hex');
 
-  const signingReference = `ton-boc:${canonical.digestHex.slice(0, 24)}:${signatureHex.slice(0, 16)}`;
+  // Prefix with ton-boc: so downstream TonAdapter can unpack the serialized BoC directly
+  const signingReference = `ton-boc:${bocBase64}`;
 
   return {
     bocBase64,

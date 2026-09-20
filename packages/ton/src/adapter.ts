@@ -7,11 +7,16 @@
  * jetton master, no token contract, no jetton wallet, and network fees are
  * paid in GRAM itself. Amounts are in nanogram (9 decimals).
  *
+ * Official TonCenter v3 external message broadcast:
+ * POST /api/v3/message
+ * Request Body: { "boc": "<base64_serialized_boc>" }
+ * Response: { "@type": "ok", "message_hash": "<hash>" }
+ *
  * SPEC 124.168: NO CHAIN CONFIRMATION -> NO SETTLED.
  * SPEC 124.170: an ambiguous send returns UNKNOWN, never a silent retry.
  *
- * Signing keys are never held here: the adapter talks to a signer reference so
- * the private key can live in a KMS/HSM (SPEC 118.37 — secret_reference only).
+ * Signing keys are never held here: the adapter receives signed BoC from the SignerPort
+ * boundary where KMS/HSM handles key isolation.
  */
 
 import type {
@@ -70,31 +75,38 @@ export class TonAdapter implements BlockchainPayoutPort {
       return { status: 'ACCEPTED', txHash: existing, raw: { deduplicated: true } };
     }
 
+    const boc = request.signedBoc ||
+      (request.signingReference?.startsWith('ton-boc:') ? request.signingReference.slice('ton-boc:'.length) : null);
+
     try {
+      // Official TonCenter API v3 standard broadcast
+      const body = boc
+        ? JSON.stringify({ boc })
+        : JSON.stringify({
+            idempotency_key: request.idempotencyKey,
+            from: this.#config.payoutWalletAddress,
+            to: request.to,
+            value: request.amountAtomic.toString(),
+            asset: this.#config.gramAsset,
+            decimals: this.#config.gramDecimals,
+            send_mode: 'PAY_GAS_SEPARATELY',
+            bounce: false,
+            signer_reference: request.signingReference ?? this.#config.signerReference,
+          });
+
       const res = await this.#rpc('/api/v3/message', {
         method: 'POST',
-        body: JSON.stringify({
-          idempotency_key: request.idempotencyKey,
-          from: this.#config.payoutWalletAddress,
-          to: request.to,
-          // Native value transfer: nanogram carried by the message itself.
-          value: request.amountAtomic.toString(),
-          asset: this.#config.gramAsset,
-          decimals: this.#config.gramDecimals,
-          // The sender pays the network fee out of its own GRAM balance, so the
-          // recipient receives exactly the quoted amount (SPEC 97.117).
-          send_mode: 'PAY_GAS_SEPARATELY',
-          bounce: false,
-          signer_reference: this.#config.signerReference,
-        }),
+        body,
       });
 
       const hash =
-        typeof res['hash'] === 'string'
-          ? res['hash']
-          : typeof res['message_hash'] === 'string'
-            ? res['message_hash']
-            : null;
+        typeof res['message_hash'] === 'string'
+          ? res['message_hash']
+          : typeof res['hash'] === 'string'
+            ? res['hash']
+            : typeof res['result'] === 'string'
+              ? res['result']
+              : null;
 
       if (!hash) {
         // Accepted-but-unidentifiable is indeterminate, not a success.
@@ -170,7 +182,7 @@ export class TonAdapter implements BlockchainPayoutPort {
         `/api/v3/message?idempotency_key=${encodeURIComponent(key)}`,
         { method: 'GET' },
       );
-      const hash = res['hash'];
+      const hash = res['hash'] ?? res['message_hash'];
       return typeof hash === 'string' ? hash : null;
     } catch {
       // A failed lookup must not be read as "not sent".
@@ -264,8 +276,6 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
     if (outcome === 'REJECTED') return { status: 'REJECTED', error: 'SIMULATED_REJECTION' };
 
     const txHash = `tx_${Buffer.from(request.idempotencyKey).toString('hex').slice(0, 48)}`;
-    // An UNKNOWN result still records the send: that is exactly the ambiguity
-    // reconciliation has to resolve.
     this.#sent.set(request.idempotencyKey, {
       txHash,
       to: request.to,

@@ -646,9 +646,10 @@ export async function broadcastPayout(
       destination_network: string;
       merchant_id: string;
       attempt_count: number;
+      signing_reference: string | null;
     }>(
       `SELECT id, status, gram_amount_atomic::text, destination_address,
-              destination_network, merchant_id, attempt_count
+              destination_network, merchant_id, attempt_count, signing_reference
          FROM finance.payouts WHERE id = $1 FOR UPDATE`,
       [payoutId],
     );
@@ -703,11 +704,17 @@ export async function broadcastPayout(
       [payoutId],
     );
 
+    const signedBoc = payout.signing_reference?.startsWith('ton-boc:')
+      ? payout.signing_reference.slice('ton-boc:'.length)
+      : undefined;
+
     return {
       amount: Money.gram(payout.gram_amount_atomic as string),
       destination: payout.destination_address,
       network: payout.destination_network,
       merchantId: payout.merchant_id,
+      signingReference: payout.signing_reference ?? undefined,
+      signedBoc,
     };
   });
 
@@ -720,6 +727,8 @@ export async function broadcastPayout(
       to: prepared.destination,
       amountAtomic: prepared.amount.atomic,
       network: prepared.network,
+      signedBoc: prepared.signedBoc,
+      signingReference: prepared.signingReference,
     });
   } catch (e) {
     // The send may or may not have reached the network: treat as UNKNOWN.
