@@ -27,6 +27,8 @@ export interface CreateInvoiceInput {
   expiresInSeconds?: number;
   /** Provided by the caller; also used for HTTP-level idempotency. */
   invoiceNumber?: string;
+  /** Optional override for provider mode (default comes from config.cubepay.activeMode). */
+  providerMode?: 'VIP' | 'STANDARD';
 }
 
 export interface CreateInvoiceResult {
@@ -37,6 +39,9 @@ export interface CreateInvoiceResult {
   platformFee: string;
   merchantNet: string;
   feeMode: FeeMode;
+  provider: string;
+  providerMode: 'VIP' | 'STANDARD';
+  providerVersion: string;
   status: 'CREATED';
   expiresAt: string | null;
   checkoutPath: string;
@@ -136,6 +141,10 @@ export async function createInvoice(
 
     const invoiceId = randomUUID();
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
+    const provider = 'CUBEPAY';
+    const providerMode = input.providerMode ?? config.cubepay.activeMode ?? 'VIP';
+    const providerVersion = providerMode === 'VIP' ? '2026-09-VIP' : '2026-09-STANDARD';
+    const providerConfigRef = `${provider}_${providerMode}_${config.fees.policyVersion}`;
 
     const inserted = await tx.query<{ id: string }>(
       `INSERT INTO core.invoices (
@@ -145,6 +154,7 @@ export async function createInvoice(
          platform_fee_amount, customer_fee_share, merchant_fee_share,
          customer_total_amount, merchant_net_amount,
          description, customer_reference,
+         provider, provider_mode, provider_version, provider_config_ref,
          status, expires_at
        ) VALUES (
          $1, $2, $3,
@@ -153,7 +163,8 @@ export async function createInvoice(
          $8, $9, $10,
          $11, $12,
          $13, $14,
-         'CREATED', $15
+         $15, $16, $17, $18,
+         'CREATED', $19
        )
        ON CONFLICT (merchant_id, invoice_number) DO NOTHING
        RETURNING id`,
@@ -172,6 +183,10 @@ export async function createInvoice(
         breakdown.merchantNet.toAtomicString(),
         input.description ?? null,
         input.customerReference ?? null,
+        provider,
+        providerMode,
+        providerVersion,
+        providerConfigRef,
         expiresAt.toISOString(),
       ],
     );
@@ -204,6 +219,8 @@ export async function createInvoice(
         base_amount: breakdown.baseAmount.toAtomicString(),
         customer_total: breakdown.customerTotal.toAtomicString(),
         fee_mode: breakdown.feeMode,
+        provider,
+        provider_mode: providerMode,
       },
     });
 
@@ -215,6 +232,9 @@ export async function createInvoice(
       platformFee: breakdown.platformFee.toAtomicString(),
       merchantNet: breakdown.merchantNet.toAtomicString(),
       feeMode: breakdown.feeMode,
+      provider,
+      providerMode,
+      providerVersion,
       status: 'CREATED' as const,
       expiresAt: expiresAt.toISOString(),
       checkoutPath: `/checkout/${invoiceId}`,

@@ -10,7 +10,7 @@ import { createDatabase, type ConcreteDatabase } from '../../database/src/client
 import { migrate } from '../../database/src/migrator.ts';
 import { loadConfig, assertTreasuryManualOnly, type Config } from '../../config/src/index.ts';
 import { ConfigError } from '../../errors/src/index.ts';
-import { CubePayAdapter } from '../../cubepay/src/adapter.ts';
+import { CubePayAdapter, CubePayProviderResolver } from '../../cubepay/src/adapter.ts';
 import { TonAdapter, InMemoryTonAdapter } from '../../ton/src/adapter.ts';
 import { StubSigner, KmsSigner } from '../../ton/src/signer.ts';
 import { TestOnlyStaticRateProvider, HttpRateProvider } from './adapters/rate-provider.ts';
@@ -37,6 +37,7 @@ export interface Container {
   logger: Logger;
   db: ConcreteDatabase;
   provider: PaymentProviderPort;
+  providerResolver: CubePayProviderResolver;
   chain: BlockchainPayoutPort;
   rates: RateProvider;
   signer: SignerPort;
@@ -70,6 +71,7 @@ export async function createContainer(
     }
   }
 
+  const providerResolver = new CubePayProviderResolver(config);
   const provider = new CubePayAdapter(config.cubepay, config.security.hmacWindowSeconds);
 
   const chain: BlockchainPayoutPort = config.ton.mock
@@ -98,6 +100,7 @@ export async function createContainer(
     logger,
     db,
     provider,
+    providerResolver,
     chain,
     rates,
     signer,

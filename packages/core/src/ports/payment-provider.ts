@@ -16,6 +16,10 @@ export interface ProviderInvoice {
   externalInvoiceId: string;
   paymentUrl: string;
   expiresAt: string | null;
+  providerPayAmountRial?: string | null;
+  providerPayAmountToman?: string | null;
+  providerTtlMinutes?: number | null;
+  redirectAfterPayment?: boolean | null;
 }
 
 export interface ProviderPaymentStatus {

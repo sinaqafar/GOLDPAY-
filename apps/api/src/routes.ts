@@ -138,9 +138,26 @@ export function buildRouter(container: Container): Router {
         });
         paymentUrl = providerInvoice.paymentUrl;
         await db.query(
-          `UPDATE core.invoices SET provider_invoice_id = $2, provider_payment_url = $3, updated_at = NOW()
+          `UPDATE core.invoices
+              SET provider_invoice_id = $2,
+                  provider_payment_url = $3,
+                  provider_order_id = $4,
+                  provider_pay_amount_rial = $5,
+                  provider_pay_amount_toman = $6,
+                  provider_ttl_minutes = $7,
+                  redirect_after_payment = $8,
+                  updated_at = NOW()
             WHERE id = $1`,
-          [invoice.invoiceId, providerInvoice.externalInvoiceId, providerInvoice.paymentUrl],
+          [
+            invoice.invoiceId,
+            providerInvoice.externalInvoiceId,
+            providerInvoice.paymentUrl,
+            invoice.invoiceId,
+            providerInvoice.providerPayAmountRial ?? null,
+            providerInvoice.providerPayAmountToman ?? null,
+            providerInvoice.providerTtlMinutes ?? null,
+            providerInvoice.redirectAfterPayment ?? true,
+          ],
         );
       } catch (e) {
         // The invoice exists and is valid; only the checkout link is missing.
@@ -862,11 +879,39 @@ export function buildRouter(container: Container): Router {
   // --- inbound provider callback -------------------------------------------
 
   router.post('/v1/webhooks/cubepay', async (ctx) => {
-    // 1. Verify the signature over the RAW bytes. An invalid signature is
-    //    logged and rejected without touching any business state.
-    const parsed = provider.parseWebhook({ rawBody: ctx.rawBody, headers: ctx.headers });
+    // 1. Extract order_id from rawBody or query params to locate the target invoice
+    let rawJson: Record<string, unknown> = {};
+    try {
+      rawJson = JSON.parse(ctx.rawBody || '{}');
+    } catch {
+      // not JSON
+    }
 
-    // 2. Record the event, deduplicated by the provider's own event id.
+    const orderId =
+      typeof rawJson['order_id'] === 'string'
+        ? rawJson['order_id']
+        : typeof ctx.query.get('order_id') === 'string'
+          ? ctx.query.get('order_id')
+          : null;
+
+    let targetAdapter = provider;
+    let invoiceRecord: { id: string; provider_mode: string } | undefined;
+
+    if (orderId) {
+      const invRes = await db.query<{ id: string; provider_mode: string }>(
+        `SELECT id, provider_mode FROM core.invoices WHERE id::text = $1 OR invoice_number = $1`,
+        [orderId],
+      );
+      invoiceRecord = invRes.rows[0];
+      if (invoiceRecord && container.providerResolver) {
+        targetAdapter = container.providerResolver.resolveForMode(invoiceRecord.provider_mode);
+      }
+    }
+
+    // 2. Verify signature and parse webhook using the invoice's snapshotted provider_mode
+    const parsed = targetAdapter.parseWebhook({ rawBody: ctx.rawBody, headers: ctx.headers });
+
+    // 3. Record the event, deduplicated by the provider's own event id.
     const eventId = randomUUID();
     const stored = await db.query<{ id: string }>(
       `INSERT INTO integration.webhook_events
@@ -877,7 +922,7 @@ export function buildRouter(container: Container): Router {
        RETURNING id`,
       [
         eventId,
-        provider.name,
+        targetAdapter.name,
         parsed.externalEventId,
         parsed.eventType,
         ctx.rawBody || '{}',
@@ -894,11 +939,11 @@ export function buildRouter(container: Container): Router {
       return { status: 200, body: { received: true, ignored: true } };
     }
 
-    // 3. THE critical step (SPEC 1248 / 124.168): never trust the callback's
-    //    amount or status. Ask the provider directly.
+    // 4. THE critical step (SPEC 1248 / 124.168): never trust the callback's
+    //    amount or status. Ask the provider directly via the matched adapter.
     let verified;
     try {
-      verified = await provider.verifyPayment(parsed.payment.externalPaymentId);
+      verified = await targetAdapter.verifyPayment(parsed.payment.externalPaymentId);
     } catch (e) {
       await markWebhookProcessed(eventId, 'FAILED', e instanceof Error ? e.message : String(e));
       // 500 so the provider retries; nothing has been credited.
@@ -907,12 +952,12 @@ export function buildRouter(container: Container): Router {
         : new IntegrationError('PROVIDER_VERIFY_FAILED', 'could not verify the payment', { cause: e });
     }
 
-    // 4. Finalise using only the provider-verified figures.
+    // 5. Finalise using only the provider-verified figures.
     const result = await finalizePayment(db, config, {
-      invoiceId: parsed.internalInvoiceId,
+      invoiceId: invoiceRecord?.id ?? parsed.internalInvoiceId,
       correlationId: eventId,
       evidence: {
-        provider: provider.name,
+        provider: targetAdapter.name,
         externalPaymentId: verified.externalPaymentId,
         paidAmount: verified.paidAmount ?? '0',
         // null when the provider does not report a fee — that is recorded as
@@ -1027,9 +1072,26 @@ export function buildRouter(container: Container): Router {
       });
       paymentUrl = providerInvoice.paymentUrl;
       await db.query(
-        `UPDATE core.invoices SET provider_invoice_id = $2, provider_payment_url = $3, updated_at = NOW()
+        `UPDATE core.invoices
+            SET provider_invoice_id = $2,
+                provider_payment_url = $3,
+                provider_order_id = $4,
+                provider_pay_amount_rial = $5,
+                provider_pay_amount_toman = $6,
+                provider_ttl_minutes = $7,
+                redirect_after_payment = $8,
+                updated_at = NOW()
           WHERE id = $1`,
-        [invoice.invoiceId, providerInvoice.externalInvoiceId, providerInvoice.paymentUrl],
+        [
+          invoice.invoiceId,
+          providerInvoice.externalInvoiceId,
+          providerInvoice.paymentUrl,
+          invoice.invoiceId,
+          providerInvoice.providerPayAmountRial ?? null,
+          providerInvoice.providerPayAmountToman ?? null,
+          providerInvoice.providerTtlMinutes ?? null,
+          providerInvoice.redirectAfterPayment ?? true,
+        ],
       );
     } catch (e) {
       logger.warn('provider.create_invoice_failed', {

@@ -87,7 +87,20 @@ export interface SecurityConfig {
   readonly allowedWebhookSchemes: readonly string[];
 }
 
+export type CubePayMode = 'VIP' | 'STANDARD';
+
+export interface CubePayModeConfig {
+  readonly baseUrl: string;
+  readonly apiToken: string | null;
+  readonly webhookSecret: string | null;
+  readonly timeoutMs: number;
+  readonly sandbox: boolean;
+}
+
 export interface ProviderConfig {
+  readonly activeMode: CubePayMode;
+  readonly vip: CubePayModeConfig;
+  readonly standard: CubePayModeConfig;
   readonly baseUrl: string;
   readonly apiKey: string | null;
   readonly apiSecret: string | null;
@@ -278,6 +291,24 @@ export function loadConfig(env: Env = process.env): Config {
     throw new ConfigError('INVALID_CONFIG', `unknown DEFAULT_FEE_MODE: ${defaultFeeModeRaw}`);
   }
 
+  const rawActiveMode = str(env, 'CUBEPAY_ACTIVE_MODE', 'VIP').trim().toUpperCase();
+  if (rawActiveMode !== 'VIP' && rawActiveMode !== 'STANDARD') {
+    throw new ConfigError(
+      'INVALID_CONFIG',
+      `CUBEPAY_ACTIVE_MODE must be VIP or STANDARD, got "${rawActiveMode}"`,
+    );
+  }
+  const activeMode = rawActiveMode as CubePayMode;
+
+  const vipApiToken = optional(env, 'CUBEPAY_VIP_API_TOKEN') ?? optional(env, 'CUBEPAY_API_KEY');
+  const standardApiToken = optional(env, 'CUBEPAY_STANDARD_API_TOKEN') ?? optional(env, 'CUBEPAY_API_KEY');
+
+  const vipWebhookSecret = optional(env, 'CUBEPAY_VIP_WEBHOOK_SECRET') ?? optional(env, 'CUBEPAY_WEBHOOK_SECRET');
+  const standardWebhookSecret = optional(env, 'CUBEPAY_STANDARD_WEBHOOK_SECRET') ?? optional(env, 'CUBEPAY_WEBHOOK_SECRET');
+
+  const vipBaseUrl = str(env, 'CUBEPAY_VIP_BASE_URL', 'https://cubevps.ir/managed-settlement');
+  const standardBaseUrl = str(env, 'CUBEPAY_STANDARD_BASE_URL', 'https://cubevps.ir/smspay');
+
   const cubepaySandbox = bool(env, 'CUBEPAY_SANDBOX', !isProduction);
   const tonMock = bool(env, 'TON_MOCK', !isProduction);
 
@@ -329,10 +360,25 @@ export function loadConfig(env: Env = process.env): Config {
         .filter(Boolean),
     },
     cubepay: {
-      baseUrl: str(env, 'CUBEPAY_BASE_URL', 'https://api.cubepay.example'),
-      apiKey: optional(env, 'CUBEPAY_API_KEY'),
+      activeMode,
+      vip: {
+        baseUrl: vipBaseUrl,
+        apiToken: vipApiToken,
+        webhookSecret: vipWebhookSecret,
+        timeoutMs: int(env, 'CUBEPAY_TIMEOUT_MS', 15_000),
+        sandbox: cubepaySandbox,
+      },
+      standard: {
+        baseUrl: standardBaseUrl,
+        apiToken: standardApiToken,
+        webhookSecret: standardWebhookSecret,
+        timeoutMs: int(env, 'CUBEPAY_TIMEOUT_MS', 15_000),
+        sandbox: cubepaySandbox,
+      },
+      baseUrl: str(env, 'CUBEPAY_BASE_URL', activeMode === 'VIP' ? vipBaseUrl : standardBaseUrl),
+      apiKey: activeMode === 'VIP' ? vipApiToken : standardApiToken,
       apiSecret: optional(env, 'CUBEPAY_API_SECRET'),
-      webhookSecret: optional(env, 'CUBEPAY_WEBHOOK_SECRET'),
+      webhookSecret: activeMode === 'VIP' ? vipWebhookSecret : standardWebhookSecret,
       timeoutMs: int(env, 'CUBEPAY_TIMEOUT_MS', 15_000),
       sandbox: cubepaySandbox,
     },
@@ -372,8 +418,29 @@ function validateProductionInvariants(config: Config, env: NodeJS.ProcessEnv): v
   if (!config.app.isProduction) return;
 
   const missing: string[] = [];
-  if (!config.cubepay.apiKey) missing.push('CUBEPAY_API_KEY');
-  if (!config.cubepay.webhookSecret) missing.push('CUBEPAY_WEBHOOK_SECRET');
+  const activeToken =
+    config.cubepay.activeMode === 'VIP'
+      ? config.cubepay.vip.apiToken
+      : config.cubepay.standard.apiToken;
+  const activeSecret =
+    config.cubepay.activeMode === 'VIP'
+      ? config.cubepay.vip.webhookSecret
+      : config.cubepay.standard.webhookSecret;
+
+  if (!activeToken && !config.cubepay.apiKey) {
+    missing.push(
+      config.cubepay.activeMode === 'VIP'
+        ? 'CUBEPAY_VIP_API_TOKEN'
+        : 'CUBEPAY_STANDARD_API_TOKEN',
+    );
+  }
+  if (!activeSecret && !config.cubepay.webhookSecret) {
+    missing.push(
+      config.cubepay.activeMode === 'VIP'
+        ? 'CUBEPAY_VIP_WEBHOOK_SECRET'
+        : 'CUBEPAY_STANDARD_WEBHOOK_SECRET',
+    );
+  }
   if (!config.telegram.botToken) missing.push('TELEGRAM_BOT_TOKEN');
   if (!config.treasury.address) missing.push('TREASURY_ADDRESS');
   if (!config.ton.payoutWalletAddress) missing.push('PAYOUT_WALLET_ADDRESS');

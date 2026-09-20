@@ -8,7 +8,7 @@ import { createDatabase, type Database, type ConcreteDatabase } from '../../pack
 import { migrate } from '../../packages/database/src/migrator.ts';
 import { loadConfig, type Config } from '../../packages/config/src/index.ts';
 import { seed } from '../../scripts/seed.ts';
-import { CubePayAdapter } from '../../packages/cubepay/src/adapter.ts';
+import { CubePayAdapter, CubePayProviderResolver } from '../../packages/cubepay/src/adapter.ts';
 import { InMemoryTonAdapter } from '../../packages/ton/src/adapter.ts';
 import { TestOnlyStaticRateProvider } from '../../packages/core/src/adapters/rate-provider.ts';
 import { StubSigner } from '../../packages/ton/src/signer.ts';
@@ -51,6 +51,7 @@ export interface Harness {
   db: ConcreteDatabase;
   config: Config;
   cubepay: CubePayAdapter;
+  cubepayResolver: CubePayProviderResolver;
   chain: InMemoryTonAdapter;
   rates: TestOnlyStaticRateProvider;
   signer: StubSigner;
@@ -69,6 +70,7 @@ export async function createHarness(overrides: Record<string, string> = {}): Pro
     db,
     config,
     cubepay: new CubePayAdapter(config.cubepay),
+    cubepayResolver: new CubePayProviderResolver(config),
     chain: new InMemoryTonAdapter({ autoConfirm: true }),
     // 1 GRAM = 100,000 Toman.
     rates: new TestOnlyStaticRateProvider('100000', { ttlSeconds: 300, source: 'TEST' }),

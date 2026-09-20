@@ -94,11 +94,15 @@ export async function finalizePayment(
         fee_mode: string;
         fee_rate_bps: string;
         fee_policy_version: string;
+        provider_mode?: string | null;
+        provider_pay_amount_toman?: string | null;
+        provider_pay_amount_rial?: string | null;
       }>(
         `SELECT id, merchant_id, status, expires_at,
                 base_amount::text, customer_total_amount::text, platform_fee_amount::text,
                 merchant_net_amount::text, customer_fee_share::text, merchant_fee_share::text,
-                fee_mode, fee_rate_bps::text, fee_policy_version
+                fee_mode, fee_rate_bps::text, fee_policy_version,
+                provider_mode, provider_pay_amount_toman::text, provider_pay_amount_rial::text
            FROM core.invoices WHERE id = $1 FOR UPDATE`,
         [input.invoiceId],
       );
@@ -131,7 +135,10 @@ export async function finalizePayment(
       }
 
       const paymentId = randomUUID();
-      const expectedTotal = Money.toman(invoice.customer_total_amount);
+      // Match against exact provider payable snapshot if offset was applied, else customer total
+      const expectedTotal = invoice.provider_pay_amount_toman
+        ? Money.toman(invoice.provider_pay_amount_toman)
+        : Money.toman(invoice.customer_total_amount);
 
       // 3. Provider status must be conclusive before any credit.
       if (evidence.status !== 'PAID') {
@@ -492,6 +499,7 @@ async function insertPayment(
   params: {
     paymentId: string;
     invoice: { id: string; merchant_id: string; customer_total_amount: string };
+    expectedAmount?: string;
     evidence: ProviderEvidence;
     status: string;
     verifiedAmount: string | null;
@@ -523,7 +531,7 @@ async function insertPayment(
       params.invoice.merchant_id,
       params.evidence.provider,
       params.evidence.externalPaymentId,
-      params.invoice.customer_total_amount,
+      params.expectedAmount ?? params.invoice.customer_total_amount,
       params.verifiedAmount,
       params.status,
       params.verifiedPaidAt,

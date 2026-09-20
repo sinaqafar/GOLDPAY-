@@ -805,4 +805,53 @@ export function registerAdminRoutes(router: Router, container: Container): void 
       },
     };
   });
+
+  // --- CubePay mode management (VIP vs STANDARD) ----------------------------
+
+  router.get('/internal/admin/cubepay/mode', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'admins:manage');
+    const resolver = container.providerResolver;
+    return {
+      status: 200,
+      body: {
+        activeMode: resolver ? resolver.getActiveMode() : container.config.cubepay.activeMode,
+        version: resolver ? resolver.getVersion() : 1,
+      },
+    };
+  });
+
+  router.post('/internal/admin/cubepay/switch-mode', async (ctx) => {
+    const actor = await auth(ctx);
+    assertPermission(actor.role, 'admins:manage');
+    const b = (ctx.body ?? {}) as Record<string, unknown>;
+    const targetMode = String(b['mode'] ?? '').toUpperCase();
+    if (targetMode !== 'VIP' && targetMode !== 'STANDARD') {
+      throw new ValidationError(
+        'INVALID_CUBEPAY_MODE',
+        `Target mode must be VIP or STANDARD, got: ${String(b['mode'])}`,
+      );
+    }
+
+    if (!container.providerResolver) {
+      throw new ValidationError('RESOLVER_UNAVAILABLE', 'CubePay provider resolver is not available');
+    }
+
+    const result = await container.providerResolver.switchMode(targetMode, {
+      actor: actor.adminId,
+      reason: typeof b['reason'] === 'string' ? b['reason'] : undefined,
+      db,
+    });
+
+    return {
+      status: 200,
+      body: {
+        success: true,
+        previousMode: result.previousMode,
+        newMode: result.newMode,
+        version: result.version,
+        switchedAt: result.switchedAt.toISOString(),
+      },
+    };
+  });
 }
