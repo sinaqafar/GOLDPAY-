@@ -20,6 +20,8 @@ export const SYSTEM_ACCOUNTS = {
   PROVIDER_CLEARING_TOMAN: { code: 'PROVIDER_CLEARING_TOMAN', type: 'ASSET', currency: 'TOMAN' },
   /** Platform fee income. */
   PLATFORM_REVENUE_TOMAN: { code: 'PLATFORM_REVENUE_TOMAN', type: 'REVENUE', currency: 'TOMAN' },
+  /** Instant withdrawal fee income (2% fee charged on instant payouts). */
+  INSTANT_WITHDRAWAL_REVENUE_TOMAN: { code: 'INSTANT_WITHDRAWAL_REVENUE_TOMAN', type: 'REVENUE', currency: 'TOMAN' },
   /** Provider costs and other platform expenses. */
   PLATFORM_EXPENSE_TOMAN: { code: 'PLATFORM_EXPENSE_TOMAN', type: 'EXPENSE', currency: 'TOMAN' },
   /** GRAM held in the treasury wallet. */

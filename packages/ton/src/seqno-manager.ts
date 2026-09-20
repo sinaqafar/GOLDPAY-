@@ -406,12 +406,12 @@ export class TonSeqnoManager {
     await db.query(
       `INSERT INTO finance.treasury_wallet_sequences
           (address, current_onchain_seqno, next_allocated_seqno, confirmed_seqno)
-       VALUES ($1, $2, $2, $3)
+       VALUES ($1, $2, $2, -1)
        ON CONFLICT (address) DO UPDATE
           SET current_onchain_seqno = GREATEST(finance.treasury_wallet_sequences.current_onchain_seqno, $2),
               next_allocated_seqno = GREATEST(finance.treasury_wallet_sequences.next_allocated_seqno, $2),
               updated_at = NOW()`,
-      [treasuryAddress, onChainSeqno, onChainSeqno - 1],
+      [treasuryAddress, onChainSeqno],
     );
   }
 
@@ -419,7 +419,7 @@ export class TonSeqnoManager {
    * Structured Evidence-Based Crash Recovery & Reconciliation.
    *
    * Scans for stuck RESERVED or BROADCASTED allocations with allocated_seqno < actualOnChainSeqno.
-   * Strictly requires positive chain execution evidence to mark a payout CONFIRMED:
+   * MANDATORY evidenceFinder: Strictly requires positive chain execution evidence to mark a payout CONFIRMED:
    * - Destination address, amount, seqno, and treasury source wallet MUST match exactly.
    * - External/unmatched transactions mark allocation FAILED and raise a reconciliation exception.
    * - Absence of evidence leaves status UNCONFIRMED, keeping subsequent payouts safely blocked.
@@ -428,7 +428,7 @@ export class TonSeqnoManager {
     db: DatabaseOrTx,
     treasuryAddress: string,
     actualOnChainSeqno: number,
-    evidenceFinder?: (
+    evidenceFinder: (
       payoutId: string,
       seqno: number,
       expected: { destination: string; amountAtomic: string },
@@ -460,11 +460,6 @@ export class TonSeqnoManager {
       let failedCount = 0;
 
       for (const stuck of stuckRes.rows) {
-        if (!evidenceFinder) {
-          // Invariant: Never assume success without verified chain evidence
-          continue;
-        }
-
         const evidence = await evidenceFinder(stuck.payout_id, stuck.allocated_seqno, {
           destination: stuck.destination_address,
           amountAtomic: stuck.gram_amount_atomic,

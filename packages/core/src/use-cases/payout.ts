@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Database, TransactionContext } from '../../../database/src/client.ts';
 import { Money, Rate } from '../../../money/src/index.ts';
-import { post } from '../../../ledger/src/ledger-service.ts';
+import { post, type JournalLine } from '../../../ledger/src/ledger-service.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../../ledger/src/accounts.ts';
 import { enqueue } from '../outbox.ts';
 import { recordTransition, transitionState } from '../transitions.ts';
@@ -39,14 +39,28 @@ import {
 // 1. Queue a payout
 // ---------------------------------------------------------------------------
 
+export interface QueuePayoutOptions {
+  mode?: 'AUTOMATIC' | 'INSTANT';
+  requestedAmountToman?: bigint;
+}
+
 export interface QueuePayoutResult {
   payoutId: string | null;
   amountToman: string | null;
+  grossAmountToman?: string | null;
+  instantFeeToman?: string | null;
+  payoutType?: 'AUTOMATIC' | 'INSTANT';
+  feeType?: 'NONE' | 'INSTANT_WITHDRAWAL_FEE';
   reason?: string;
 }
 
 /**
  * Move a merchant's AVAILABLE liability into SETTLING and create the payout.
+ *
+ * Supports two modes:
+ * - AUTOMATIC (default): 0% withdrawal fee, processed after 48h hold.
+ * - INSTANT: 2% withdrawal fee (INSTANT_WITHDRAWAL_FEE), deducted immediately
+ *   and credited to INSTANT_WITHDRAWAL_REVENUE_TOMAN, net amount moved to SETTLING.
  *
  * The partial unique index `ux_payouts_merchant_in_flight` guarantees a merchant
  * can only have one in-flight payout, which is what closes the double-spend
@@ -56,7 +70,9 @@ export async function queuePayoutForMerchant(
   db: Database,
   config: Config,
   merchantId: string,
+  options: QueuePayoutOptions = {},
 ): Promise<QueuePayoutResult> {
+  const mode = options.mode ?? 'AUTOMATIC';
   return db.transaction(
     async (tx) => {
       const merchantRes = await tx.query<{ id: string; status: string; auto_payout: boolean }>(
@@ -68,7 +84,7 @@ export async function queuePayoutForMerchant(
       if (merchant.status !== 'ACTIVE') {
         return { payoutId: null, amountToman: null, reason: 'MERCHANT_NOT_ACTIVE' };
       }
-      if (!merchant.auto_payout || !config.settlement.autoPayoutEnabled) {
+      if (mode === 'AUTOMATIC' && (!merchant.auto_payout || !config.settlement.autoPayoutEnabled)) {
         return { payoutId: null, amountToman: null, reason: 'AUTO_PAYOUT_DISABLED' };
       }
 
@@ -114,48 +130,64 @@ export async function queuePayoutForMerchant(
       );
       const available = Money.toman(balanceRes.rows[0]?.available ?? '0');
 
-      if (available.atomic < config.settlement.minPayoutToman) {
+      let grossAmount: Money;
+      if (options.requestedAmountToman !== undefined) {
+        if (options.requestedAmountToman > available.atomic) {
+          return { payoutId: null, amountToman: null, reason: 'INSUFFICIENT_AVAILABLE_BALANCE' };
+        }
+        grossAmount = Money.toman(options.requestedAmountToman);
+      } else {
+        grossAmount = available;
+      }
+
+      if (grossAmount.atomic < config.settlement.minPayoutToman) {
         return { payoutId: null, amountToman: null, reason: 'BELOW_MINIMUM' };
       }
+
       // Cap a single payout so one huge settlement cannot drain the treasury.
-      const amount =
-        available.atomic > config.settlement.maxPayoutToman
-          ? Money.toman(config.settlement.maxPayoutToman)
-          : available;
-      assertTomanWithinBounds(amount.atomic, 'payout amount');
+      if (grossAmount.atomic > config.settlement.maxPayoutToman) {
+        grossAmount = Money.toman(config.settlement.maxPayoutToman);
+      }
+      assertTomanWithinBounds(grossAmount.atomic, 'payout gross amount');
+
+      // Calculate instant fee (2% / 200 bps) if INSTANT mode; otherwise 0%
+      let instantFee = Money.zero('TOMAN');
+      let netAmount = grossAmount;
+      let feeType: 'NONE' | 'INSTANT_WITHDRAWAL_FEE' = 'NONE';
+
+      if (mode === 'INSTANT') {
+        // 2% Instant Withdrawal Fee
+        instantFee = grossAmount.mulDiv(2n, 100n, 'FLOOR');
+        netAmount = grossAmount.subtract(instantFee);
+        feeType = 'INSTANT_WITHDRAWAL_FEE';
+      }
+
+      if (!netAmount.isPositive()) {
+        return { payoutId: null, amountToman: null, reason: 'NET_AMOUNT_NON_POSITIVE' };
+      }
 
       const payoutId = randomUUID();
       await tx.query(
         `INSERT INTO finance.payouts
             (id, merchant_id, wallet_id, amount_toman, status,
-             destination_address, destination_network)
-         VALUES ($1,$2,$3,$4,'CREATED',$5,$6)`,
-        [payoutId, merchantId, wallet.id, amount.toAtomicString(), wallet.address, wallet.network],
+             destination_address, destination_network, payout_type, fee_type,
+             gross_amount_toman, withdrawal_fee_toman)
+         VALUES ($1,$2,$3,$4,'CREATED',$5,$6,$7,$8,$9,$10)`,
+        [
+          payoutId,
+          merchantId,
+          wallet.id,
+          netAmount.toAtomicString(),
+          wallet.address,
+          wallet.network,
+          mode,
+          feeType,
+          grossAmount.toAtomicString(),
+          instantFee.toAtomicString(),
+        ],
       );
 
       // Which released payments this payout settles, oldest first.
-      //
-      // The per-payment figure must be scoped to the MERCHANT'S OWN liability
-      // account: a payment journal also touches the provider clearing asset and
-      // platform revenue, and summing those in would net to zero.
-      // Allocate payments up to EXACTLY the payout amount, oldest first.
-      //
-      // Two bugs live here if this is done carelessly:
-      //
-      //  1. Without the running-total cap, every unallocated payment is
-      //     attached regardless of the payout's size, so the items can sum to
-      //     more than the payout itself and the audit trail contradicts the
-      //     ledger.
-      //
-      //  2. Excluding any payment that has EVER appeared in payout_items
-      //     strands money permanently: a failed payout returns the funds to
-      //     AVAILABLE but leaves its rows behind, so the payment is spendable
-      //     in the ledger yet invisible to every future selection. Only items
-      //     belonging to a LIVE payout may exclude a payment.
-      //
-      // A payment larger than the remaining room is left for the next payout
-      // rather than partially attached, so an item always means "this payment
-      // was settled by this payout".
       await tx.query(
         `INSERT INTO finance.payout_items(payout_id, payment_id, amount_toman)
          SELECT $1, payment_id, amount
@@ -186,19 +218,34 @@ export async function queuePayoutForMerchant(
           WHERE running_total <= $4::numeric
           ORDER BY running_total
          ON CONFLICT DO NOTHING`,
-        [payoutId, merchantId, merchantAccount, amount.toAtomicString()],
+        [payoutId, merchantId, merchantAccount, grossAmount.toAtomicString()],
       );
 
-      // AVAILABLE -> SETTLING on the merchant's liability account.
+      // Ledger Journal Posting:
+      // In AUTOMATIC mode: DR merchant (AVAILABLE) amount, CR merchant (SETTLING) amount
+      // In INSTANT mode:
+      //   DR merchant (AVAILABLE) grossAmount
+      //   CR merchant (SETTLING) netAmount
+      //   CR instant fee revenue (AVAILABLE) instantFee (2%)
+      const lines: JournalLine[] = [
+        { accountId: merchantAccount, debit: grossAmount, bucket: 'AVAILABLE' as const },
+        { accountId: merchantAccount, credit: netAmount, bucket: 'SETTLING' as const },
+      ];
+
+      if (mode === 'INSTANT' && instantFee.isPositive()) {
+        const instantFeeAccount = await getSystemAccountId(tx, 'INSTANT_WITHDRAWAL_REVENUE_TOMAN');
+        lines.push({ accountId: instantFeeAccount, credit: instantFee, bucket: 'AVAILABLE' as const });
+      }
+
       const posting = await post(tx, {
         referenceType: 'PAYOUT',
         referenceId: payoutId,
         operationId: `payout:queued:${payoutId}`,
-        description: 'available liability moved to settling',
-        lines: [
-          { accountId: merchantAccount, debit: amount, bucket: 'AVAILABLE' },
-          { accountId: merchantAccount, credit: amount, bucket: 'SETTLING' },
-        ],
+        description:
+          mode === 'INSTANT'
+            ? 'instant withdrawal 2% fee (INSTANT_WITHDRAWAL_FEE) and available liability moved to settling'
+            : 'available liability moved to settling',
+        lines,
       });
       if (!posting.created) {
         throw new FinancialError(ErrorCodes.DUPLICATE_OPERATION, 'payout queue posting already exists');
@@ -211,7 +258,7 @@ export async function queuePayoutForMerchant(
         fromState: 'CREATED',
         toState: 'QUEUED',
         event: 'QUEUE',
-        actorType: 'WORKER',
+        actorType: mode === 'INSTANT' ? 'MERCHANT' : 'WORKER',
       });
 
       await enqueue(tx, {
@@ -221,14 +268,39 @@ export async function queuePayoutForMerchant(
         payload: {
           payout_id: payoutId,
           merchant_id: merchantId,
-          amount_toman: amount.toAtomicString(),
+          amount_toman: netAmount.toAtomicString(),
+          gross_amount_toman: grossAmount.toAtomicString(),
+          instant_fee_toman: instantFee.toAtomicString(),
+          payout_type: mode,
         },
       });
 
-      return { payoutId, amountToman: amount.toAtomicString() };
+      return {
+        payoutId,
+        amountToman: netAmount.toAtomicString(),
+        grossAmountToman: grossAmount.toAtomicString(),
+        instantFeeToman: instantFee.toAtomicString(),
+        payoutType: mode,
+        feeType,
+      };
     },
     { isolation: 'SERIALIZABLE', retries: 3 },
   );
+}
+
+/**
+ * Merchant-initiated Instant Payout with 2% Instant Withdrawal Fee.
+ */
+export async function queueInstantPayoutForMerchant(
+  db: Database,
+  config: Config,
+  merchantId: string,
+  requestedAmountToman?: bigint,
+): Promise<QueuePayoutResult> {
+  return queuePayoutForMerchant(db, config, merchantId, {
+    mode: 'INSTANT',
+    requestedAmountToman,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1135,8 +1207,10 @@ export async function failPayout(
         status: string;
         merchant_id: string;
         amount_toman: string;
+        payout_type: string | null;
+        withdrawal_fee_toman: string | null;
       }>(
-        `SELECT id, status, merchant_id, amount_toman::text
+        `SELECT id, status, merchant_id, amount_toman::text, payout_type, withdrawal_fee_toman::text
            FROM finance.payouts WHERE id = $1 FOR UPDATE`,
         [payoutId],
       );
@@ -1155,17 +1229,29 @@ export async function failPayout(
       }
 
       const amount = Money.toman(payout.amount_toman);
+      const fee = Money.toman(payout.withdrawal_fee_toman ?? '0');
       const merchantAccount = await getOrCreateMerchantAccount(tx, payout.merchant_id);
+
+      const lines: JournalLine[] = [
+        { accountId: merchantAccount, debit: amount, bucket: 'SETTLING' as const },
+        { accountId: merchantAccount, credit: amount, bucket: 'AVAILABLE' as const },
+      ];
+
+      // If an INSTANT payout fails, reverse the instant fee back to the merchant's available balance
+      if (payout.payout_type === 'INSTANT' && fee.isPositive()) {
+        const instantFeeAccount = await getSystemAccountId(tx, 'INSTANT_WITHDRAWAL_REVENUE_TOMAN');
+        lines.push(
+          { accountId: instantFeeAccount, debit: fee, bucket: 'AVAILABLE' as const },
+          { accountId: merchantAccount, credit: fee, bucket: 'AVAILABLE' as const },
+        );
+      }
 
       const posting = await post(tx, {
         referenceType: 'PAYOUT',
         referenceId: payoutId,
         operationId: `payout:failed:${payoutId}`,
         description: `payout failed: ${reason}`,
-        lines: [
-          { accountId: merchantAccount, debit: amount, bucket: 'SETTLING' },
-          { accountId: merchantAccount, credit: amount, bucket: 'AVAILABLE' },
-        ],
+        lines,
       });
       if (!posting.created) return { failed: false };
 

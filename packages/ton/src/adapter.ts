@@ -137,6 +137,37 @@ export class TonAdapter implements BlockchainPayoutPort {
       const success = tx['success'] === true || tx['description'] === 'ok';
       const confirmations = typeof tx['mc_block_seqno'] === 'number' ? 1 : 0;
       if (!success) return { state: 'FAILED', txHash: request.txHash };
+
+      // In TON, if send_mode=3 (IGNORE_ACTION_ERRORS) is used:
+      // The wallet transaction may succeed at top level, but we must verify:
+      // 1. Action phase succeeded (if action_phase present, action_phase.success === true and action_phase.result_code === 0)
+      // 2. Outgoing message exists with matching recipient and amount
+      const actionPhase = tx['action_phase'] as Record<string, unknown> | undefined;
+      if (actionPhase && (actionPhase['success'] === false || actionPhase['result_code'] !== 0)) {
+        return { state: 'FAILED', txHash: request.txHash };
+      }
+
+      const outMsgs = Array.isArray(tx['out_msgs']) ? (tx['out_msgs'] as Record<string, unknown>[]) : [];
+      let outMsg = outMsgs[0];
+      if (request.to && outMsgs.length > 0) {
+        const match = outMsgs.find((m) => m['destination'] === request.to);
+        if (match) outMsg = match;
+      }
+
+      const onChainDest =
+        outMsg && typeof outMsg['destination'] === 'string'
+          ? outMsg['destination']
+          : typeof tx['destination'] === 'string'
+            ? tx['destination']
+            : typeof tx['account'] === 'string'
+              ? tx['account']
+              : undefined;
+
+      const onChainAmount =
+        outMsg && (outMsg['value'] || outMsg['amount'])
+          ? parseAtomic(outMsg['value'] ?? outMsg['amount'])
+          : parseAtomic(tx['amount']);
+
       if (confirmations < this.#config.minConfirmations) {
         return { state: 'PENDING', txHash: request.txHash, confirmations };
       }
@@ -144,13 +175,8 @@ export class TonAdapter implements BlockchainPayoutPort {
         state: 'CONFIRMED',
         txHash: request.txHash,
         confirmations,
-        onChainAmountAtomic: parseAtomic(tx['amount']),
-        onChainDestination:
-          typeof tx['destination'] === 'string'
-            ? tx['destination']
-            : typeof tx['account'] === 'string'
-              ? tx['account']
-              : undefined,
+        onChainAmountAtomic: onChainAmount,
+        onChainDestination: onChainDest,
         networkFeeAtomic: parseAtomic(tx['total_fees'] ?? tx['fee']),
       };
     }
