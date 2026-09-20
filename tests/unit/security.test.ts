@@ -338,11 +338,16 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   describe('TonSeqnoManager sequence reservation', () => {
+<<<<<<< HEAD
     it('allocates strictly monotonic sequence numbers for concurrent payouts', async () => {
+=======
+    it('allocates strictly monotonic sequence numbers starting from current on-chain seqno N', async () => {
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
       const dbSequences = new Map<string, any>();
       const dbAllocations = new Map<string, any>();
 
       const mockDb: any = {
+<<<<<<< HEAD
         query: async (sql: string, params?: any[]) => {
           if (sql.includes('FROM finance.payout_seqno_allocations')) {
             const row = dbAllocations.get(params?.[0]);
@@ -379,15 +384,66 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
             });
             return { rowCount: 1 };
           }
+=======
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string, params?: any[]) => {
+              if (sql.includes('FROM finance.payout_seqno_allocations')) {
+                const row = dbAllocations.get(params?.[0]);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('FROM finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                const row = dbSequences.get(addr);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('INSERT INTO finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                if (!dbSequences.has(addr)) {
+                  dbSequences.set(addr, {
+                    current_onchain_seqno: params?.[1],
+                    next_allocated_seqno: params?.[1],
+                    confirmed_seqno: params?.[1],
+                  });
+                }
+                return { rowCount: 1 };
+              }
+              if (sql.includes('UPDATE finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                const allocated = params?.[1];
+                const row = dbSequences.get(addr);
+                if (row) row.next_allocated_seqno = allocated + 1;
+                return { rowCount: 1 };
+              }
+              if (sql.includes('INSERT INTO finance.payout_seqno_allocations')) {
+                const payoutId = params?.[1];
+                dbAllocations.set(payoutId, {
+                  allocated_seqno: params?.[3],
+                  status: params?.[4],
+                });
+                return { rowCount: 1 };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async (sql: string, params?: any[]) => {
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
           return { rows: [] };
         },
       };
 
       const wallet = 'EQD__________________________________________0vo';
+<<<<<<< HEAD
+=======
+      // First allocation starts at on-chain seqno N = 10
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
       const seq1 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
       const seq2 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-2', 10);
       const seq3 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-3', 10);
 
+<<<<<<< HEAD
       expect(seq1).toBe(11);
       expect(seq2).toBe(12);
       expect(seq3).toBe(13);
@@ -395,6 +451,15 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       // Repeated call for payout-1 returns same seqno
       const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
       expect(seq1Repeat).toBe(11);
+=======
+      expect(seq1).toBe(10);
+      expect(seq2).toBe(11);
+      expect(seq3).toBe(12);
+
+      // Repeated call for payout-1 returns identical allocated seqno (10)
+      const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
+      expect(seq1Repeat).toBe(10);
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
     });
   });
 
@@ -429,6 +494,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     it('persists and returns identical signature evidence on retry with DB idempotency', async () => {
       const mockDbRecords = new Map<string, any>();
       const mockDb: any = {
+<<<<<<< HEAD
         query: async (sql: string, params?: any[]) => {
           if (sql.includes('SELECT')) {
             const row = mockDbRecords.get(params?.[0]);
@@ -443,6 +509,38 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
             });
             return { rowCount: 1 };
           }
+=======
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string, params?: any[]) => {
+              if (sql.includes('SELECT') && sql.includes('finance.payout_seqno_allocations')) {
+                return { rows: [{ allocated_seqno: 10, status: 'RESERVED' }] };
+              }
+              if (sql.includes('SELECT') && sql.includes('system.signing_requests')) {
+                const row = mockDbRecords.get(params?.[0]);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('INSERT INTO system.signing_requests')) {
+                const signReqId = params?.[1];
+                mockDbRecords.set(signReqId, {
+                  status: 'CLAIMED',
+                  from_address: params?.[5],
+                  destination_address: params?.[6],
+                  amount_atomic: params?.[7],
+                  seqno: params?.[8],
+                  valid_until: params?.[9],
+                  unsigned_hash: params?.[10],
+                  created_at: new Date(),
+                });
+                return { rowCount: 1 };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async (sql: string, params?: any[]) => {
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
           if (sql.includes('UPDATE system.signing_requests')) {
             const signReqId = params?.[3];
             const row = mockDbRecords.get(signReqId);
@@ -476,12 +574,19 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       const mockDbRecords = new Map<string, any>();
       mockDbRecords.set(request.signRequestId, {
         status: 'COMPLETED',
+<<<<<<< HEAD
+=======
+        from_address: request.fromAddress,
+        destination_address: 'UQ_DIFFERENT_DESTINATION',
+        amount_atomic: request.amountAtomic,
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
         unsigned_hash: 'different_hash_from_another_transaction',
         signing_reference: 'ref-1',
         signed_at: new Date(),
       });
 
       const mockDb: any = {
+<<<<<<< HEAD
         query: async (sql: string) => {
           if (sql.includes('finance.payout_seqno_allocations') || sql.includes('finance.treasury_wallet_sequences')) {
             return { rows: [{ allocated_seqno: 1, current_onchain_seqno: 1, next_allocated_seqno: 2 }] };
@@ -489,6 +594,20 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
           if (sql.includes('system.signing_requests')) {
             return { rows: [mockDbRecords.get(request.signRequestId)] };
           }
+=======
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string) => {
+              if (sql.includes('system.signing_requests')) {
+                return { rows: [mockDbRecords.get(request.signRequestId)] };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async (sql: string) => {
+>>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
           return { rows: [] };
         },
       };
