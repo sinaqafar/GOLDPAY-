@@ -25,6 +25,7 @@ import type { Config } from '../../../config/src/index.ts';
 import type { RateProvider } from '../ports/rate-provider.ts';
 import type { BlockchainPayoutPort, BroadcastResult } from '../ports/blockchain.ts';
 import type { SignerPort } from '../ports/signer.ts';
+import { TonSeqnoManager } from '../../../ton/src/seqno-manager.ts';
 import { assertGramWithinBounds, assertTomanWithinBounds } from '../limits.ts';
 import {
   PayoutError,
@@ -636,7 +637,7 @@ export async function broadcastPayout(
   db: Database,
   chain: BlockchainPayoutPort,
   payoutId: string,
-): Promise<{ status: 'BROADCASTED' | 'UNKNOWN' | 'FAILED'; txHash?: string }> {
+): Promise<{ status: 'BROADCASTED' | 'UNKNOWN' | 'FAILED' | 'QUEUED_FOR_ORDERED_BROADCAST'; txHash?: string; reason?: string }> {
   const prepared = await db.transaction(async (tx) => {
     const r = await tx.query<{
       id: string;
@@ -658,6 +659,23 @@ export async function broadcastPayout(
     // SPEC 5502 — only a SIGNED payout may be broadcast.
     if (payout.status !== 'SIGNED') {
       throw new PayoutError('PAYOUT_NOT_BROADCASTABLE', `payout is ${payout.status}`);
+    }
+
+    // Sequence Gate check: if this payout has an allocated TON seqno, verify predecessor confirmation
+    const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+      `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+      [payoutId],
+    );
+    if (allocRow.rows[0]) {
+      const gate = await TonSeqnoManager.canBroadcast(tx, allocRow.rows[0].treasury_address, payoutId);
+      if (!gate.allowed) {
+        return {
+          allowed: false as const,
+          gateReason: gate.reason,
+          predecessorSeqno: gate.predecessorSeqno,
+          treasuryAddress: allocRow.rows[0].treasury_address,
+        };
+      }
     }
 
     const reservation = await tx.query<{ id: string; amount_atomic: string }>(
@@ -709,14 +727,23 @@ export async function broadcastPayout(
       : undefined;
 
     return {
+      allowed: true as const,
       amount: Money.gram(payout.gram_amount_atomic as string),
       destination: payout.destination_address,
       network: payout.destination_network,
       merchantId: payout.merchant_id,
       signingReference: payout.signing_reference ?? undefined,
       signedBoc,
+      treasuryAddress: allocRow.rows[0]?.treasury_address,
     };
   });
+
+  if (!prepared.allowed) {
+    return {
+      status: 'QUEUED_FOR_ORDERED_BROADCAST',
+      reason: prepared.gateReason,
+    };
+  }
 
   let result: BroadcastResult;
   try {
@@ -761,6 +788,11 @@ export async function broadcastPayout(
       },
       actorType: 'WORKER',
     });
+
+    if (prepared.treasuryAddress) {
+      await TonSeqnoManager.markBroadcasted(tx, prepared.treasuryAddress, payoutId);
+    }
+
     const raw = JSON.stringify(result.raw ?? {});
     await tx.query(
       `INSERT INTO integration.provider_evidence
@@ -1052,6 +1084,20 @@ export async function settlePayout(
         actorType: 'WORKER',
       });
 
+      // Confirm seqno allocation on TonSeqnoManager
+      const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+        `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+        [payoutId],
+      );
+      if (allocRow.rows[0]) {
+        await TonSeqnoManager.confirm(
+          tx,
+          allocRow.rows[0].treasury_address,
+          payoutId,
+          allocRow.rows[0].allocated_seqno,
+        );
+      }
+
       await enqueue(tx, {
         eventType: 'payout.confirmed',
         aggregateType: 'PAYOUT',
@@ -1148,6 +1194,20 @@ export async function failPayout(
         extraSet: { failure_code: reason.slice(0, 200) },
         actorType: 'WORKER',
       });
+
+      // Mark seqno allocation as FAILED to prevent sequence violation on subsequent payouts
+      const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+        `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+        [payoutId],
+      );
+      if (allocRow.rows[0]) {
+        await TonSeqnoManager.fail(
+          tx,
+          allocRow.rows[0].treasury_address,
+          payoutId,
+          allocRow.rows[0].allocated_seqno,
+        );
+      }
 
       await enqueue(tx, {
         eventType: 'payout.failed',

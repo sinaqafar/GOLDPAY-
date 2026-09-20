@@ -19,8 +19,12 @@ CREATE TABLE IF NOT EXISTS finance.payout_seqno_allocations (
     status VARCHAR(32) NOT NULL CHECK (status IN ('RESERVED', 'BROADCASTED', 'CONFIRMED', 'EXPIRED', 'FAILED')),
     allocated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     confirmed_at TIMESTAMPTZ,
-    CONSTRAINT ux_seqno_per_wallet UNIQUE (treasury_address, allocated_seqno),
     CONSTRAINT ux_seqno_per_payout UNIQUE (payout_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_seqno_allocations_wallet_status ON finance.payout_seqno_allocations (treasury_address, status);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_active_seqno_per_wallet
+    ON finance.payout_seqno_allocations (treasury_address, allocated_seqno)
+    WHERE status IN ('RESERVED', 'BROADCASTED', 'CONFIRMED');
+
+CREATE INDEX IF NOT EXISTS ix_seqno_allocations_wallet_status
+    ON finance.payout_seqno_allocations (treasury_address, status);

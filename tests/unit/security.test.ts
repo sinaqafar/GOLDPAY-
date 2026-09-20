@@ -410,10 +410,15 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   describe('AwsKmsEd25519Signer', () => {
+    let capturedKmsParams: any = null;
     const mockKmsClient = {
-      sign: async (params: { KeyId: string; Message: Uint8Array; SigningAlgorithm: string }) => {
+      sign: async (params: { KeyId: string; Message: Uint8Array; MessageType: string; SigningAlgorithm: string }) => {
+        capturedKmsParams = params;
         if (params.SigningAlgorithm !== 'ED25519_SHA_512') {
           throw new Error(`Invalid KMS algorithm: ${params.SigningAlgorithm}`);
+        }
+        if (params.MessageType !== 'RAW') {
+          throw new Error(`Invalid KMS messageType: ${params.MessageType}`);
         }
         return {
           Signature: new Uint8Array(64).fill(0xab),
@@ -423,7 +428,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       },
     };
 
-    it('signs canonical TON payload with official AWS algorithm ED25519_SHA_512', async () => {
+    it('signs canonical TON payload with official AWS algorithm ED25519_SHA_512 and MessageType RAW', async () => {
       const signer = new AwsKmsEd25519Signer({
         config: tonConfig,
         keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
@@ -436,6 +441,13 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       expect(signed.signingReference).toMatch(/^ton-boc:/);
       expect(signed.bocBase64).toBeDefined();
       expect(signed.unsignedHash).toBeDefined();
+
+      expect(capturedKmsParams).toMatchObject({
+        KeyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        MessageType: 'RAW',
+        SigningAlgorithm: 'ED25519_SHA_512',
+      });
+      expect(capturedKmsParams.Message).toHaveLength(32);
     });
 
     it('persists and returns identical signature evidence on retry with DB idempotency', async () => {

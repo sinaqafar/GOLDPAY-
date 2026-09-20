@@ -87,6 +87,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
     assertSignable(request, this.#config);
 
     const comment = `payout:${request.payoutId.slice(0, 8)}`;
+    const leaseSeconds = this.#config.signingLeaseSeconds ?? 30;
     let canonical: CanonicalTonSigningPayload;
 
     // 2. Atomic claim and immutable intent verification inside single DB transaction
@@ -189,9 +190,9 @@ export class AwsKmsEd25519Signer implements SignerPort {
           await tx.query(
             `UPDATE system.signing_requests
                 SET status = 'CLAIMED',
-                    lease_expires_at = NOW() + INTERVAL '30 seconds'
+                    lease_expires_at = NOW() + ($2 * INTERVAL '1 second')
               WHERE sign_request_id = $1`,
-            [request.signRequestId],
+            [request.signRequestId, leaseSeconds],
           );
 
           return { type: 'CLAIMED' as const, canonical: reconstructed };
@@ -239,7 +240,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
               (id, sign_request_id, payout_id, signer_name, key_reference,
                network, asset, from_address, destination_address, amount_atomic,
                seqno, valid_until, unsigned_hash, intent_hash, status, lease_expires_at)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'CLAIMED', NOW() + INTERVAL '30 seconds')`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, 'CLAIMED', NOW() + ($15 * INTERVAL '1 second'))`,
           [
             randomUUID(),
             request.signRequestId,
@@ -255,6 +256,7 @@ export class AwsKmsEd25519Signer implements SignerPort {
             validUntil,
             freshCanonical.digestHex,
             intentHash,
+            leaseSeconds,
           ],
         );
 

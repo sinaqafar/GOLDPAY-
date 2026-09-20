@@ -115,10 +115,12 @@ export interface TonConfig {
   /** Hot wallet that payouts are sent from. */
   readonly payoutWalletAddress: string | null;
   /**
-   * Opaque handle to the signing key held by a KMS/HSM.
+   * Opaque handle to the signing key held by a KMS/HSM (e.g. AWS KMS ECC_NIST_EDWARDS25519).
    * SPEC 118.37: never the key material itself.
    */
   readonly signerReference: string | null;
+  /** Signing lease timeout in seconds for distributed workers. */
+  readonly signingLeaseSeconds?: number;
   /** When true, no real chain call is ever made. */
   readonly mock: boolean;
 }
@@ -348,6 +350,7 @@ export function loadConfig(env: Env = process.env): Config {
       gramDecimals: treasury.gramDecimals,
       payoutWalletAddress: optional(env, 'PAYOUT_WALLET_ADDRESS'),
       signerReference: optional(env, 'TON_SIGNER_REFERENCE'),
+      signingLeaseSeconds: int(env, 'SIGNING_LEASE_SECONDS', 30),
       mock: tonMock,
     },
     telegram: {

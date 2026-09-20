@@ -19,6 +19,7 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
     gramDecimals: 9,
     payoutWalletAddress: 'EQD__________________________________________0vo',
     signerReference: 'kms://test/key-1',
+    signingLeaseSeconds: 30,
     mock: true,
   } as const;
 
@@ -123,6 +124,113 @@ describe('Real PostgreSQL: TON Seqno & Immutable Signing Intent Invariants', () 
       const sorted = [...allocations].sort((a, b) => a - b);
       expect(sorted[0]).toBe(100);
       expect(sorted[14]).toBe(114);
+    });
+  });
+
+  describe('Per-Wallet Ordered Broadcast Gate (TON Wallet V4 Invariant)', () => {
+    const treasuryWallet = 'EQD_ORDERED_BROADCAST_TREASURY_WALLET________0vo';
+    const startSeqno = 200;
+
+    it('enforces strictly ordered broadcast and prevents out-of-order broadcast for 20 concurrent payouts', async () => {
+      // 1. Create 20 concurrent payouts
+      const payouts = await Promise.all(
+        Array.from({ length: 20 }, () => createTestPayout()),
+      );
+
+      // 2. Concurrently allocate sequence numbers
+      const allocations = await Promise.all(
+        payouts.map((payoutId) =>
+          TonSeqnoManager.allocate(db, treasuryWallet, payoutId, startSeqno),
+        ),
+      );
+
+      expect(allocations).toHaveLength(20);
+      for (let i = 0; i < 20; i++) {
+        expect(allocations[i]).toBe(startSeqno + i);
+      }
+
+      // 3. Payout 0 (seqno 200) is allowed to broadcast immediately
+      const gate0 = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[0] as string);
+      expect(gate0.allowed).toBe(true);
+      expect(gate0.seqno).toBe(200);
+
+      // 4. Payout 1 (seqno 201) CANNOT broadcast while Payout 0 is not confirmed
+      const gate1Before = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[1] as string);
+      expect(gate1Before.allowed).toBe(false);
+      expect(gate1Before.reason).toBe('PREDECESSOR_UNCONFIRMED');
+
+      // 5. Payout 0 broadcasts (status = BROADCASTED)
+      await TonSeqnoManager.markBroadcasted(db, treasuryWallet, payouts[0] as string);
+
+      // Payout 1 still cannot broadcast (predecessor in flight)
+      const gate1InFlight = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[1] as string);
+      expect(gate1InFlight.allowed).toBe(false);
+      expect(gate1InFlight.reason).toBe('PREDECESSOR_IN_FLIGHT');
+
+      // 6. Drive all 20 payouts through the sequence gate in strict order
+      for (let i = 0; i < 20; i++) {
+        const pId = payouts[i] as string;
+        const expectedSeqno = startSeqno + i;
+
+        // Current payout must now be allowed to broadcast
+        const gate = await TonSeqnoManager.canBroadcast(db, treasuryWallet, pId);
+        expect(gate.allowed).toBe(true);
+        expect(gate.seqno).toBe(expectedSeqno);
+
+        // Mark broadcasted
+        await TonSeqnoManager.markBroadcasted(db, treasuryWallet, pId);
+
+        // Next payout must NOT be allowed to broadcast while this is in flight
+        if (i + 1 < 20) {
+          const nextGate = await TonSeqnoManager.canBroadcast(db, treasuryWallet, payouts[i + 1] as string);
+          expect(nextGate.allowed).toBe(false);
+        }
+
+        // Confirm this payout on chain
+        await TonSeqnoManager.confirm(db, treasuryWallet, pId, expectedSeqno);
+      }
+
+      // Verify wallet on-chain seqno is advanced to 220
+      const walletRow = await db.query<{ current_onchain_seqno: number; confirmed_seqno: number }>(
+        `SELECT current_onchain_seqno, confirmed_seqno FROM finance.treasury_wallet_sequences WHERE address = $1`,
+        [treasuryWallet],
+      );
+      expect(walletRow.rows[0]?.confirmed_seqno).toBe(219);
+      expect(walletRow.rows[0]?.current_onchain_seqno).toBe(220);
+    });
+
+    it('blocks subsequent payouts if a predecessor fails, and safely reconciles sequence gap', async () => {
+      const failWallet = 'EQD_FAIL_RECONCILE_WALLET_TEST_______________0vo';
+      const p1 = await createTestPayout();
+      const p2 = await createTestPayout();
+      const p3 = await createTestPayout();
+
+      const seq1 = await TonSeqnoManager.allocate(db, failWallet, p1, 500);
+      const seq2 = await TonSeqnoManager.allocate(db, failWallet, p2, 500);
+      const seq3 = await TonSeqnoManager.allocate(db, failWallet, p3, 500);
+
+      expect(seq1).toBe(500);
+      expect(seq2).toBe(501);
+      expect(seq3).toBe(502);
+
+      // Payout 1 fails before broadcast
+      await TonSeqnoManager.fail(db, failWallet, p1, 500);
+
+      // Payout 2 is blocked from broadcast because predecessor failed (prevents exit code 33)
+      const gate2 = await TonSeqnoManager.canBroadcast(db, failWallet, p2);
+      expect(gate2.allowed).toBe(false);
+      expect(gate2.reason).toBe('PREDECESSOR_FAILED');
+
+      // Reconcile sequence gap with actual on-chain seqno (500)
+      await TonSeqnoManager.reconcileSequenceGap(db, failWallet, 500);
+
+      // New payout gets seqno 500
+      const pFresh = await createTestPayout();
+      const seqFresh = await TonSeqnoManager.allocate(db, failWallet, pFresh, 500);
+      expect(seqFresh).toBe(500);
+
+      const gateFresh = await TonSeqnoManager.canBroadcast(db, failWallet, pFresh);
+      expect(gateFresh.allowed).toBe(true);
     });
   });
 
