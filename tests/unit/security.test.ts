@@ -268,7 +268,6 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   it('never produces a second signature for the same request id', async () => {
-    // Otherwise a retry could authorise the same funds twice.
     const signer = new StubSigner(tonConfig);
     await signer.sign(request);
     await expect(signer.sign(request)).rejects.toThrow(/already produced a signature/);
@@ -338,53 +337,11 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   describe('TonSeqnoManager sequence reservation', () => {
-<<<<<<< HEAD
-    it('allocates strictly monotonic sequence numbers for concurrent payouts', async () => {
-=======
     it('allocates strictly monotonic sequence numbers starting from current on-chain seqno N', async () => {
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
       const dbSequences = new Map<string, any>();
       const dbAllocations = new Map<string, any>();
 
       const mockDb: any = {
-<<<<<<< HEAD
-        query: async (sql: string, params?: any[]) => {
-          if (sql.includes('FROM finance.payout_seqno_allocations')) {
-            const row = dbAllocations.get(params?.[0]);
-            return { rows: row ? [row] : [] };
-          }
-          if (sql.includes('FROM finance.treasury_wallet_sequences')) {
-            const addr = params?.[0];
-            const row = dbSequences.get(addr);
-            return { rows: row ? [row] : [] };
-          }
-          if (sql.includes('INSERT INTO finance.treasury_wallet_sequences')) {
-            const addr = params?.[0];
-            if (!dbSequences.has(addr)) {
-              dbSequences.set(addr, {
-                current_onchain_seqno: params?.[1],
-                next_allocated_seqno: params?.[2],
-                confirmed_seqno: params?.[1],
-              });
-            }
-            return { rowCount: 1 };
-          }
-          if (sql.includes('UPDATE finance.treasury_wallet_sequences')) {
-            const addr = params?.[0];
-            const nextSeq = params?.[1];
-            const row = dbSequences.get(addr);
-            if (row) row.next_allocated_seqno = nextSeq + 1;
-            return { rowCount: 1 };
-          }
-          if (sql.includes('INSERT INTO finance.payout_seqno_allocations')) {
-            const payoutId = params?.[1];
-            dbAllocations.set(payoutId, {
-              allocated_seqno: params?.[3],
-              status: params?.[4],
-            });
-            return { rowCount: 1 };
-          }
-=======
         transaction: async (fn: any) => {
           const tx = {
             query: async (sql: string, params?: any[]) => {
@@ -428,30 +385,17 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
           };
           return fn(tx);
         },
-        query: async (sql: string, params?: any[]) => {
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
+        query: async () => {
           return { rows: [] };
         },
       };
 
       const wallet = 'EQD__________________________________________0vo';
-<<<<<<< HEAD
-=======
       // First allocation starts at on-chain seqno N = 10
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
       const seq1 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
       const seq2 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-2', 10);
       const seq3 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-3', 10);
 
-<<<<<<< HEAD
-      expect(seq1).toBe(11);
-      expect(seq2).toBe(12);
-      expect(seq3).toBe(13);
-
-      // Repeated call for payout-1 returns same seqno
-      const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
-      expect(seq1Repeat).toBe(11);
-=======
       expect(seq1).toBe(10);
       expect(seq2).toBe(11);
       expect(seq3).toBe(12);
@@ -459,7 +403,6 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       // Repeated call for payout-1 returns identical allocated seqno (10)
       const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
       expect(seq1Repeat).toBe(10);
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
     });
   });
 
@@ -494,22 +437,6 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     it('persists and returns identical signature evidence on retry with DB idempotency', async () => {
       const mockDbRecords = new Map<string, any>();
       const mockDb: any = {
-<<<<<<< HEAD
-        query: async (sql: string, params?: any[]) => {
-          if (sql.includes('SELECT')) {
-            const row = mockDbRecords.get(params?.[0]);
-            return { rows: row ? [row] : [] };
-          }
-          if (sql.includes('INSERT INTO system.signing_requests')) {
-            const signReqId = params?.[1];
-            mockDbRecords.set(signReqId, {
-              status: 'PENDING',
-              unsigned_hash: params?.[5],
-              created_at: new Date(),
-            });
-            return { rowCount: 1 };
-          }
-=======
         transaction: async (fn: any) => {
           const tx = {
             query: async (sql: string, params?: any[]) => {
@@ -540,7 +467,6 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
           return fn(tx);
         },
         query: async (sql: string, params?: any[]) => {
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
           if (sql.includes('UPDATE system.signing_requests')) {
             const signReqId = params?.[3];
             const row = mockDbRecords.get(signReqId);
@@ -574,27 +500,15 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       const mockDbRecords = new Map<string, any>();
       mockDbRecords.set(request.signRequestId, {
         status: 'COMPLETED',
-<<<<<<< HEAD
-=======
         from_address: request.fromAddress,
         destination_address: 'UQ_DIFFERENT_DESTINATION',
         amount_atomic: request.amountAtomic,
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
         unsigned_hash: 'different_hash_from_another_transaction',
         signing_reference: 'ref-1',
         signed_at: new Date(),
       });
 
       const mockDb: any = {
-<<<<<<< HEAD
-        query: async (sql: string) => {
-          if (sql.includes('finance.payout_seqno_allocations') || sql.includes('finance.treasury_wallet_sequences')) {
-            return { rows: [{ allocated_seqno: 1, current_onchain_seqno: 1, next_allocated_seqno: 2 }] };
-          }
-          if (sql.includes('system.signing_requests')) {
-            return { rows: [mockDbRecords.get(request.signRequestId)] };
-          }
-=======
         transaction: async (fn: any) => {
           const tx = {
             query: async (sql: string) => {
@@ -606,8 +520,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
           };
           return fn(tx);
         },
-        query: async (sql: string) => {
->>>>>>> 5df0b9f (feat(security): implement immutable signing intent, atomic TonSeqnoManager base-0 offset, and multi-source rate quorum validation)
+        query: async () => {
           return { rows: [] };
         },
       };
@@ -720,8 +633,6 @@ describe('rate limiting (SPEC 253)', () => {
   });
 
   it('refills continuously instead of resetting on a window edge', () => {
-    // A fixed window would let a caller spend the full budget twice across the
-    // boundary. A token bucket refills smoothly, so it cannot.
     let clock = 0;
     const limiter = new TokenBucketRateLimiter({ now: () => clock });
     const rule = { limit: 60, windowSeconds: 60 };
@@ -729,7 +640,6 @@ describe('rate limiting (SPEC 253)', () => {
     for (let i = 0; i < 60; i++) limiter.check('caller', rule);
     expect(limiter.check('caller', rule).allowed).toBe(false);
 
-    // One second later exactly one token is back.
     clock += 1000;
     expect(limiter.check('caller', rule).allowed).toBe(true);
     expect(limiter.check('caller', rule).allowed).toBe(false);
@@ -743,28 +653,24 @@ describe('rate limiting (SPEC 253)', () => {
     limiter.check('a', rule);
     limiter.check('a', rule);
     expect(limiter.check('a', rule).allowed).toBe(false);
-    // B is untouched by A exhausting its budget.
     expect(limiter.check('b', rule).allowed).toBe(true);
   });
 
   it('gives credential issuance the tightest budget', () => {
     expect(ruleFor('POST', '/v1/api-keys').name).toBe('SENSITIVE');
     expect(ruleFor('POST', '/v1/wallets').name).toBe('SENSITIVE');
-    // Reading wallets is not sensitive in the same way.
     expect(ruleFor('GET', '/v1/wallets').name).toBe('MERCHANT');
   });
 
   it('separates writes from reads, and provider callbacks from both', () => {
     expect(ruleFor('POST', '/v1/invoices').name).toBe('MERCHANT_WRITE');
     expect(ruleFor('GET', '/v1/invoices').name).toBe('MERCHANT');
-    // The provider retries legitimately, so its budget is generous.
     expect(ruleFor('POST', '/v1/webhooks/cubepay').name).toBe('WEBHOOK');
     expect(ruleFor('GET', '/health/live').name).toBe('PUBLIC');
   });
 });
 
 describe('distributed rate limiting', () => {
-  /** Minimal in-memory stand-in that executes the Lua contract faithfully. */
   function fakeRedis() {
     const store = new Map<string, { tokens: number; ts: number }>();
     let failing = false;
@@ -793,8 +699,6 @@ describe('distributed rate limiting', () => {
   }
 
   it('shares one budget across instances instead of multiplying it', async () => {
-    // Two API instances, one Redis. The whole point: five requests total, not
-    // five per instance.
     const redis = fakeRedis();
     let clock = 0;
     const rule = { limit: 5, windowSeconds: 60 };
@@ -826,9 +730,6 @@ describe('distributed rate limiting', () => {
   });
 
   it('keeps serving traffic when Redis is down', async () => {
-    // Rate limiting is a courtesy control, not a security boundary
-    // (SPEC 7245). Turning a Redis blip into a full outage would be worse than
-    // briefly not limiting.
     const redis = fakeRedis();
     const limiter = new RedisRateLimiter({ redis, now: () => 0 });
     redis.setFailing(true);
