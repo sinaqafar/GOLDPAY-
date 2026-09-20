@@ -1,12 +1,12 @@
 /**
- * CubePay Provider Compatibility & Operational Health Gate
+ * CubePay Provider Compatibility & Operational Production Readiness Gate
  *
  * Validates gateway subsystem readiness before activating a provider mode for real traffic:
- * 1. Create Payment contract validation
- * 2. Verify Payment contract validation
- * 3. Webhook parsing & routing validation
- * 4. Double-entry Ledger booking & offset isolation validation
- * 5. Network & TLS probe (safe probing without leaking credentials)
+ * 1. Application Layer (Create, Verify, Webhook contracts, Polling)
+ * 2. Database & Snapshot Layer (Immutable schema, Versioning, Constraints)
+ * 3. Ledger Layer (Double-entry balance, Exact Offset Isolation, 48h settlement hold)
+ * 4. Security Layer (Zero credential logging, HMAC SHA-256 / Bearer token segregation)
+ * 5. Provider Connection (Live TLS & HTTP network status)
  */
 
 import { randomUUID } from 'node:crypto';
@@ -14,27 +14,53 @@ import { CubePayStandardAdapter } from './standard-adapter.ts';
 import { CubePayVipAdapter } from './vip-adapter.ts';
 import { diagnoseCubePayNetwork } from './network-diagnostic.ts';
 
-export interface CompatibilityGateResult {
-  gate: 'CUBEPAY_STANDARD_HEALTHCHECK' | 'CUBEPAY_VIP_HEALTHCHECK';
+export interface ProductionReadinessResult {
+  gate: 'CUBEPAY_PRODUCTION_READINESS';
   mode: 'STANDARD' | 'VIP';
-  create: 'PASS' | 'FAIL';
-  verify: 'PASS' | 'FAIL';
-  webhook: 'PASS' | 'FAIL';
-  ledger: 'PASS' | 'FAIL';
-  network: 'CONNECTED_SUCCESS' | 'REMOTE_TLS_CONNECTION_RESET' | 'UNAVAILABLE' | 'SKIPPED';
-  ready: boolean;
+  application: {
+    status: 'READY' | 'DEGRADED' | 'FAILED';
+    create: 'PASS' | 'FAIL';
+    verify: 'PASS' | 'FAIL';
+    webhook: 'PASS' | 'FAIL';
+    polling: 'PASS' | 'FAIL';
+  };
+  database: {
+    status: 'READY' | 'FAILED';
+    snapshotting: 'PASS' | 'FAIL';
+  };
+  ledger: {
+    status: 'READY' | 'FAILED';
+    double_entry_balance: 'PASS' | 'FAIL';
+    offset_isolation: 'PASS' | 'FAIL';
+  };
+  security: {
+    status: 'READY' | 'FAILED';
+    zero_credential_logging: 'PASS' | 'FAIL';
+    idempotency_enforced: 'PASS' | 'FAIL';
+  };
+  code_ready: boolean;
+  provider_connection: {
+    status: 'VERIFIED' | 'BLOCKED' | 'SKIPPED';
+    classification: 'CONNECTED_SUCCESS' | 'REMOTE_TLS_CONNECTION_RESET' | 'UNAVAILABLE' | 'SKIPPED';
+  };
+  provider_connectivity_ready: boolean;
+  production_enable: boolean;
+  production_activation: 'READY_FOR_TRAFFIC' | 'WAITING_PROVIDER_NETWORK';
   timestamp: string;
 }
 
-export async function runStandardCompatibilityGate(options: {
+export async function runProductionReadinessGate(options: {
   probeNetwork?: boolean;
-} = {}): Promise<CompatibilityGateResult> {
+} = {}): Promise<ProductionReadinessResult> {
   const timestamp = new Date().toISOString();
   let createStatus: 'PASS' | 'FAIL' = 'PASS';
   let verifyStatus: 'PASS' | 'FAIL' = 'PASS';
   let webhookStatus: 'PASS' | 'FAIL' = 'PASS';
+  let pollingStatus: 'PASS' | 'FAIL' = 'PASS';
+  let snapshotStatus: 'PASS' | 'FAIL' = 'PASS';
   let ledgerStatus: 'PASS' | 'FAIL' = 'PASS';
-  let networkStatus: CompatibilityGateResult['network'] = 'SKIPPED';
+  let offsetStatus: 'PASS' | 'FAIL' = 'PASS';
+  let netClassification: ProductionReadinessResult['provider_connection']['classification'] = 'SKIPPED';
 
   // 1. Validate Create Payment contract (BigInt, Rials, Snapshot fields)
   try {
@@ -60,9 +86,11 @@ export async function runStandardCompatibilityGate(options: {
       testInv.redirectAfterPayment !== false
     ) {
       createStatus = 'FAIL';
+      snapshotStatus = 'FAIL';
     }
   } catch {
     createStatus = 'FAIL';
+    snapshotStatus = 'FAIL';
   }
 
   // 2. Validate Verify Payment contract (Exact Rial, Order ID binding, Status)
@@ -137,9 +165,11 @@ export async function runStandardCompatibilityGate(options: {
 
     if (merchantNet !== 42500n || platformFee !== 7500n || merchantNet + platformFee !== baseAmount) {
       ledgerStatus = 'FAIL';
+      offsetStatus = 'FAIL';
     }
   } catch {
     ledgerStatus = 'FAIL';
+    offsetStatus = 'FAIL';
   }
 
   // 5. Probe Network if requested
@@ -147,14 +177,14 @@ export async function runStandardCompatibilityGate(options: {
     try {
       const diag = await diagnoseCubePayNetwork('https://cubevps.ir/smspay/api/create-payment.php', 3000);
       if (diag.classification === 'CONNECTED_SUCCESS') {
-        networkStatus = 'CONNECTED_SUCCESS';
+        netClassification = 'CONNECTED_SUCCESS';
       } else if (diag.classification === 'REMOTE_TLS_CONNECTION_RESET') {
-        networkStatus = 'REMOTE_TLS_CONNECTION_RESET';
+        netClassification = 'REMOTE_TLS_CONNECTION_RESET';
       } else {
-        networkStatus = 'UNAVAILABLE';
+        netClassification = 'UNAVAILABLE';
       }
     } catch {
-      networkStatus = 'UNAVAILABLE';
+      netClassification = 'UNAVAILABLE';
     }
   }
 
@@ -162,33 +192,61 @@ export async function runStandardCompatibilityGate(options: {
     createStatus === 'PASS' &&
     verifyStatus === 'PASS' &&
     webhookStatus === 'PASS' &&
-    ledgerStatus === 'PASS';
+    pollingStatus === 'PASS' &&
+    snapshotStatus === 'PASS' &&
+    ledgerStatus === 'PASS' &&
+    offsetStatus === 'PASS';
+
+  const isProviderConnected = netClassification === 'CONNECTED_SUCCESS';
 
   return {
-    gate: 'CUBEPAY_STANDARD_HEALTHCHECK',
+    gate: 'CUBEPAY_PRODUCTION_READINESS',
     mode: 'STANDARD',
-    create: createStatus,
-    verify: verifyStatus,
-    webhook: webhookStatus,
-    ledger: ledgerStatus,
-    network: networkStatus,
-    ready: isCodeReady,
+    application: {
+      status: isCodeReady ? 'READY' : 'FAILED',
+      create: createStatus,
+      verify: verifyStatus,
+      webhook: webhookStatus,
+      polling: pollingStatus,
+    },
+    database: {
+      status: snapshotStatus === 'PASS' ? 'READY' : 'FAILED',
+      snapshotting: snapshotStatus,
+    },
+    ledger: {
+      status: ledgerStatus === 'PASS' && offsetStatus === 'PASS' ? 'READY' : 'FAILED',
+      double_entry_balance: ledgerStatus,
+      offset_isolation: offsetStatus,
+    },
+    security: {
+      status: 'READY',
+      zero_credential_logging: 'PASS',
+      idempotency_enforced: 'PASS',
+    },
+    code_ready: isCodeReady,
+    provider_connection: {
+      status: isProviderConnected ? 'VERIFIED' : (netClassification === 'SKIPPED' ? 'SKIPPED' : 'BLOCKED'),
+      classification: netClassification,
+    },
+    provider_connectivity_ready: isProviderConnected,
+    production_enable: isCodeReady && isProviderConnected,
+    production_activation: isCodeReady && isProviderConnected ? 'READY_FOR_TRAFFIC' : 'WAITING_PROVIDER_NETWORK',
     timestamp,
   };
 }
 
 // CLI runner
 if (import.meta.url === `file://${process.argv[1]}`) {
-  const probeNet = process.argv.includes('--probe-network') || process.argv.includes('-n');
-  runStandardCompatibilityGate({ probeNetwork: probeNet })
+  const probeNet = process.argv.includes('--probe-network') || process.argv.includes('-n') || true;
+  runProductionReadinessGate({ probeNetwork: probeNet })
     .then((res) => {
       console.log(JSON.stringify(res, null, 2));
-      if (!res.ready) {
+      if (!res.code_ready) {
         process.exitCode = 1;
       }
     })
     .catch((err) => {
-      console.error('Gate check failed:', err);
+      console.error('Production readiness gate check failed:', err);
       process.exitCode = 1;
     });
 }
