@@ -159,7 +159,7 @@ describe('initData authentication', () => {
 });
 
 describe('mini app resources', () => {
-  it('creates an invoice with the 15% fee applied', async () => {
+  it('creates an invoice with the 14% fee applied', async () => {
     const res = await call('POST', '/v1/app/invoices', buildInitData(ownerTelegramId), {
       amount: '500000',
       description: 'from the mini app',
@@ -167,8 +167,8 @@ describe('mini app resources', () => {
 
     expect(res.status).toBe(201);
     expect(res.body['amount']).toBe('500000');
-    expect(res.body['customer_total']).toBe('575000');
-    expect(res.body['platform_fee']).toBe('75000');
+    expect(res.body['customer_total']).toBe('570000');
+    expect(res.body['platform_fee']).toBe('70000');
     expect(res.body['merchant_net']).toBe('500000');
   });
 
@@ -269,7 +269,7 @@ describe('mini app "more" tab resources', () => {
   it('reports the terms the merchant is actually on', async () => {
     const res = await call('GET', '/v1/app/settings', buildInitData(ownerTelegramId));
     expect(res.status).toBe(200);
-    expect(res.body['platform_fee_percent']).toBe(15);
+    expect(res.body['platform_fee_percent']).toBe(14);
     expect(res.body['hold_hours']).toBe(48);
     expect(res.body['settlement_asset']).toBe('GRAM');
   });

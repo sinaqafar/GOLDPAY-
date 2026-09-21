@@ -29,6 +29,19 @@ describe('liquidity fit', () => {
     expect(selected.reduce((sum, s) => sum + s.gramAtomic, 0n)).toBe(1000n);
   });
 
+  it('handles partial queue fit (Wallet=100, Queue=[70, 50, 20] -> 70, 20 selected, 50 waiting)', () => {
+    // 100 spendable, payouts of 70, 50, 20.
+    // 70 + 20 = 90 <= 100; 50 is skipped and stays waiting.
+    const selected = selectByLiquidityFit(
+      [make('P1', 70n, 300), make('P2', 50n, 200), make('P3', 20n, 100)],
+      100n,
+    );
+
+    const ids = selected.map((s) => s.payoutId).sort();
+    expect(ids).toEqual(['P1', 'P3']);
+    expect(selected.reduce((sum, s) => sum + s.gramAtomic, 0n)).toBe(90n);
+  });
+
   it('never selects more than the treasury can cover', () => {
     const selected = selectByLiquidityFit(
       [make('A', 700n), make('B', 600n), make('C', 500n)],

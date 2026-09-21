@@ -148,7 +148,7 @@ describe('Instant Withdrawal (2% Fee) vs Automatic Settlement (0% Fee)', () => {
         WHERE a.account_code = 'PLATFORM_REVENUE_TOMAN'`,
     );
 
-    expect(platformRev.rows[0]?.total).toBe('150000');
+    expect(platformRev.rows[0]?.total).toBe('140000');
   });
 
   it('Automatic Settlement: charges 0% withdrawal fee and moves 100% of available funds', async () => {
@@ -161,7 +161,7 @@ describe('Instant Withdrawal (2% Fee) vs Automatic Settlement (0% Fee)', () => {
     expect(result.payoutType).toBe('AUTOMATIC');
     expect(result.feeType).toBe('NONE');
     expect(result.instantFeeToman).toBe('0');
-    expect(result.amountToman).toBe('850000'); // Full 850,000 Toman net available
+    expect(result.amountToman).toBe('860000'); // Full 860,000 Toman net available
   });
 
   it('Insufficient Treasury Liquidity: parks payout in WAITING_LIQUIDITY with NO partial payout', async () => {
@@ -200,7 +200,7 @@ describe('Instant Withdrawal (2% Fee) vs Automatic Settlement (0% Fee)', () => {
       [merchantId],
     );
 
-    expect(balanceRestored.rows[0]?.available).toBe('850000');
+    expect(balanceRestored.rows[0]?.available).toBe('860000');
     expect(balanceRestored.rows[0]?.settling).toBe('0');
 
     // Instant fee revenue must be 0 (reversed)

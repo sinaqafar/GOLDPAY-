@@ -31,7 +31,7 @@ export const TEST_ENV: Record<string, string> = {
   APP_ENV: 'test',
   DATABASE_URL: 'pglite:memory',
   APP_URL: 'http://localhost:3000',
-  PLATFORM_FEE_PERCENT: '15',
+  PLATFORM_FEE_PERCENT: '14',
   PAYOUT_HOLD_HOURS: '48',
   GRAM_NETWORK: 'TON_TESTNET',
   TON_NETWORK: 'TON_TESTNET',
