@@ -45,7 +45,7 @@ Invoice
  ├── provider = CUBEPAY
  ├── provider_mode = STANDARD
  ├── base_amount_toman = مبلغ پایه
- ├── platform_fee_toman = کارمزد پلتفرم (۱۵٪)
+ ├── platform_fee_toman = کارمزد پلتفرم (۱۴٪)
  ├── customer_charge_toman = مبلغ مطالبه از مشتری
  ├── provider_order_id = شناسه پایدار سفارش
  └── provider_version = 2026-09-STANDARD
@@ -218,7 +218,7 @@ invoice.redirect_after_payment = false
 ```text
 بدهکار (DR): حساب واسط پرووایدر (CubePay Clearing Account)
 بستانکار (CR): موجودی در انتظار تسویه فروشنده (Merchant Pending Balance)
-بستانکار (CR): درآمد کارمزد پلتفرم (Platform Revenue Toman - 15%)
+بستانکار (CR): درآمد کارمزد پلتفرم (Platform Revenue Toman - 14%)
 ```
 
 تایم‌استمپ‌ها:
@@ -233,7 +233,7 @@ release_at = NOW() + 48 Hours
 
 تمام اجزای مالی به صورت کاملاً مجزا ذخیره و محاسبه می‌شوند:
 - `base_amount_toman`: مبلغ پایه محصول فروشنده
-- `platform_fee_toman`: کارمزد ثابت ۱۵٪ پلتفرم GOLDPAY (`PLATFORM_FEE_PERCENT = 15`)
+- `platform_fee_toman`: کارمزد ثابت ۱۴٪ پلتفرم GOLDPAY (`PLATFORM_FEE_PERCENT = 14`)
 - `customer_charge_toman`: مبلغ نهایی مطالبه از خریدار بر اساس Fee Mode
 - `provider_pay_amount_toman`: مبلغ نهایی پرووایدر با احتساب آفست بانکی (هرگز به عنوان درآمد فروشنده لحاظ نمی‌شود)
 - `provider_pay_amount_rial`: معادل ریالی پرووایدر

@@ -30,7 +30,7 @@ We require a clean dual-mode architecture where `VIP` is the default active mode
    - Every invoice captures `provider = 'CUBEPAY'`, `provider_mode = 'VIP' | 'STANDARD'`, and `provider_version`.
    - Webhooks inspect the invoice's snapshotted mode first before delegating verification to the corresponding adapter.
 4. **Isolated Fees & Credentials**:
-   - Platform fee is fixed at 15%.
+   - Platform fee is fixed at 14%.
    - Provider expected fee is recorded at 9% until confirmed by authoritative provider evidence.
    - Instant withdrawal fee is 2% and completely independent of the ingress provider.
 

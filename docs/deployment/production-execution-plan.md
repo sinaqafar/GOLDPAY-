@@ -121,7 +121,7 @@ GRANT SELECT, INSERT, UPDATE ON core.payment_attempts TO gram_app;
    ```
 3. اعتبارسنجی ۴ شاخص در تراکنش واقعی آزمایشی:
    * برابری دقیق ریالی و آفست (`provider_pay_amount_rial == verified_amount_rial`).
-   * ثبت کارمزد ۱۵٪ پلتفرم در لجر (`PLATFORM_REVENUE_TOMAN`).
+   * ثبت کارمزد ۱۴٪ پلتفرم در لجر (`PLATFORM_REVENUE_TOMAN`).
    * ثبت سهم خالص مرچنت در باکت `PENDING`.
    * بررسی ضد-Replay وب‌هوک (ارسال مجدد = ۰ تأثیر مالی).
 
