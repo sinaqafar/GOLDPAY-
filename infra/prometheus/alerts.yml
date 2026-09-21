@@ -1,0 +1,57 @@
+groups:
+  - name: goldpay_critical_financial_alerts
+    rules:
+      - alert: LedgerImbalanceCritical
+        expr: gram_financial_freeze == 1 or gram_reconciliation_exceptions_open{severity="CRITICAL"} > 0
+        for: 0m
+        labels:
+          severity: critical
+          tier: financial
+        annotations:
+          summary: "CRITICAL: Financial Ledger Imbalance or Platform Freeze Active"
+          description: "Double-entry balance violation or manual financial freeze detected. All payouts must be suspended immediately."
+          runbook_url: "docs/runbooks/operations-manual.md#1-پروتکل-واکنش-به-عدم-تعادل-دفاتر-کل-حسابداری-ledger-imbalance-critical"
+
+      - alert: PayoutStalledInQueue
+        expr: gram_oldest_unknown_payout_seconds > 900 or gram_payouts_by_status{status="WAITING_LIQUIDITY"} > 5
+        for: 5m
+        labels:
+          severity: warning
+          tier: treasury
+        annotations:
+          summary: "Treasury Payout Stalled in Queue"
+          description: "Payout has been unresolved/unknown for > 15 minutes or treasury liquidity waiting queue is growing."
+          runbook_url: "docs/runbooks/operations-manual.md#2-پروتکل-بازیابی-پرداخت‌های-ناموفق-و-تسویه‌های-معلق"
+
+      - alert: OracleDeviationHigh
+        expr: gram_oracle_divergence_bps > 500
+        for: 2m
+        labels:
+          severity: critical
+          tier: oracle
+        annotations:
+          summary: "High Oracle Price Deviation (>5% Spread)"
+          description: "Exchange rate divergence across weighted median sources exceeds 500 bps. Degradation mode activated."
+          runbook_url: "docs/runbooks/operations-manual.md#3-پروتکل-تضعیف-و-بازیابی-اوراکل-نرخ-طلا-تومان"
+
+      - alert: TreasuryLiquidityLow
+        expr: gram_treasury_balance_nanogram < 50000000000
+        for: 5m
+        labels:
+          severity: warning
+          tier: treasury
+        annotations:
+          summary: "TON Treasury Balance Below Threshold"
+          description: "Confirmed GRAM treasury balance is low. Manual funding by treasury owner required."
+          runbook_url: "docs/runbooks/operations-manual.md"
+
+      - alert: WebhookDeliveryFailing
+        expr: rate(gram_webhooks_delivered_total{outcome="failed"}[5m]) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          tier: integration
+        annotations:
+          summary: "High Webhook Delivery Failure Rate"
+          description: "Merchant webhooks are failing delivery at elevated rates."
+          runbook_url: "docs/runbooks/operations-manual.md"
