@@ -26,6 +26,7 @@
     "bot": "node --experimental-strip-types apps/bot/src/main.ts",
     "mini-app": "node --experimental-strip-types apps/mini-app/src/main.ts",
     "health-check": "node --experimental-strip-types scripts/health-check.ts",
+    "ledger:verify": "node --experimental-strip-types scripts/ledger-verify.ts",
     "create-admin": "node --experimental-strip-types scripts/create-admin.ts",
     "admin:build": "node apps/admin/build.mjs",
     "admin": "node --experimental-strip-types apps/admin/src/main.ts",
@@ -34,7 +35,7 @@
     "build:all": "npm run build && node apps/admin/build.mjs"
   },
   "dependencies": {
-    "@electric-sql/pglite": "^0.3.11",
+    "@electric-sql/pglite": "^0.3.16",
     "@ton/core": "^0.63.1",
     "@ton/crypto": "^3.3.0",
     "@types/react": "^18.3.31",
