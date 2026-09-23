@@ -46,13 +46,13 @@ BROADCASTED       → native GRAM transfer on TON
 SETTLED           → close merchant liability, reduce treasury
 ```
 
-### Fee modes (14% platform fee, snapshotted at invoice creation)
+### Fee modes (15% platform fee, snapshotted at invoice creation)
 
 | Mode | Customer pays | Merchant receives |
 |---|---|---|
-| `CUSTOMER` | 114% | 100% |
-| `MERCHANT` | 100% | 86% |
-| `SPLIT` | 107% | 93% |
+| `CUSTOMER` | 115% | 100% |
+| `MERCHANT` | 100% | 85% |
+| `SPLIT` | 107.5% | 92.5% |
 
 The identity `customerTotal − platformFee == merchantNet` holds in every mode
 for every amount, and is asserted by both the code and a database `CHECK`.

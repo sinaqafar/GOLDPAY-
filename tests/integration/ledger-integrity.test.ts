@@ -669,10 +669,10 @@ describe('per-merchant fee mode (SPEC 2386)', () => {
       baseAmount: '1000000',
     });
 
-    // MERCHANT mode: the customer pays the base and the merchant absorbs 14%.
+    // MERCHANT mode: the customer pays the base and the merchant absorbs 15%.
     expect(invoice.feeMode).toBe('MERCHANT');
     expect(invoice.customerTotal).toBe('1000000');
-    expect(invoice.merchantNet).toBe('860000');
+    expect(invoice.merchantNet).toBe('850000');
   });
 
   it('still lets an explicit request override the merchant default', async () => {
@@ -686,10 +686,10 @@ describe('per-merchant fee mode (SPEC 2386)', () => {
       feeMode: 'SPLIT',
     });
 
-    // SPLIT: 7% each side.
+    // SPLIT: 7.5% each side.
     expect(invoice.feeMode).toBe('SPLIT');
-    expect(invoice.customerTotal).toBe('1070000');
-    expect(invoice.merchantNet).toBe('930000');
+    expect(invoice.customerTotal).toBe('1075000');
+    expect(invoice.merchantNet).toBe('925000');
   });
 
   it('freezes the snapshot, so changing the default later does not move it', async () => {
@@ -701,7 +701,7 @@ describe('per-merchant fee mode (SPEC 2386)', () => {
       merchantId: merchant.merchantId,
       baseAmount: '1000000',
     });
-    expect(invoice.customerTotal).toBe('1140000');
+    expect(invoice.customerTotal).toBe('1150000');
 
     // The merchant switches their default afterwards.
     await db.query(`UPDATE core.merchants SET default_fee_mode = 'MERCHANT' WHERE id = $1`, [
@@ -713,7 +713,7 @@ describe('per-merchant fee mode (SPEC 2386)', () => {
       [invoice.invoiceId],
     );
     expect(stored.rows[0]?.fee_mode).toBe('CUSTOMER');
-    expect(stored.rows[0]?.customer_total_amount).toBe('1140000');
+    expect(stored.rows[0]?.customer_total_amount).toBe('1150000');
   });
 });
 
@@ -926,9 +926,9 @@ describe('refunds (PART 70)', () => {
          FROM core.refunds WHERE payment_id = $1`,
       [payment.paymentId],
     );
-    expect(row.rows[0]?.original_amount).toBe('1140000');
-    expect(row.rows[0]?.original_platform_fee).toBe('140000');
-    expect(row.rows[0]?.original_provider_fee).toBe('102600');
+    expect(row.rows[0]?.original_amount).toBe('1150000');
+    expect(row.rows[0]?.original_platform_fee).toBe('150000');
+    expect(row.rows[0]?.original_provider_fee).toBe('103500');
     // Undecided, which is exactly why execution is blocked.
     expect(row.rows[0]?.platform_fee_reversal).toBeNull();
   });
@@ -945,7 +945,7 @@ describe('refunds (PART 70)', () => {
       requestedByType: 'MERCHANT',
     });
 
-    // 1,000,000 + 200,000 > 1,140,000 collected.
+    // 1,000,000 + 200,000 > 1,150,000 collected.
     await expect(
       requestRefund(harness.db, {
         paymentId: payment.paymentId,
@@ -967,7 +967,7 @@ describe('refunds (PART 70)', () => {
         `INSERT INTO core.refunds
            (id, payment_id, merchant_id, original_amount, original_platform_fee,
             requested_amount, status, reason, requested_by_type)
-         VALUES ($1,$2,$3,'1140000','140000','9999999','REQUESTED','bypass','ADMIN')`,
+         VALUES ($1,$2,$3,'1150000','150000','9999999','REQUESTED','bypass','ADMIN')`,
         [randomUUID(), payment.paymentId, merchant.merchantId],
       ),
     ).rejects.toThrow(/exceeds the collected amount/);
@@ -977,12 +977,12 @@ describe('refunds (PART 70)', () => {
     harness = await createHarness();
     const { merchant, payment } = await verifiedPayment(harness);
 
-    expect(await refundableAmount(harness.db, payment.paymentId)).toBe('1140000');
+    expect(await refundableAmount(harness.db, payment.paymentId)).toBe('1150000');
 
     await requestRefund(harness.db, {
       paymentId: payment.paymentId,
       merchantId: merchant.merchantId,
-      amount: '140000',
+      amount: '150000',
       reason: 'partial',
       requestedByType: 'MERCHANT',
     });

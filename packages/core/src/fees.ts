@@ -1,14 +1,14 @@
 /**
- * Fee engine — the single place where the 14% platform fee is computed.
+ * Fee engine — the single place where the 15% platform fee is computed.
  *
  * SPEC (03 · کارمزد / قواعد مالی):
- *   CUSTOMER : buyer pays 114% of base; merchant is owed 100% of base.
- *   MERCHANT : buyer pays 100%; 14% is deducted; merchant is owed 86%.
- *   SPLIT    : 7% to each side; customer pays 107%, merchant is owed 93%.
+ *   CUSTOMER : buyer pays 115% of base; merchant is owed 100% of base.
+ *   MERCHANT : buyer pays 100%; 15% is deducted; merchant is owed 85%.
+ *   SPLIT    : 7.5% to each side; customer pays 107.5%, merchant is owed 92.5%.
  *
  * SPEC 4334/4335 + "Snapshot": the rate and mode are frozen onto the invoice at
  * creation; later config changes must never alter an existing invoice.
- * SPEC 103900: `amount * 0.14` must never appear anywhere outside this module.
+ * SPEC 103900: `amount * 0.15` must never appear anywhere outside this module.
  */
 
 import { Money, Percentage, type Rounding } from '../../money/src/index.ts';
@@ -139,7 +139,7 @@ export function calculateFees(
  * The provider's own cut, which is NOT the platform fee.
  *
  * CubePay charges ~9% of the amount it actually collects. The spec is explicit
- * that this must never be merged with our 14% into a single headline number for
+ * that this must never be merged with our 15% into a single headline number for
  * the merchant: the merchant's contract is with us, and CubePay deducts its
  * cost from OUR receipts.
  *
@@ -147,26 +147,26 @@ export function calculateFees(
  *     Base Amount    − Merchant Fee = Merchant Credit
  *     CubePay Net    − Merchant Credit = Platform Gross Margin
  *
- * Worked example (MERCHANT mode, 1,000,000 base, 14% platform, 9% provider):
+ * Worked example (MERCHANT mode, 1,000,000 base, 15% platform, 9% provider):
  *     customer pays          1,000,000
  *     provider keeps            90,000
  *     we receive               910,000
- *     merchant is credited     860,000
- *     our gross margin          50,000
+ *     merchant is credited     850,000
+ *     our gross margin          60,000
  *
- * Worked example (CUSTOMER mode, 1,000,000 base, 14% platform, 9% provider):
- *     customer pays          1,140,000
- *     provider keeps           102,600
- *     we receive             1,037,400
+ * Worked example (CUSTOMER mode, 1,000,000 base, 15% platform, 9% provider):
+ *     customer pays          1,150,000
+ *     provider keeps           103,500
+ *     we receive             1,046,500
  *     merchant is credited   1,000,000
- *     our gross margin          37,400 (≈3.74% on base)
+ *     our gross margin          46,500
  *
- * Worked example (SPLIT mode, 1,000,000 base, 14% platform (7%+7%), 9% provider):
- *     customer pays          1,070,000
- *     provider keeps            96,300
- *     we receive               973,700
- *     merchant is credited     930,000
- *     our gross margin          43,700 (≈4.37% on base)
+ * Worked example (SPLIT mode, 1,000,000 base, 15% platform (7.5%+7.5%), 9% provider):
+ *     customer pays          1,075,000
+ *     provider keeps            96,750
+ *     we receive               978,250
+ *     merchant is credited     925,000
+ *     our gross margin          53,250
  */
 export interface ProviderCostBreakdown {
   /** Amount the provider actually collected from the customer. */

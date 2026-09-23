@@ -90,7 +90,7 @@ describe('Internal CubePay Sandbox Simulation Gate Validations', () => {
     // 4. Verify directly with provider
     const verified = await vipAdapter.verifyPayment(provInv.externalInvoiceId);
     expect(verified.status).toBe('PAID');
-    expect(verified.paidAmount).toBe('1140000');
+    expect(verified.paidAmount).toBe('1150000');
 
     // 5. Finalize payment & post double-entry ledger
     const finRes = await finalizePayment(h.db, vipConfig, {
@@ -200,7 +200,7 @@ describe('Internal CubePay Sandbox Simulation Gate Validations', () => {
 
     expect(finRes.status).toBe('VERIFIED');
     expect(finRes.credited).toBe(true);
-    expect(finRes.merchantNet).toBe('430000');
+    expect(finRes.merchantNet).toBe('425000');
 
     // 6. Fast forward 48 hours & release
     await fastForwardRelease(h.db, finRes.paymentId);
@@ -212,7 +212,7 @@ describe('Internal CubePay Sandbox Simulation Gate Validations', () => {
         WHERE a.owner_id = $1`,
       [merchantId],
     );
-    expect(mBal.rows[0]?.available).toBe('430000');
+    expect(mBal.rows[0]?.available).toBe('425000');
   });
 
   // 3. Standard Offset Payment
@@ -279,7 +279,7 @@ describe('Internal CubePay Sandbox Simulation Gate Validations', () => {
         WHERE a.owner_id = $1`,
       [merchantId],
     );
-    expect(mBal.rows[0]?.pending).toBe('43000');
+    expect(mBal.rows[0]?.pending).toBe('42500');
   });
 
   // 4. Duplicate Callback Idempotency

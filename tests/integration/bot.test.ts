@@ -86,8 +86,8 @@ describe('invoice conversation', () => {
     );
     expect(invoices.rowCount).toBe(1);
     expect(invoices.rows[0]?.base_amount).toBe('250000');
-    expect(invoices.rows[0]?.customer_total_amount).toBe('285000'); // +14%
-    expect(invoices.rows[0]?.platform_fee_amount).toBe('35000');
+    expect(invoices.rows[0]?.customer_total_amount).toBe('287500'); // +15%
+    expect(invoices.rows[0]?.platform_fee_amount).toBe('37500');
 
     // The conversation is finished and cleaned up.
     expect((await h.db.query('SELECT 1 FROM core.bot_conversations')).rowCount).toBe(0);

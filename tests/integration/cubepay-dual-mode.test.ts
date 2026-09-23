@@ -417,7 +417,7 @@ describe('CubePay Dual-Mode: VIP & Standard Official Contract Integration', () =
         WHERE a.owner_id = $1`,
       [merchantId],
     );
-    expect(balance.rows[0]?.pending).toBe('17200');
+    expect(balance.rows[0]?.pending).toBe('17000');
   });
 
   // 16. Amount mismatch detection if paid amount does not match snapshot
@@ -499,16 +499,16 @@ describe('CubePay Dual-Mode: VIP & Standard Official Contract Integration', () =
          JOIN finance.ledger_accounts a ON a.id = e.account_id
         WHERE a.account_code = 'PLATFORM_REVENUE_TOMAN'`,
     );
-    expect(revRes.rows[0]?.total).toBe('140000');
+    expect(revRes.rows[0]?.total).toBe('150000');
 
-    // Expected provider expense = 9% of 1,140,000 = 102,600 Toman
+    // Expected provider expense = 9% of 1,150,000 = 103,500 Toman
     const expRes = await h.db.query<{ total: string }>(
       `SELECT COALESCE(SUM(e.debit - e.credit),0)::text AS total
          FROM finance.journal_entries e
          JOIN finance.ledger_accounts a ON a.id = e.account_id
         WHERE a.account_code = 'PLATFORM_EXPENSE_TOMAN'`,
     );
-    expect(expRes.rows[0]?.total).toBe('102600');
+    expect(expRes.rows[0]?.total).toBe('103500');
   });
 
   // 18. Duplicate verify produces idempotent single credit
@@ -796,7 +796,7 @@ describe('CubePay Dual-Mode: VIP & Standard Official Contract Integration', () =
         WHERE a.owner_id = $1`,
       [merchantId],
     );
-    expect(mBal.rows[0]?.pending).toBe('215000'); // 250,000 * 86%
+    expect(mBal.rows[0]?.pending).toBe('212500'); // 250,000 * 85%
   });
 
   // 26. Concurrent callback + polling produces exactly ONE ledger credit

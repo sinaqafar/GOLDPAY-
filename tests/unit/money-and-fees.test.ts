@@ -13,7 +13,7 @@ import {
   MAX_GRAM_ATOMIC,
 } from '../../packages/core/src/limits.ts';
 
-const FEE = { rate: Percentage.fromPercent(14), version: 'v1' };
+const FEE = { rate: Percentage.fromPercent(15), version: 'v1' };
 
 describe('Money', () => {
   it('refuses floats entirely', () => {
@@ -43,27 +43,27 @@ describe('calculateFees', () => {
   const conserves = (b: ReturnType<typeof calculateFees>) =>
     b.customerTotal.subtract(b.platformFee).equals(b.merchantNet);
 
-  it('CUSTOMER mode: buyer pays 114%, seller receives 100%', () => {
+  it('CUSTOMER mode: buyer pays 115%, seller receives 100%', () => {
     const b = calculateFees(Money.toman(1_000_000), 'CUSTOMER', FEE);
-    expect(b.customerTotal.toAtomicString()).toBe('1140000');
+    expect(b.customerTotal.toAtomicString()).toBe('1150000');
     expect(b.merchantNet.toAtomicString()).toBe('1000000');
-    expect(b.platformFee.toAtomicString()).toBe('140000');
+    expect(b.platformFee.toAtomicString()).toBe('150000');
     expect(conserves(b)).toBe(true);
   });
 
-  it('MERCHANT mode: buyer pays 100%, seller receives 86%', () => {
+  it('MERCHANT mode: buyer pays 100%, seller receives 85%', () => {
     const b = calculateFees(Money.toman(1_000_000), 'MERCHANT', FEE);
     expect(b.customerTotal.toAtomicString()).toBe('1000000');
-    expect(b.merchantNet.toAtomicString()).toBe('860000');
-    expect(b.platformFee.toAtomicString()).toBe('140000');
+    expect(b.merchantNet.toAtomicString()).toBe('850000');
+    expect(b.platformFee.toAtomicString()).toBe('150000');
     expect(conserves(b)).toBe(true);
   });
 
-  it('SPLIT mode: 7% each way — buyer pays 107%, seller gets 93%', () => {
+  it('SPLIT mode: 7.5% each way — buyer pays 107.5%, seller gets 92.5%', () => {
     const b = calculateFees(Money.toman(1_000_000), 'SPLIT', FEE);
-    expect(b.customerTotal.toAtomicString()).toBe('1070000');
-    expect(b.merchantNet.toAtomicString()).toBe('930000');
-    expect(b.platformFee.toAtomicString()).toBe('140000');
+    expect(b.customerTotal.toAtomicString()).toBe('1075000');
+    expect(b.merchantNet.toAtomicString()).toBe('925000');
+    expect(b.platformFee.toAtomicString()).toBe('150000');
     expect(conserves(b)).toBe(true);
   });
 
@@ -113,33 +113,33 @@ describe('provider cost (CubePay 9%)', () => {
 
   it('is kept separate from the platform fee and never merged into one rate', () => {
     // MERCHANT mode on a 1,000,000 base: the customer pays the base, we credit
-    // 860,000, CubePay keeps 90,000 of what it collects, so our real margin is
-    // 140,000 − 90,000 = 50,000. The merchant only ever sees our 14%.
+    // 850,000, CubePay keeps 90,000 of what it collects, so our real margin is
+    // 150,000 − 90,000 = 60,000. The merchant only ever sees our 15%.
     const breakdown = calculateFees(Money.toman(1_000_000), 'MERCHANT', FEE);
     const cost = calculateProviderCost(breakdown.customerTotal, PROVIDER);
 
     expect(breakdown.customerTotal.toAtomicString()).toBe('1000000');
-    expect(breakdown.merchantNet.toAtomicString()).toBe('860000');
-    expect(breakdown.platformFee.toAtomicString()).toBe('140000');
+    expect(breakdown.merchantNet.toAtomicString()).toBe('850000');
+    expect(breakdown.platformFee.toAtomicString()).toBe('150000');
 
     expect(cost.providerFee.toAtomicString()).toBe('90000');
     expect(cost.providerNet.toAtomicString()).toBe('910000');
 
     const grossMargin = cost.providerNet.subtract(breakdown.merchantNet);
-    expect(grossMargin.toAtomicString()).toBe('50000');
+    expect(grossMargin.toAtomicString()).toBe('60000');
   });
 
   it('charges the provider rate on what was actually collected, not on the base', () => {
-    // CUSTOMER mode: the customer pays 1,140,000, so CubePay's 9% applies to
-    // the larger figure — 102,600, not 90,000.
+    // CUSTOMER mode: the customer pays 1,150,000, so CubePay's 9% applies to
+    // the larger figure — 103,500, not 90,000.
     const breakdown = calculateFees(Money.toman(1_000_000), 'CUSTOMER', FEE);
     const cost = calculateProviderCost(breakdown.customerTotal, PROVIDER);
 
-    expect(breakdown.customerTotal.toAtomicString()).toBe('1140000');
-    expect(cost.providerFee.toAtomicString()).toBe('102600');
+    expect(breakdown.customerTotal.toAtomicString()).toBe('1150000');
+    expect(cost.providerFee.toAtomicString()).toBe('103500');
 
     const grossMargin = cost.providerNet.subtract(breakdown.merchantNet);
-    expect(grossMargin.toAtomicString()).toBe('37400');
+    expect(grossMargin.toAtomicString()).toBe('46500');
   });
 
   it('rounds the cost up so platform margin is never flattered', () => {

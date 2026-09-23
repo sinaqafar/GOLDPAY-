@@ -8,7 +8,7 @@
  * database both defend the invariant).
  *
  * Ceilings are deliberately well below the raw column width so derived figures
- * — a 114% customer total, a summed payout, a Toman→GRAM conversion — cannot
+ * — a 115% customer total, a summed payout, a Toman→GRAM conversion — cannot
  * overflow either.
  */
 

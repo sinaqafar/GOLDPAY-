@@ -218,7 +218,7 @@ invoice.redirect_after_payment = false
 ```text
 بدهکار (DR): حساب واسط پرووایدر (CubePay Clearing Account)
 بستانکار (CR): موجودی در انتظار تسویه فروشنده (Merchant Pending Balance)
-بستانکار (CR): درآمد کارمزد پلتفرم (Platform Revenue Toman - 14%)
+بستانکار (CR): درآمد کارمزد پلتفرم (Platform Revenue Toman - 15%)
 ```
 
 تایم‌استمپ‌ها:

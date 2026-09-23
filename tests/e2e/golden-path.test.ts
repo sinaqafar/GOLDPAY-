@@ -42,10 +42,10 @@ describe('golden path', () => {
       feeMode: 'CUSTOMER',
     });
 
-    // 14% fee added on top: the customer pays 1,140,000 and the merchant is
+    // 15% fee added on top: the customer pays 1,150,000 and the merchant is
     // owed the full 1,000,000.
-    expect(invoice.customerTotal).toBe('1140000');
-    expect(invoice.platformFee).toBe('140000');
+    expect(invoice.customerTotal).toBe('1150000');
+    expect(invoice.platformFee).toBe('150000');
     expect(invoice.merchantNet).toBe('1000000');
 
     // --- 2. VERIFY PAYMENT + 3. POST LEDGER --------------------------------
@@ -54,7 +54,7 @@ describe('golden path', () => {
       evidence: {
         provider: 'CUBEPAY',
         externalPaymentId: 'cp_golden_1',
-        paidAmount: '1140000',
+        paidAmount: '1150000',
         status: 'PAID',
         paidAt: new Date().toISOString(),
         raw: { ok: true },
@@ -71,7 +71,7 @@ describe('golden path', () => {
     expect(pending.available).toBe('0');
 
     // Platform revenue was recognised immediately.
-    expect(await systemBalance(db, 'PLATFORM_REVENUE_TOMAN')).toBe('140000');
+    expect(await systemBalance(db, 'PLATFORM_REVENUE_TOMAN')).toBe('150000');
 
     // --- 4. WAIT 48H -------------------------------------------------------
     // Nothing is releasable before the hold elapses.
@@ -182,7 +182,7 @@ describe('golden path', () => {
       evidence: {
         provider: 'CUBEPAY',
         externalPaymentId: 'cp_short_1',
-        paidAmount: '1140000',
+        paidAmount: '1150000',
         status: 'PAID',
         paidAt: new Date().toISOString(),
         raw: {},

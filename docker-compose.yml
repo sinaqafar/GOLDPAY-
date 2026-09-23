@@ -46,7 +46,7 @@ x-app: &app
     AUTO_EXCHANGE: "false"
     AUTO_BRIDGE: "false"
 
-    PLATFORM_FEE_PERCENT: "14"
+    PLATFORM_FEE_PERCENT: "15"
     PROVIDER_FEE_PERCENT: "9"
     PAYOUT_HOLD_HOURS: "48"
   depends_on:

@@ -308,16 +308,16 @@ describe('authentication', () => {
 });
 
 describe('invoices over HTTP', () => {
-  it('creates an invoice with the 14% fee applied', async () => {
+  it('creates an invoice with the 15% fee applied', async () => {
     const res = await call(keyA.token, 'POST', '/v1/invoices', {
       amount: '1000000',
       fee_mode: 'CUSTOMER',
       description: 'Test order',
     });
     expect(res.status).toBe(201);
-    expect(res.body.customer_total).toBe('1140000');
+    expect(res.body.customer_total).toBe('1150000');
     expect(res.body.merchant_net).toBe('1000000');
-    expect(res.body.platform_fee).toBe('140000');
+    expect(res.body.platform_fee).toBe('150000');
     // The sandbox provider returned a checkout link.
     expect(res.body.payment_url).toBeTruthy();
   });
@@ -534,9 +534,9 @@ describe('public checkout page (SPEC 1459)', () => {
 
     const html = await res.text();
     expect(html).toContain('1,000,000');
-    // CUSTOMER mode: 14% on top.
-    expect(html).toContain('140,000');
-    expect(html).toContain('1,140,000');
+    // CUSTOMER mode: 15% on top.
+    expect(html).toContain('150,000');
+    expect(html).toContain('1,150,000');
     expect(html).toContain('Test product');
   });
 
@@ -641,7 +641,7 @@ describe('merchant SDK (SPEC 1778/1779)', () => {
   it('signs correctly enough to be accepted by the real server', async () => {
     const invoice = await sdk().createInvoice({ amount: '250000' });
     expect(invoice['id']).toBeTruthy();
-    expect(invoice['customer_total']).toBe('285000');
+    expect(invoice['customer_total']).toBe('287500');
   });
 
   it('signs the query string, not just the path', async () => {

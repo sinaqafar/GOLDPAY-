@@ -268,7 +268,7 @@ export function loadConfig(env: Env = process.env): Config {
     throw new ConfigError('INVALID_CONFIG', 'PAYOUT_HOLD_HOURS cannot be negative');
   }
 
-  const feePercentRaw = Number.parseFloat(str(env, 'PLATFORM_FEE_PERCENT', '14'));
+  const feePercentRaw = Number.parseFloat(str(env, 'PLATFORM_FEE_PERCENT', '15'));
   const platformFeePercent = Percentage.fromPercent(feePercentRaw);
   if (platformFeePercent.bps > 10_000n) {
     throw new ConfigError('INVALID_CONFIG', 'PLATFORM_FEE_PERCENT cannot exceed 100');

@@ -79,7 +79,7 @@ export async function createInvoice(
   // Toman columns are NUMERIC(30,0). Reject anything that cannot fit BEFORE it
   // reaches SQL, otherwise the driver raises a numeric overflow and the caller
   // sees a 500 for what is plainly bad input. The ceiling is applied to the
-  // customer total, which is the largest derived figure (up to 114% of base).
+  // customer total, which is the largest derived figure (up to 115% of base).
   if (baseAmount.atomic > MAX_TOMAN_AMOUNT) {
     throw new ValidationError('AMOUNT_TOO_LARGE', 'amount exceeds the maximum supported value', {
       maximum: MAX_TOMAN_AMOUNT.toString(),

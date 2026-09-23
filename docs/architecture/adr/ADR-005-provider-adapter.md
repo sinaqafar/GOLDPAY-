@@ -11,10 +11,10 @@ requires `PaymentProviderPort` with CubePay, future and mock implementations
 behind it.
 
 **Economics.** CubePay charges roughly 9% of what it collects. The specification
-is emphatic that this must never be merged with our 14% into a single headline
+is emphatic that this must never be merged with our 15% into a single headline
 number shown to merchants:
 
-> «۱۴٪ کارمزد پلتفرم است. ۹٪ CubePay هزینه زیرساخت پرداخت است. این دو را در پنل
+> «۱۵٪ کارمزد پلتفرم است. ۹٪ CubePay هزینه زیرساخت پرداخت است. این دو را در پنل
 > فروشنده به یک کارمزد تبدیل نمی‌کنیم.»
 
 The merchant's contract is with us. CubePay deducts its cost from **our**
