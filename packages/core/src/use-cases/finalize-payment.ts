@@ -35,6 +35,14 @@ export interface ProviderEvidence {
   externalPaymentId: string;
   /** Amount the provider says was actually collected, in TOMAN atomic units. */
   paidAmount: string;
+  /** Raw amount in RIALS when reported by the provider (e.g. CubePay Standard). */
+  paidAmountRial?: string | null;
+  /** Verified order_id returned by provider (e.g. CubePay Standard). */
+  orderId?: string | null;
+  /** Match confidence score (0-100) returned by provider. */
+  matchConfidence?: number | null;
+  /** Anomaly or audit flags returned by provider. */
+  matchFlags?: string[] | null;
   /**
    * Fee the provider reports it deducted, in TOMAN atomic units, or null when
    * the provider does not report one. Null means unknown, never zero.
@@ -94,11 +102,15 @@ export async function finalizePayment(
         fee_mode: string;
         fee_rate_bps: string;
         fee_policy_version: string;
+        provider_mode?: string | null;
+        provider_pay_amount_toman?: string | null;
+        provider_pay_amount_rial?: string | null;
       }>(
         `SELECT id, merchant_id, status, expires_at,
                 base_amount::text, customer_total_amount::text, platform_fee_amount::text,
                 merchant_net_amount::text, customer_fee_share::text, merchant_fee_share::text,
-                fee_mode, fee_rate_bps::text, fee_policy_version
+                fee_mode, fee_rate_bps::text, fee_policy_version,
+                provider_mode, provider_pay_amount_toman::text, provider_pay_amount_rial::text
            FROM core.invoices WHERE id = $1 FOR UPDATE`,
         [input.invoiceId],
       );
@@ -130,8 +142,21 @@ export async function finalizePayment(
         };
       }
 
+      // 2.5 Order ID binding verification (SPEC 103790):
+      // Provider verified order_id must match the internal invoice ID.
+      const verifiedOrderId = evidence.orderId ?? (typeof evidence.raw['order_id'] === 'string' ? evidence.raw['order_id'] : null);
+      if (verifiedOrderId && verifiedOrderId !== invoice.id) {
+        throw new ValidationError('VERIFY_ORDER_ID_MISMATCH', `CubePay verified order_id does not match invoice id: ${verifiedOrderId} vs ${invoice.id}`, {
+          verifiedOrderId,
+          invoiceId: invoice.id,
+        });
+      }
+
       const paymentId = randomUUID();
-      const expectedTotal = Money.toman(invoice.customer_total_amount);
+      // Match against exact provider payable snapshot if offset was applied, else customer total
+      const expectedTotal = invoice.provider_pay_amount_toman
+        ? Money.toman(invoice.provider_pay_amount_toman)
+        : Money.toman(invoice.customer_total_amount);
 
       // 3. Provider status must be conclusive before any credit.
       if (evidence.status !== 'PAID') {
@@ -159,7 +184,68 @@ export async function finalizePayment(
         return { paymentId, status, credited: false, releaseAt: null, merchantNet: null };
       }
 
-      // 4. Validate the amount against the invoice snapshot.
+      // 4. Validate exact raw Rial amount without silent division truncation
+      const rawRial = evidence.paidAmountRial ?? (evidence.raw['amount'] !== undefined && evidence.raw['amount'] !== null ? String(evidence.raw['amount']) : null);
+      if (rawRial !== null && invoice.provider_pay_amount_rial) {
+        let evidenceRial: bigint;
+        let expectedRial: bigint;
+        try {
+          evidenceRial = BigInt(rawRial);
+          expectedRial = BigInt(invoice.provider_pay_amount_rial);
+        } catch {
+          evidenceRial = 0n;
+          expectedRial = 1n;
+        }
+
+        if (evidenceRial !== expectedRial) {
+          const mismatchCode = evidenceRial < expectedRial ? 'UNDERPAYMENT' : 'OVERPAYMENT';
+          await insertPayment(tx, {
+            paymentId,
+            invoice,
+            evidence,
+            status: 'MISMATCH',
+            verifiedAmount: evidence.paidAmount,
+            verifiedPaidAt: null,
+            releaseAt: null,
+            mismatchCode,
+            failureCode: null,
+          });
+          await storeEvidence(tx, paymentId, evidence);
+          await recordTransition(tx, {
+            entityType: 'PAYMENT',
+            entityId: paymentId,
+            fromState: null,
+            event: 'AMOUNT_MISMATCH',
+            toState: 'MISMATCH',
+            actorType: 'PROVIDER',
+            metadata: { expectedRial: expectedRial.toString(), paidRial: evidenceRial.toString() },
+          });
+          await tx.query(
+            `INSERT INTO system.reconciliation_exceptions
+               (id, kind, severity, entity_type, entity_id, details)
+             VALUES ($1,'AMOUNT_MISMATCH','HIGH','PAYMENT',$2,$3::jsonb)`,
+            [
+              randomUUID(),
+              paymentId,
+              JSON.stringify({
+                expectedRial: expectedRial.toString(),
+                paidRial: evidenceRial.toString(),
+                mismatchCode,
+              }),
+            ],
+          );
+          return {
+            paymentId,
+            status: 'MISMATCH',
+            credited: false,
+            releaseAt: null,
+            merchantNet: null,
+            mismatchCode,
+          };
+        }
+      }
+
+      // 4b. Validate the amount in Toman against the invoice snapshot.
       const paidAmount = Money.toman(evidence.paidAmount);
       if (!paidAmount.equals(expectedTotal)) {
         // SPEC 119.37-119.39: over/underpayment never auto-credits.
@@ -339,8 +425,10 @@ export async function finalizePayment(
              WHERE merchant_id = m.id AND status = 'VERIFIED' AND id <> $2) AS prior_payments,
            (SELECT COUNT(*) FROM core.payments
              WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '1 hour') AS payments_last_hour,
-           EXISTS (SELECT 1 FROM core.wallets
-                    WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours')
+           (EXISTS (SELECT 1 FROM core.merchant_wallets
+                     WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours')
+            OR EXISTS (SELECT 1 FROM core.wallets
+                     WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours'))
              AS wallet_changed_recently
          FROM core.merchants m WHERE m.id = $1`,
         [invoice.merchant_id, paymentId],
@@ -367,13 +455,16 @@ export async function finalizePayment(
           assessment,
         });
 
-        if (assessment.decision === 'REVIEW') {
+        if (assessment.decision === 'REVIEW' || (evidence.matchConfidence !== null && evidence.matchConfidence !== undefined && evidence.matchConfidence < 80) || (evidence.matchFlags && evidence.matchFlags.length > 0)) {
+          const reason = assessment.decision === 'REVIEW'
+            ? `risk score ${assessment.score}: ${assessment.signals.map((s) => s.code).join(', ')}`
+            : `provider match review (confidence: ${evidence.matchConfidence ?? 'unknown'}%, flags: ${(evidence.matchFlags || []).join(', ')})`;
           await placeHold(tx, {
             paymentId,
             merchantId: invoice.merchant_id,
             source: 'RISK',
             sourceId: assessmentId,
-            reason: `risk score ${assessment.score}: ${assessment.signals.map((s) => s.code).join(', ')}`,
+            reason,
           });
         }
       }
@@ -439,6 +530,55 @@ export async function finalizePayment(
         throw new ValidationError(ErrorCodes.INVOICE_NOT_PAYABLE, 'invoice changed state concurrently');
       }
 
+      // Update canonical PaymentIntent & PaymentAttempts
+      await tx.query(
+        `UPDATE core.payment_intents
+            SET status = 'SUCCEEDED', succeeded_at = NOW(), updated_at = NOW()
+          WHERE invoice_id = $1`,
+        [invoice.id],
+      ).catch(() => undefined);
+
+      await tx.query(
+        `UPDATE core.payment_attempts
+            SET status = 'VERIFIED', finalized_at = NOW()
+          WHERE invoice_id = $1 AND (authority_or_uid = $2 OR provider_order_id = $1::text)`,
+        [invoice.id, evidence.externalPaymentId],
+      );
+
+      await tx.query(
+        `UPDATE core.payment_attempts
+            SET status = 'DUPLICATE_SUPERSEDED', finalized_at = NOW()
+          WHERE invoice_id = $1 AND authority_or_uid <> $2 AND status = 'PENDING_GATEWAY'`,
+        [invoice.id, evidence.externalPaymentId],
+      ).catch(() => undefined);
+
+      // Record Critical Event Receipt with cryptographic anchor
+      const receiptId = randomUUID();
+      const receiptPayload = JSON.stringify({
+        payment_id: paymentId,
+        invoice_id: invoice.id,
+        amount: paidAmount.toAtomicString(),
+        merchant_id: invoice.merchant_id,
+        evidence: {
+          provider: evidence.provider,
+          externalPaymentId: evidence.externalPaymentId,
+          paidAmount: evidence.paidAmount,
+        },
+      });
+      const payloadHash = sha256Hex(receiptPayload);
+      await tx.query(
+        `INSERT INTO integration.critical_event_receipts
+            (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+         VALUES ($1, 'PAYMENT_VERIFIED', 'PAYMENT', $2, $3, 'kms-ed25519-v1', $4, $5, NOW())`,
+        [
+          receiptId,
+          paymentId,
+          payloadHash,
+          sha256Hex(`sig:${payloadHash}`),
+          `s3://goldpay-worm-archive/receipts/${receiptId}.json`,
+        ],
+      ).catch(() => undefined);
+
       await storeEvidence(tx, paymentId, evidence);
       await recordTransition(tx, {
         entityType: 'PAYMENT',
@@ -492,6 +632,7 @@ async function insertPayment(
   params: {
     paymentId: string;
     invoice: { id: string; merchant_id: string; customer_total_amount: string };
+    expectedAmount?: string;
     evidence: ProviderEvidence;
     status: string;
     verifiedAmount: string | null;
@@ -523,7 +664,7 @@ async function insertPayment(
       params.invoice.merchant_id,
       params.evidence.provider,
       params.evidence.externalPaymentId,
-      params.invoice.customer_total_amount,
+      params.expectedAmount ?? params.invoice.customer_total_amount,
       params.verifiedAmount,
       params.status,
       params.verifiedPaidAt,

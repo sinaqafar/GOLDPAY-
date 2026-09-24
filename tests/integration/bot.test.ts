@@ -92,6 +92,7 @@ describe('invoice conversation', () => {
     // The conversation is finished and cleaned up.
     expect((await h.db.query('SELECT 1 FROM core.bot_conversations')).rowCount).toBe(0);
     expect(telegram.sent.at(-1)?.text).toContain('فاکتور ساخته شد');
+    expect(telegram.sent.at(-1)?.text).toContain('/checkout/');
   });
 
   it('accepts Persian digits', async () => {

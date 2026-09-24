@@ -16,12 +16,20 @@ export interface ProviderInvoice {
   externalInvoiceId: string;
   paymentUrl: string;
   expiresAt: string | null;
+  providerPayAmountRial?: string | null;
+  providerPayAmountToman?: string | null;
+  providerTtlMinutes?: number | null;
+  redirectAfterPayment?: boolean | null;
 }
 
 export interface ProviderPaymentStatus {
   externalPaymentId: string;
   status: 'PAID' | 'FAILED' | 'PENDING' | 'UNKNOWN';
   paidAmount: string | null;
+  paidAmountRial?: string | null;
+  orderId?: string | null;
+  matchConfidence?: number | null;
+  matchFlags?: string[] | null;
   paidAt: string | null;
   /**
    * The fee the provider actually deducted, in TOMAN atomic units, when the

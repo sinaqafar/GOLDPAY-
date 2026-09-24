@@ -170,6 +170,7 @@ describe('mini app resources', () => {
     expect(res.body['customer_total']).toBe('575000');
     expect(res.body['platform_fee']).toBe('75000');
     expect(res.body['merchant_net']).toBe('500000');
+    expect(res.body['checkout_url']).toContain('/checkout/');
   });
 
   it('lists only this merchant\u2019s invoices', async () => {

@@ -115,7 +115,7 @@ label { display: block; font-size: 13px; color: var(--hint); margin-bottom: 6px;
 /* --- tab bar ------------------------------------------------------------- */
 #tabbar {
   position: fixed; bottom: 0; right: 0; left: 0;
-  display: grid; grid-template-columns: repeat(4, 1fr);
+  display: grid; grid-template-columns: repeat(5, 1fr);
   background: var(--secondary-bg);
   border-top: 1px solid var(--bg);
   padding-bottom: env(safe-area-inset-bottom);

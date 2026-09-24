@@ -282,7 +282,7 @@ export async function verifyProjection(
   if (!type) throw new FinancialError('LEDGER_UNKNOWN_ACCOUNT', 'account not found', { accountId });
 
   // Sign the sum according to the account's natural balance direction.
-  const sign = type === 'LIABILITY' ? '(e.credit - e.debit)' : '(e.debit - e.credit)';
+  const sign = (type === 'LIABILITY' || type === 'REVENUE' || type === 'EQUITY') ? '(e.credit - e.debit)' : '(e.debit - e.credit)';
   const computed = await tx.query<{ bucket: string; total: string }>(
     `SELECT e.bucket, COALESCE(SUM(${sign}),0)::text AS total
        FROM finance.journal_entries e

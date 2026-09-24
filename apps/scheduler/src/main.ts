@@ -13,10 +13,13 @@ import { verifyGlobalBalance } from '../../../packages/ledger/src/ledger-service
 import { expireStaleInvoices } from '../../../packages/core/src/use-cases/create-invoice.ts';
 import { expireStaleReservations } from '../../../packages/core/src/use-cases/payout.ts';
 import { purgeExpired } from '../../../packages/core/src/idempotency.ts';
+import { pollPendingInvoices } from '../../../packages/core/src/use-cases/poll-pending-invoices.ts';
 
 export interface SchedulerReport {
   ledgerBalanced: boolean;
   invoicesExpired: number;
+  invoicesPolled: number;
+  invoicesRecovered: number;
   reservationsExpired: number;
   staleUnknownPayouts: number;
   openExceptions: number;
@@ -26,11 +29,14 @@ export interface SchedulerReport {
  * The integrity sweep. Safe to run repeatedly; it only reports and records.
  */
 export async function runIntegritySweep(container: Container): Promise<SchedulerReport> {
-  const { db, logger } = container;
+  const { db, config, providerResolver, logger } = container;
 
   const invoicesExpired = await expireStaleInvoices(db);
   const reservationsExpired = await expireStaleReservations(db);
   await purgeExpired(db);
+
+  // Independent Status Polling for Pending Invoices (CubePay Standard fallback recovery)
+  const pollResult = await pollPendingInvoices(db, config, providerResolver);
 
   // THE global invariant: debits must equal credits, per currency.
   const balance = await db.transaction((tx) => verifyGlobalBalance(tx));
@@ -76,7 +82,9 @@ export async function runIntegritySweep(container: Container): Promise<Scheduler
 
   const report: SchedulerReport = {
     ledgerBalanced: balance.balanced,
-    invoicesExpired,
+    invoicesExpired: invoicesExpired + pollResult.expired,
+    invoicesPolled: pollResult.polled,
+    invoicesRecovered: pollResult.verified,
     reservationsExpired,
     staleUnknownPayouts,
     openExceptions: Number.parseInt(open.rows[0]?.count ?? '0', 10),

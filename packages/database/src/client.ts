@@ -199,6 +199,21 @@ class DatabaseImpl implements Database {
     params: readonly unknown[] = [],
   ): Promise<QueryResult<R>> {
     this.#assertOpen();
+    if (this.driver === 'pglite') {
+      const previous = this.#lock;
+      let release!: () => void;
+      this.#lock = new Promise<void>((r) => {
+        release = r;
+      });
+      await previous.catch(() => undefined);
+      try {
+        return await this.#raw.query<R>(sql, params);
+      } catch (e) {
+        throw translateDbError(e);
+      } finally {
+        release();
+      }
+    }
     try {
       return await this.#raw.query<R>(sql, params);
     } catch (e) {
@@ -209,6 +224,22 @@ class DatabaseImpl implements Database {
   /** Multi-statement DDL (migrations only). */
   async exec(sql: string): Promise<void> {
     this.#assertOpen();
+    if (this.driver === 'pglite') {
+      const previous = this.#lock;
+      let release!: () => void;
+      this.#lock = new Promise<void>((r) => {
+        release = r;
+      });
+      await previous.catch(() => undefined);
+      try {
+        await this.#raw.exec(sql);
+      } catch (e) {
+        throw translateDbError(e);
+      } finally {
+        release();
+      }
+      return;
+    }
     try {
       await this.#raw.exec(sql);
     } catch (e) {
@@ -259,9 +290,8 @@ class DatabaseImpl implements Database {
     const id = randomUUID();
     let began = false;
     try {
-      await run('BEGIN', []);
+      await run(`BEGIN ISOLATION LEVEL ${isolation}`, []);
       began = true;
-      await run(`SET TRANSACTION ISOLATION LEVEL ${isolation}`, []);
 
       const ctx: TransactionContext = {
         id,

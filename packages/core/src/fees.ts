@@ -153,6 +153,20 @@ export function calculateFees(
  *     we receive               910,000
  *     merchant is credited     850,000
  *     our gross margin          60,000
+ *
+ * Worked example (CUSTOMER mode, 1,000,000 base, 15% platform, 9% provider):
+ *     customer pays          1,150,000
+ *     provider keeps           103,500
+ *     we receive             1,046,500
+ *     merchant is credited   1,000,000
+ *     our gross margin          46,500
+ *
+ * Worked example (SPLIT mode, 1,000,000 base, 15% platform (7.5%+7.5%), 9% provider):
+ *     customer pays          1,075,000
+ *     provider keeps            96,750
+ *     we receive               978,250
+ *     merchant is credited     925,000
+ *     our gross margin          53,250
  */
 export interface ProviderCostBreakdown {
   /** Amount the provider actually collected from the customer. */

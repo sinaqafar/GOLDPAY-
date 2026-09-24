@@ -9,6 +9,13 @@ export interface SendTransferRequest {
   to: string;
   amountAtomic: bigint;
   network: string;
+  /**
+   * Base64 serialized Bag of Cells (BoC) containing the signed TON external message.
+   * Required for official TonCenter v3 broadcast: POST /api/v3/message { "boc": ... }
+   */
+  signedBoc?: string;
+  /** Signing reference for audit and fallback lookup. */
+  signingReference?: string;
 }
 
 export interface BroadcastResult {
@@ -54,4 +61,6 @@ export interface BlockchainPayoutPort {
   getBalance(address: string): Promise<bigint>;
   /** Address format validation for the configured network. */
   isValidAddress(address: string, network: string): boolean;
+  /** Current on-chain sequence number (seqno) of a wallet. */
+  getOnChainSeqno?(address: string): Promise<number>;
 }

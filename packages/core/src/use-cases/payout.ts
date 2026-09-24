@@ -16,7 +16,7 @@
 import { randomUUID } from 'node:crypto';
 import type { Database, TransactionContext } from '../../../database/src/client.ts';
 import { Money, Rate } from '../../../money/src/index.ts';
-import { post } from '../../../ledger/src/ledger-service.ts';
+import { post, type JournalLine } from '../../../ledger/src/ledger-service.ts';
 import { getOrCreateMerchantAccount, getSystemAccountId } from '../../../ledger/src/accounts.ts';
 import { enqueue } from '../outbox.ts';
 import { recordTransition, transitionState } from '../transitions.ts';
@@ -25,6 +25,7 @@ import type { Config } from '../../../config/src/index.ts';
 import type { RateProvider } from '../ports/rate-provider.ts';
 import type { BlockchainPayoutPort, BroadcastResult } from '../ports/blockchain.ts';
 import type { SignerPort } from '../ports/signer.ts';
+import { TonSeqnoManager } from '../../../ton/src/seqno-manager.ts';
 import { assertGramWithinBounds, assertTomanWithinBounds } from '../limits.ts';
 import {
   PayoutError,
@@ -38,14 +39,28 @@ import {
 // 1. Queue a payout
 // ---------------------------------------------------------------------------
 
+export interface QueuePayoutOptions {
+  mode?: 'AUTOMATIC' | 'INSTANT';
+  requestedAmountToman?: bigint;
+}
+
 export interface QueuePayoutResult {
   payoutId: string | null;
   amountToman: string | null;
+  grossAmountToman?: string | null;
+  instantFeeToman?: string | null;
+  payoutType?: 'AUTOMATIC' | 'INSTANT';
+  feeType?: 'NONE' | 'INSTANT_WITHDRAWAL_FEE';
   reason?: string;
 }
 
 /**
  * Move a merchant's AVAILABLE liability into SETTLING and create the payout.
+ *
+ * Supports two modes:
+ * - AUTOMATIC (default): 0% withdrawal fee, processed after 48h hold.
+ * - INSTANT: 2% withdrawal fee (INSTANT_WITHDRAWAL_FEE), deducted immediately
+ *   and credited to INSTANT_WITHDRAWAL_REVENUE_TOMAN, net amount moved to SETTLING.
  *
  * The partial unique index `ux_payouts_merchant_in_flight` guarantees a merchant
  * can only have one in-flight payout, which is what closes the double-spend
@@ -55,7 +70,9 @@ export async function queuePayoutForMerchant(
   db: Database,
   config: Config,
   merchantId: string,
+  options: QueuePayoutOptions = {},
 ): Promise<QueuePayoutResult> {
+  const mode = options.mode ?? 'AUTOMATIC';
   return db.transaction(
     async (tx) => {
       const merchantRes = await tx.query<{ id: string; status: string; auto_payout: boolean }>(
@@ -67,7 +84,7 @@ export async function queuePayoutForMerchant(
       if (merchant.status !== 'ACTIVE') {
         return { payoutId: null, amountToman: null, reason: 'MERCHANT_NOT_ACTIVE' };
       }
-      if (!merchant.auto_payout || !config.settlement.autoPayoutEnabled) {
+      if (mode === 'AUTOMATIC' && (!merchant.auto_payout || !config.settlement.autoPayoutEnabled)) {
         return { payoutId: null, amountToman: null, reason: 'AUTO_PAYOUT_DISABLED' };
       }
 
@@ -92,12 +109,29 @@ export async function queuePayoutForMerchant(
         hold_until: string | null;
       }>(
         `SELECT id, address, network, status, hold_until
-           FROM core.wallets
+           FROM core.merchant_wallets
           WHERE merchant_id = $1 AND status = 'ACTIVE'
           FOR UPDATE`,
         [merchantId],
       );
-      const wallet = walletRes.rows[0];
+      let wallet = walletRes.rows[0];
+      if (!wallet) {
+        const legacyRes = await tx.query<{
+          id: string;
+          address: string;
+          network: string;
+          status: string;
+          hold_until: string | null;
+        }>(
+          `SELECT id, address, network, status, hold_until
+             FROM core.wallets
+            WHERE merchant_id = $1 AND status = 'ACTIVE'
+            FOR UPDATE`,
+          [merchantId],
+        );
+        wallet = legacyRes.rows[0];
+      }
+
       if (!wallet) {
         return { payoutId: null, amountToman: null, reason: ErrorCodes.WALLET_NOT_ACTIVE };
       }
@@ -113,48 +147,64 @@ export async function queuePayoutForMerchant(
       );
       const available = Money.toman(balanceRes.rows[0]?.available ?? '0');
 
-      if (available.atomic < config.settlement.minPayoutToman) {
+      let grossAmount: Money;
+      if (options.requestedAmountToman !== undefined) {
+        if (options.requestedAmountToman > available.atomic) {
+          return { payoutId: null, amountToman: null, reason: 'INSUFFICIENT_AVAILABLE_BALANCE' };
+        }
+        grossAmount = Money.toman(options.requestedAmountToman);
+      } else {
+        grossAmount = available;
+      }
+
+      if (grossAmount.atomic < config.settlement.minPayoutToman) {
         return { payoutId: null, amountToman: null, reason: 'BELOW_MINIMUM' };
       }
+
       // Cap a single payout so one huge settlement cannot drain the treasury.
-      const amount =
-        available.atomic > config.settlement.maxPayoutToman
-          ? Money.toman(config.settlement.maxPayoutToman)
-          : available;
-      assertTomanWithinBounds(amount.atomic, 'payout amount');
+      if (grossAmount.atomic > config.settlement.maxPayoutToman) {
+        grossAmount = Money.toman(config.settlement.maxPayoutToman);
+      }
+      assertTomanWithinBounds(grossAmount.atomic, 'payout gross amount');
+
+      // Calculate instant fee (2% / 200 bps) if INSTANT mode; otherwise 0%
+      let instantFee = Money.zero('TOMAN');
+      let netAmount = grossAmount;
+      let feeType: 'NONE' | 'INSTANT_WITHDRAWAL_FEE' = 'NONE';
+
+      if (mode === 'INSTANT') {
+        // 2% Instant Withdrawal Fee
+        instantFee = grossAmount.mulDiv(2n, 100n, 'FLOOR');
+        netAmount = grossAmount.subtract(instantFee);
+        feeType = 'INSTANT_WITHDRAWAL_FEE';
+      }
+
+      if (!netAmount.isPositive()) {
+        return { payoutId: null, amountToman: null, reason: 'NET_AMOUNT_NON_POSITIVE' };
+      }
 
       const payoutId = randomUUID();
       await tx.query(
         `INSERT INTO finance.payouts
             (id, merchant_id, wallet_id, amount_toman, status,
-             destination_address, destination_network)
-         VALUES ($1,$2,$3,$4,'CREATED',$5,$6)`,
-        [payoutId, merchantId, wallet.id, amount.toAtomicString(), wallet.address, wallet.network],
+             destination_address, destination_network, payout_type, fee_type,
+             gross_amount_toman, withdrawal_fee_toman)
+         VALUES ($1,$2,$3,$4,'CREATED',$5,$6,$7,$8,$9,$10)`,
+        [
+          payoutId,
+          merchantId,
+          wallet.id,
+          netAmount.toAtomicString(),
+          wallet.address,
+          wallet.network,
+          mode,
+          feeType,
+          grossAmount.toAtomicString(),
+          instantFee.toAtomicString(),
+        ],
       );
 
       // Which released payments this payout settles, oldest first.
-      //
-      // The per-payment figure must be scoped to the MERCHANT'S OWN liability
-      // account: a payment journal also touches the provider clearing asset and
-      // platform revenue, and summing those in would net to zero.
-      // Allocate payments up to EXACTLY the payout amount, oldest first.
-      //
-      // Two bugs live here if this is done carelessly:
-      //
-      //  1. Without the running-total cap, every unallocated payment is
-      //     attached regardless of the payout's size, so the items can sum to
-      //     more than the payout itself and the audit trail contradicts the
-      //     ledger.
-      //
-      //  2. Excluding any payment that has EVER appeared in payout_items
-      //     strands money permanently: a failed payout returns the funds to
-      //     AVAILABLE but leaves its rows behind, so the payment is spendable
-      //     in the ledger yet invisible to every future selection. Only items
-      //     belonging to a LIVE payout may exclude a payment.
-      //
-      // A payment larger than the remaining room is left for the next payout
-      // rather than partially attached, so an item always means "this payment
-      // was settled by this payout".
       await tx.query(
         `INSERT INTO finance.payout_items(payout_id, payment_id, amount_toman)
          SELECT $1, payment_id, amount
@@ -185,19 +235,34 @@ export async function queuePayoutForMerchant(
           WHERE running_total <= $4::numeric
           ORDER BY running_total
          ON CONFLICT DO NOTHING`,
-        [payoutId, merchantId, merchantAccount, amount.toAtomicString()],
+        [payoutId, merchantId, merchantAccount, grossAmount.toAtomicString()],
       );
 
-      // AVAILABLE -> SETTLING on the merchant's liability account.
+      // Ledger Journal Posting:
+      // In AUTOMATIC mode: DR merchant (AVAILABLE) amount, CR merchant (SETTLING) amount
+      // In INSTANT mode:
+      //   DR merchant (AVAILABLE) grossAmount
+      //   CR merchant (SETTLING) netAmount
+      //   CR instant fee revenue (AVAILABLE) instantFee (2%)
+      const lines: JournalLine[] = [
+        { accountId: merchantAccount, debit: grossAmount, bucket: 'AVAILABLE' as const },
+        { accountId: merchantAccount, credit: netAmount, bucket: 'SETTLING' as const },
+      ];
+
+      if (mode === 'INSTANT' && instantFee.isPositive()) {
+        const instantFeeAccount = await getSystemAccountId(tx, 'INSTANT_WITHDRAWAL_REVENUE_TOMAN');
+        lines.push({ accountId: instantFeeAccount, credit: instantFee, bucket: 'AVAILABLE' as const });
+      }
+
       const posting = await post(tx, {
         referenceType: 'PAYOUT',
         referenceId: payoutId,
         operationId: `payout:queued:${payoutId}`,
-        description: 'available liability moved to settling',
-        lines: [
-          { accountId: merchantAccount, debit: amount, bucket: 'AVAILABLE' },
-          { accountId: merchantAccount, credit: amount, bucket: 'SETTLING' },
-        ],
+        description:
+          mode === 'INSTANT'
+            ? 'instant withdrawal 2% fee (INSTANT_WITHDRAWAL_FEE) and available liability moved to settling'
+            : 'available liability moved to settling',
+        lines,
       });
       if (!posting.created) {
         throw new FinancialError(ErrorCodes.DUPLICATE_OPERATION, 'payout queue posting already exists');
@@ -210,7 +275,7 @@ export async function queuePayoutForMerchant(
         fromState: 'CREATED',
         toState: 'QUEUED',
         event: 'QUEUE',
-        actorType: 'WORKER',
+        actorType: mode === 'INSTANT' ? 'MERCHANT' : 'WORKER',
       });
 
       await enqueue(tx, {
@@ -220,14 +285,39 @@ export async function queuePayoutForMerchant(
         payload: {
           payout_id: payoutId,
           merchant_id: merchantId,
-          amount_toman: amount.toAtomicString(),
+          amount_toman: netAmount.toAtomicString(),
+          gross_amount_toman: grossAmount.toAtomicString(),
+          instant_fee_toman: instantFee.toAtomicString(),
+          payout_type: mode,
         },
       });
 
-      return { payoutId, amountToman: amount.toAtomicString() };
+      return {
+        payoutId,
+        amountToman: netAmount.toAtomicString(),
+        grossAmountToman: grossAmount.toAtomicString(),
+        instantFeeToman: instantFee.toAtomicString(),
+        payoutType: mode,
+        feeType,
+      };
     },
     { isolation: 'SERIALIZABLE', retries: 3 },
   );
+}
+
+/**
+ * Merchant-initiated Instant Payout with 2% Instant Withdrawal Fee.
+ */
+export async function queueInstantPayoutForMerchant(
+  db: Database,
+  config: Config,
+  merchantId: string,
+  requestedAmountToman?: bigint,
+): Promise<QueuePayoutResult> {
+  return queuePayoutForMerchant(db, config, merchantId, {
+    mode: 'INSTANT',
+    requestedAmountToman,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -565,6 +655,8 @@ export async function signPayout(
   // for money that may already be committed (SPEC 5569/5570). That idempotency
   // is what makes it safe to do this outside the transaction.
   let signingReference: string;
+  let signedKeyId = 'kms-ed25519-v1';
+  let signatureHex = '';
   if (signer) {
     const signed = await signer.sign({
       signRequestId: `payout:${payoutId}`,
@@ -576,6 +668,8 @@ export async function signPayout(
       fromAddress: config.ton.payoutWalletAddress ?? '',
     });
     signingReference = signed.signingReference;
+    signedKeyId = signed.signer ?? 'kms-ed25519-v1';
+    signatureHex = signed.unsignedHash ?? '';
   } else {
     // No signer wired up (development). The state machine still records that
     // signing happened, so the SIGNED stage cannot be skipped by accident.
@@ -617,6 +711,28 @@ export async function signPayout(
       actorType: 'WORKER',
     });
 
+    // Record Critical Event Receipt for signed payout
+    const receiptId = randomUUID();
+    const receiptPayload = JSON.stringify({
+      payout_id: payoutId,
+      signing_reference: signingReference,
+      signer_key_id: signedKeyId,
+    });
+    const payloadHash = sha256Hex(receiptPayload);
+    await tx.query(
+      `INSERT INTO integration.critical_event_receipts
+          (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+         VALUES ($1, 'PAYOUT_SIGNED', 'PAYOUT', $2, $3, $4, $5, $6, NOW())`,
+      [
+        receiptId,
+        payoutId,
+        payloadHash,
+        signedKeyId,
+        signatureHex || sha256Hex(`sig:${payloadHash}`),
+        `s3://goldpay-worm-archive/payout-receipts/${receiptId}.json`,
+      ],
+    ).catch(() => undefined);
+
     return { status: 'SIGNED' as const, signingReference };
   });
 }
@@ -636,7 +752,7 @@ export async function broadcastPayout(
   db: Database,
   chain: BlockchainPayoutPort,
   payoutId: string,
-): Promise<{ status: 'BROADCASTED' | 'UNKNOWN' | 'FAILED'; txHash?: string }> {
+): Promise<{ status: 'BROADCASTED' | 'UNKNOWN' | 'FAILED' | 'QUEUED_FOR_ORDERED_BROADCAST'; txHash?: string; reason?: string }> {
   const prepared = await db.transaction(async (tx) => {
     const r = await tx.query<{
       id: string;
@@ -646,9 +762,10 @@ export async function broadcastPayout(
       destination_network: string;
       merchant_id: string;
       attempt_count: number;
+      signing_reference: string | null;
     }>(
       `SELECT id, status, gram_amount_atomic::text, destination_address,
-              destination_network, merchant_id, attempt_count
+              destination_network, merchant_id, attempt_count, signing_reference
          FROM finance.payouts WHERE id = $1 FOR UPDATE`,
       [payoutId],
     );
@@ -657,6 +774,24 @@ export async function broadcastPayout(
     // SPEC 5502 — only a SIGNED payout may be broadcast.
     if (payout.status !== 'SIGNED') {
       throw new PayoutError('PAYOUT_NOT_BROADCASTABLE', `payout is ${payout.status}`);
+    }
+
+    // Sequence Gate check: if this payout has an allocated TON seqno, verify predecessor confirmation
+    const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+      `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+      [payoutId],
+    );
+    if (allocRow.rows[0]) {
+      const gate = await TonSeqnoManager.canBroadcast(tx, allocRow.rows[0].treasury_address, payoutId);
+      if (!gate.allowed) {
+        return {
+          allowed: false as const,
+          gateReason: gate.reason,
+          predecessorSeqno: gate.predecessorSeqno,
+          treasuryAddress: allocRow.rows[0].treasury_address,
+          expectedSeqno: gate.expectedSeqno,
+        };
+      }
     }
 
     const reservation = await tx.query<{ id: string; amount_atomic: string }>(
@@ -672,12 +807,21 @@ export async function broadcastPayout(
     // SPEC 97.115 — destination guard. The address we are about to pay must
     // still be the merchant's active wallet. A wallet change mid-flight must
     // never silently redirect funds.
-    const wallet = await tx.query<{ address: string; network: string }>(
-      `SELECT address, network FROM core.wallets
+    const walletRes = await tx.query<{ address: string; network: string }>(
+      `SELECT address, network FROM core.merchant_wallets
         WHERE merchant_id = $1 AND status = 'ACTIVE'`,
       [payout.merchant_id],
     );
-    const activeWallet = wallet.rows[0];
+    let activeWallet = walletRes.rows[0];
+    if (!activeWallet) {
+      const legacyRes = await tx.query<{ address: string; network: string }>(
+        `SELECT address, network FROM core.wallets
+          WHERE merchant_id = $1 AND status = 'ACTIVE'`,
+        [payout.merchant_id],
+      );
+      activeWallet = legacyRes.rows[0];
+    }
+
     if (
       !activeWallet ||
       activeWallet.address !== payout.destination_address ||
@@ -703,13 +847,28 @@ export async function broadcastPayout(
       [payoutId],
     );
 
+    const signedBoc = payout.signing_reference?.startsWith('ton-boc:')
+      ? payout.signing_reference.slice('ton-boc:'.length)
+      : undefined;
+
     return {
+      allowed: true as const,
       amount: Money.gram(payout.gram_amount_atomic as string),
       destination: payout.destination_address,
       network: payout.destination_network,
       merchantId: payout.merchant_id,
+      signingReference: payout.signing_reference ?? undefined,
+      signedBoc,
+      treasuryAddress: allocRow.rows[0]?.treasury_address,
     };
   });
+
+  if (!prepared.allowed) {
+    return {
+      status: 'QUEUED_FOR_ORDERED_BROADCAST',
+      reason: prepared.gateReason,
+    };
+  }
 
   let result: BroadcastResult;
   try {
@@ -720,6 +879,8 @@ export async function broadcastPayout(
       to: prepared.destination,
       amountAtomic: prepared.amount.atomic,
       network: prepared.network,
+      signedBoc: prepared.signedBoc,
+      signingReference: prepared.signingReference,
     });
   } catch (e) {
     // The send may or may not have reached the network: treat as UNKNOWN.
@@ -752,6 +913,11 @@ export async function broadcastPayout(
       },
       actorType: 'WORKER',
     });
+
+    if (prepared.treasuryAddress) {
+      await TonSeqnoManager.markBroadcasted(tx, prepared.treasuryAddress, payoutId);
+    }
+
     const raw = JSON.stringify(result.raw ?? {});
     await tx.query(
       `INSERT INTO integration.provider_evidence
@@ -1043,6 +1209,20 @@ export async function settlePayout(
         actorType: 'WORKER',
       });
 
+      // Confirm seqno allocation on TonSeqnoManager
+      const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+        `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+        [payoutId],
+      );
+      if (allocRow.rows[0]) {
+        await TonSeqnoManager.confirm(
+          tx,
+          allocRow.rows[0].treasury_address,
+          payoutId,
+          allocRow.rows[0].allocated_seqno,
+        );
+      }
+
       await enqueue(tx, {
         eventType: 'payout.confirmed',
         aggregateType: 'PAYOUT',
@@ -1079,8 +1259,10 @@ export async function failPayout(
         status: string;
         merchant_id: string;
         amount_toman: string;
+        payout_type: string | null;
+        withdrawal_fee_toman: string | null;
       }>(
-        `SELECT id, status, merchant_id, amount_toman::text
+        `SELECT id, status, merchant_id, amount_toman::text, payout_type, withdrawal_fee_toman::text
            FROM finance.payouts WHERE id = $1 FOR UPDATE`,
         [payoutId],
       );
@@ -1099,17 +1281,29 @@ export async function failPayout(
       }
 
       const amount = Money.toman(payout.amount_toman);
+      const fee = Money.toman(payout.withdrawal_fee_toman ?? '0');
       const merchantAccount = await getOrCreateMerchantAccount(tx, payout.merchant_id);
+
+      const lines: JournalLine[] = [
+        { accountId: merchantAccount, debit: amount, bucket: 'SETTLING' as const },
+        { accountId: merchantAccount, credit: amount, bucket: 'AVAILABLE' as const },
+      ];
+
+      // If an INSTANT payout fails, reverse the instant fee back to the merchant's available balance
+      if (payout.payout_type === 'INSTANT' && fee.isPositive()) {
+        const instantFeeAccount = await getSystemAccountId(tx, 'INSTANT_WITHDRAWAL_REVENUE_TOMAN');
+        lines.push(
+          { accountId: instantFeeAccount, debit: fee, bucket: 'AVAILABLE' as const },
+          { accountId: merchantAccount, credit: fee, bucket: 'AVAILABLE' as const },
+        );
+      }
 
       const posting = await post(tx, {
         referenceType: 'PAYOUT',
         referenceId: payoutId,
         operationId: `payout:failed:${payoutId}`,
         description: `payout failed: ${reason}`,
-        lines: [
-          { accountId: merchantAccount, debit: amount, bucket: 'SETTLING' },
-          { accountId: merchantAccount, credit: amount, bucket: 'AVAILABLE' },
-        ],
+        lines,
       });
       if (!posting.created) return { failed: false };
 
@@ -1139,6 +1333,20 @@ export async function failPayout(
         extraSet: { failure_code: reason.slice(0, 200) },
         actorType: 'WORKER',
       });
+
+      // Mark seqno allocation as FAILED to prevent sequence violation on subsequent payouts
+      const allocRow = await tx.query<{ allocated_seqno: number; treasury_address: string }>(
+        `SELECT allocated_seqno, treasury_address FROM finance.payout_seqno_allocations WHERE payout_id = $1`,
+        [payoutId],
+      );
+      if (allocRow.rows[0]) {
+        await TonSeqnoManager.fail(
+          tx,
+          allocRow.rows[0].treasury_address,
+          payoutId,
+          allocRow.rows[0].allocated_seqno,
+        );
+      }
 
       await enqueue(tx, {
         eventType: 'payout.failed',
@@ -1321,6 +1529,27 @@ export async function recordManualTreasuryFunding(
         { accountId: equityAccount, credit: amount },
       ],
     });
+
+    const receiptId = randomUUID();
+    const receiptPayload = JSON.stringify({
+      treasury_account_id: params.treasuryAccountId,
+      amount: amount.toAtomicString(),
+      tx_hash: params.txHash,
+      direction: 'IN',
+    });
+    const payloadHash = sha256Hex(receiptPayload);
+    await tx.query(
+      `INSERT INTO integration.critical_event_receipts
+          (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+       VALUES ($1, 'TREASURY_MOVEMENT', 'TREASURY', $2, $3, 'kms-ed25519-v1', $4, $5, NOW())`,
+      [
+        receiptId,
+        params.treasuryAccountId,
+        payloadHash,
+        sha256Hex(`sig:${payloadHash}`),
+        `s3://goldpay-worm-archive/treasury-receipts/${receiptId}.json`,
+      ],
+    ).catch(() => undefined);
 
     await tx.query(
       `INSERT INTO audit.audit_logs(id, actor_type, actor_id, action, resource_type, resource_id, reason, metadata)

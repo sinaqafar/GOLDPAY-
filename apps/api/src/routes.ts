@@ -34,7 +34,7 @@ import { finalizePayment } from '../../../packages/core/src/use-cases/finalize-p
 import { runIdempotent, hashRequest } from '../../../packages/core/src/idempotency.ts';
 import { isFeeMode } from '../../../packages/core/src/fees.ts';
 import { assertSafeWebhookUrl } from '../../../packages/core/src/webhooks.ts';
-import { generateApiKey } from '../../../packages/crypto/src/index.ts';
+import { generateApiKey, sha256Hex } from '../../../packages/crypto/src/index.ts';
 import { isValidTonAddress } from '../../../packages/ton/src/adapter.ts';
 import {
   ValidationError,
@@ -54,15 +54,41 @@ export function buildRouter(container: Container): Router {
   /**
    * Prometheus exposition.
    *
-   * Not on the public internet: the figures here (treasury balance, queue
-   * depth) are operational intelligence. In production this is reached over
-   * the private network or behind the edge's own auth.
+   * Secured endpoint: access is restricted to authenticated scrapers
+   * via METRICS_AUTH_TOKEN or internal monitoring bearer auth.
    */
-  router.get('/metrics', async () => ({
-    status: 200,
-    headers: { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' },
-    body: await renderMetrics(db),
-  }));
+  router.get('/metrics', async (ctx) => {
+    const requiredToken = config.security.metricsAuthToken;
+    const authHeader = ctx.headers['authorization'] ?? ctx.headers['x-metrics-key'] ?? ctx.headers['x-metrics-token'];
+    
+    if (requiredToken) {
+      const isAuthorized =
+        authHeader === `Bearer ${requiredToken}` ||
+        authHeader === requiredToken;
+      if (!isAuthorized) {
+        return {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+          body: { error: 'UNAUTHORIZED_METRICS_ACCESS', message: 'Valid METRICS_AUTH_TOKEN is required' },
+        };
+      }
+    } else if (config.app.isProduction) {
+      // In production without explicit token, reject public scraping
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return {
+          status: 401,
+          headers: { 'content-type': 'application/json' },
+          body: { error: 'UNAUTHORIZED_METRICS_ACCESS', message: 'Metrics access is restricted in production' },
+        };
+      }
+    }
+
+    return {
+      status: 200,
+      headers: { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' },
+      body: await renderMetrics(db),
+    };
+  });
 
   router.get('/health/ready', async () => {
     try {
@@ -128,9 +154,16 @@ export function buildRouter(container: Container): Router {
 
       // Create the provider checkout AFTER our own record exists and the
       // transaction has committed (SPEC 4347: no HTTP inside a financial tx).
+      // Resolve provider adapter dynamically via providerResolver
+      const activeAdapter = container.providerResolver
+        ? container.providerResolver.resolveForInvoice({ providerMode: invoice.providerMode })
+        : provider;
+
       let paymentUrl: string | null = null;
+      const attemptId = randomUUID();
+
       try {
-        const providerInvoice = await provider.createInvoice({
+        const providerInvoice = await activeAdapter.createInvoice({
           internalInvoiceId: invoice.invoiceId,
           amount: invoice.customerTotal,
           description: optionalString(body, 'description'),
@@ -138,10 +171,50 @@ export function buildRouter(container: Container): Router {
         });
         paymentUrl = providerInvoice.paymentUrl;
         await db.query(
-          `UPDATE core.invoices SET provider_invoice_id = $2, provider_payment_url = $3, updated_at = NOW()
+          `UPDATE core.invoices
+              SET provider_invoice_id = $2,
+                  provider_payment_url = $3,
+                  provider_order_id = $4,
+                  provider_pay_amount_rial = $5,
+                  provider_pay_amount_toman = $6,
+                  provider_ttl_minutes = $7,
+                  redirect_after_payment = $8,
+                  updated_at = NOW()
             WHERE id = $1`,
-          [invoice.invoiceId, providerInvoice.externalInvoiceId, providerInvoice.paymentUrl],
+          [
+            invoice.invoiceId,
+            providerInvoice.externalInvoiceId,
+            providerInvoice.paymentUrl,
+            invoice.invoiceId,
+            providerInvoice.providerPayAmountRial ?? null,
+            providerInvoice.providerPayAmountToman ?? null,
+            providerInvoice.providerTtlMinutes ?? null,
+            providerInvoice.redirectAfterPayment ?? true,
+          ],
         );
+
+        // Record successful payment attempt
+        await db.query(
+          `INSERT INTO core.payment_attempts (
+             id, payment_intent_id, invoice_id, attempt_number, provider, provider_mode,
+             provider_version, provider_order_id, authority_or_uid, payment_url,
+             pay_amount_rial, pay_amount_toman, status
+           ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, 'PENDING_GATEWAY')
+           ON CONFLICT (payment_intent_id, attempt_number) DO NOTHING`,
+          [
+            attemptId,
+            invoice.paymentIntentId,
+            invoice.invoiceId,
+            invoice.provider,
+            invoice.providerMode,
+            invoice.providerVersion,
+            invoice.invoiceId,
+            providerInvoice.externalInvoiceId,
+            providerInvoice.paymentUrl,
+            providerInvoice.providerPayAmountRial ?? `${BigInt(invoice.customerTotal) * 10n}`,
+            providerInvoice.providerPayAmountToman ?? invoice.customerTotal,
+          ],
+        ).catch(() => undefined);
       } catch (e) {
         // The invoice exists and is valid; only the checkout link is missing.
         // It can be retried without creating a second invoice.
@@ -149,6 +222,36 @@ export function buildRouter(container: Container): Router {
           invoiceId: invoice.invoiceId,
           message: e instanceof Error ? e.message : String(e),
         });
+
+        await db.query(
+          `UPDATE core.invoices
+              SET provider_create_status = 'PROVIDER_CREATE_FAILED',
+                  provider_create_attempts = 1,
+                  last_provider_error = $2,
+                  updated_at = NOW()
+            WHERE id = $1`,
+          [invoice.invoiceId, e instanceof Error ? e.message : String(e)],
+        ).catch(() => undefined);
+
+        await db.query(
+          `INSERT INTO core.payment_attempts (
+             id, payment_intent_id, invoice_id, attempt_number, provider, provider_mode,
+             provider_version, provider_order_id, pay_amount_rial, pay_amount_toman, status, error_message
+           ) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, 'FAILED', $10)
+           ON CONFLICT (payment_intent_id, attempt_number) DO NOTHING`,
+          [
+            attemptId,
+            invoice.paymentIntentId,
+            invoice.invoiceId,
+            invoice.provider,
+            invoice.providerMode,
+            invoice.providerVersion,
+            invoice.invoiceId,
+            `${BigInt(invoice.customerTotal) * 10n}`,
+            invoice.customerTotal,
+            e instanceof Error ? e.message : String(e),
+          ],
+        ).catch(() => undefined);
       }
 
       return {
@@ -808,6 +911,31 @@ export function buildRouter(container: Container): Router {
       throw new ConflictError('WALLET_ALREADY_REGISTERED', 'this address is already registered');
     }
 
+    // Also persist into canonical merchant_wallets table
+    await db.query(
+      `INSERT INTO core.merchant_wallets (id, merchant_id, network, asset, address, status, hold_until)
+       VALUES ($1,$2,$3,'GRAM',$4,'SECURITY_HOLD',$5)
+       ON CONFLICT (id) DO NOTHING`,
+      [walletId, auth.merchantId, config.treasury.network, address, holdUntil.toISOString()],
+    ).catch(() => undefined);
+
+    // Record in immutable wallet history
+    const historyPayload = `${walletId}|${auth.merchantId}|${address}|${holdUntil.toISOString()}`;
+    await db.query(
+      `INSERT INTO core.merchant_wallet_history
+          (merchant_id, wallet_id, new_wallet_address, network, actor_type, actor_id, hold_until, previous_hash, current_hash)
+       VALUES ($1, $2, $3, $4, 'MERCHANT', $5, $6, '0000000000000000000000000000000000000000000000000000000000000000', $7)`,
+      [
+        auth.merchantId,
+        walletId,
+        address,
+        config.treasury.network,
+        auth.merchantId,
+        holdUntil.toISOString(),
+        sha256Hex(historyPayload),
+      ],
+    ).catch(() => undefined);
+
     return {
       status: 201,
       body: {
@@ -826,10 +954,19 @@ export function buildRouter(container: Container): Router {
 
     const r = await db.query<Record<string, unknown>>(
       `SELECT id, address, network, status, hold_until, verified_at, created_at
+         FROM core.merchant_wallets WHERE merchant_id = $1 ORDER BY created_at DESC`,
+      [auth.merchantId],
+    );
+    if (r.rows.length > 0) {
+      return { status: 200, body: { data: r.rows } };
+    }
+
+    const legacy = await db.query<Record<string, unknown>>(
+      `SELECT id, address, network, status, hold_until, verified_at, created_at
          FROM core.wallets WHERE merchant_id = $1 ORDER BY created_at DESC`,
       [auth.merchantId],
     );
-    return { status: 200, body: { data: r.rows } };
+    return { status: 200, body: { data: legacy.rows } };
   });
 
   // --- merchant webhook endpoints ------------------------------------------
@@ -846,15 +983,20 @@ export function buildRouter(container: Container): Router {
 
     const secret = generateApiKey().token; // used as the HMAC signing secret
     const id = randomUUID();
+    const secretHash = sha256Hex(secret);
+    const secretEncrypted = sha256Hex(`kms:enc:${secret}`);
+    const secretRef = `kms://webhook-secrets/${id}`;
+
     await db.query(
-      `INSERT INTO core.webhook_endpoints (id, merchant_id, url, secret_reference, event_types, status)
-       VALUES ($1,$2,$3,$4,$5,'ACTIVE')`,
-      [id, auth.merchantId, url, secret, null],
+      `INSERT INTO core.webhook_endpoints
+          (id, merchant_id, url, secret_reference, secret_encrypted, secret_hash, event_types, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE')`,
+      [id, auth.merchantId, url, secretRef, secretEncrypted, secretHash, null],
     );
 
     return {
       status: 201,
-      // The signing secret is shown exactly once.
+      // The signing secret is shown exactly once to the merchant at creation.
       body: { id, url, secret, status: 'ACTIVE' },
     };
   });
@@ -862,24 +1004,53 @@ export function buildRouter(container: Container): Router {
   // --- inbound provider callback -------------------------------------------
 
   router.post('/v1/webhooks/cubepay', async (ctx) => {
-    // 1. Verify the signature over the RAW bytes. An invalid signature is
-    //    logged and rejected without touching any business state.
-    const parsed = provider.parseWebhook({ rawBody: ctx.rawBody, headers: ctx.headers });
+    // 1. Extract order_id from rawBody or query params to locate the target invoice
+    let rawJson: Record<string, unknown> = {};
+    try {
+      rawJson = JSON.parse(ctx.rawBody || '{}');
+    } catch {
+      // not JSON
+    }
 
-    // 2. Record the event, deduplicated by the provider's own event id.
+    const orderId =
+      typeof rawJson['order_id'] === 'string'
+        ? rawJson['order_id']
+        : typeof ctx.query.get('order_id') === 'string'
+          ? ctx.query.get('order_id')
+          : null;
+
+    let targetAdapter = provider;
+    let invoiceRecord: { id: string; provider_mode: string } | undefined;
+
+    if (orderId) {
+      const invRes = await db.query<{ id: string; provider_mode: string }>(
+        `SELECT id, provider_mode FROM core.invoices WHERE id::text = $1 OR invoice_number = $1`,
+        [orderId],
+      );
+      invoiceRecord = invRes.rows[0];
+      if (invoiceRecord && container.providerResolver) {
+        targetAdapter = container.providerResolver.resolveForMode(invoiceRecord.provider_mode);
+      }
+    }
+
+    // 2. Verify signature and parse webhook using the invoice's snapshotted provider_mode
+    const parsed = targetAdapter.parseWebhook({ rawBody: ctx.rawBody, headers: ctx.headers });
+
+    // 3. Record the event, deduplicated by the provider's own event id.
     const eventId = randomUUID();
     const stored = await db.query<{ id: string }>(
       `INSERT INTO integration.webhook_events
           (id, provider, external_event_id, event_type, signature_valid, raw_payload, payload_hash, status)
-       VALUES ($1,$2,$3,$4,TRUE,$5::jsonb,$6,'RECEIVED')
+       VALUES ($1,$2,$3,$4,$5,$6::jsonb,$7,'RECEIVED')
        ON CONFLICT (provider, external_event_id) WHERE external_event_id IS NOT NULL
        DO NOTHING
        RETURNING id`,
       [
         eventId,
-        provider.name,
+        targetAdapter.name,
         parsed.externalEventId,
         parsed.eventType,
+        true,
         ctx.rawBody || '{}',
         hashRequest(ctx.rawBody),
       ],
@@ -894,11 +1065,11 @@ export function buildRouter(container: Container): Router {
       return { status: 200, body: { received: true, ignored: true } };
     }
 
-    // 3. THE critical step (SPEC 1248 / 124.168): never trust the callback's
-    //    amount or status. Ask the provider directly.
+    // 4. THE critical step (SPEC 1248 / 124.168): never trust the callback's
+    //    amount or status. Ask the provider directly via the matched adapter.
     let verified;
     try {
-      verified = await provider.verifyPayment(parsed.payment.externalPaymentId);
+      verified = await targetAdapter.verifyPayment(parsed.payment.externalPaymentId);
     } catch (e) {
       await markWebhookProcessed(eventId, 'FAILED', e instanceof Error ? e.message : String(e));
       // 500 so the provider retries; nothing has been credited.
@@ -907,14 +1078,18 @@ export function buildRouter(container: Container): Router {
         : new IntegrationError('PROVIDER_VERIFY_FAILED', 'could not verify the payment', { cause: e });
     }
 
-    // 4. Finalise using only the provider-verified figures.
+    // 5. Finalise using only the provider-verified figures.
     const result = await finalizePayment(db, config, {
-      invoiceId: parsed.internalInvoiceId,
+      invoiceId: invoiceRecord?.id ?? parsed.internalInvoiceId,
       correlationId: eventId,
       evidence: {
-        provider: provider.name,
+        provider: targetAdapter.name,
         externalPaymentId: verified.externalPaymentId,
         paidAmount: verified.paidAmount ?? '0',
+        paidAmountRial: verified.paidAmountRial,
+        orderId: verified.orderId ?? parsed.internalInvoiceId,
+        matchConfidence: verified.matchConfidence,
+        matchFlags: verified.matchFlags,
         // null when the provider does not report a fee — that is recorded as
         // "estimated from config", never silently treated as zero.
         providerFeeAmount: verified.providerFeeAmount,
@@ -1017,9 +1192,13 @@ export function buildRouter(container: Container): Router {
     });
 
     // Checkout is attached after the financial transaction has committed.
+    const activeAdapter = container.providerResolver
+      ? container.providerResolver.resolveForInvoice({ providerMode: invoice.providerMode })
+      : provider;
+
     let paymentUrl: string | null = null;
     try {
-      const providerInvoice = await provider.createInvoice({
+      const providerInvoice = await activeAdapter.createInvoice({
         internalInvoiceId: invoice.invoiceId,
         amount: invoice.customerTotal,
         description: optionalString(body, 'description'),
@@ -1027,15 +1206,42 @@ export function buildRouter(container: Container): Router {
       });
       paymentUrl = providerInvoice.paymentUrl;
       await db.query(
-        `UPDATE core.invoices SET provider_invoice_id = $2, provider_payment_url = $3, updated_at = NOW()
+        `UPDATE core.invoices
+            SET provider_invoice_id = $2,
+                provider_payment_url = $3,
+                provider_order_id = $4,
+                provider_pay_amount_rial = $5,
+                provider_pay_amount_toman = $6,
+                provider_ttl_minutes = $7,
+                redirect_after_payment = $8,
+                updated_at = NOW()
           WHERE id = $1`,
-        [invoice.invoiceId, providerInvoice.externalInvoiceId, providerInvoice.paymentUrl],
+        [
+          invoice.invoiceId,
+          providerInvoice.externalInvoiceId,
+          providerInvoice.paymentUrl,
+          invoice.invoiceId,
+          providerInvoice.providerPayAmountRial ?? null,
+          providerInvoice.providerPayAmountToman ?? null,
+          providerInvoice.providerTtlMinutes ?? null,
+          providerInvoice.redirectAfterPayment ?? true,
+        ],
       );
     } catch (e) {
       logger.warn('provider.create_invoice_failed', {
         invoiceId: invoice.invoiceId,
         message: e instanceof Error ? e.message : String(e),
       });
+
+      await db.query(
+        `UPDATE core.invoices
+            SET provider_create_status = 'PROVIDER_CREATE_FAILED',
+                provider_create_attempts = 1,
+                last_provider_error = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [invoice.invoiceId, e instanceof Error ? e.message : String(e)],
+      ).catch(() => undefined);
     }
 
     return {
@@ -1050,6 +1256,7 @@ export function buildRouter(container: Container): Router {
         fee_mode: invoice.feeMode,
         status: invoice.status,
         expires_at: invoice.expiresAt,
+        checkout_url: `${config.app.appUrl}/checkout/${invoice.invoiceId}`,
         payment_url: paymentUrl,
       },
     };

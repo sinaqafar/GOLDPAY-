@@ -7,11 +7,16 @@
  * jetton master, no token contract, no jetton wallet, and network fees are
  * paid in GRAM itself. Amounts are in nanogram (9 decimals).
  *
+ * Official TonCenter v3 external message broadcast:
+ * POST /api/v3/message
+ * Request Body: { "boc": "<base64_serialized_boc>" }
+ * Response: { "@type": "ok", "message_hash": "<hash>" }
+ *
  * SPEC 124.168: NO CHAIN CONFIRMATION -> NO SETTLED.
  * SPEC 124.170: an ambiguous send returns UNKNOWN, never a silent retry.
  *
- * Signing keys are never held here: the adapter talks to a signer reference so
- * the private key can live in a KMS/HSM (SPEC 118.37 — secret_reference only).
+ * Signing keys are never held here: the adapter receives signed BoC from the SignerPort
+ * boundary where KMS/HSM handles key isolation.
  */
 
 import type {
@@ -70,31 +75,38 @@ export class TonAdapter implements BlockchainPayoutPort {
       return { status: 'ACCEPTED', txHash: existing, raw: { deduplicated: true } };
     }
 
+    const boc = request.signedBoc ||
+      (request.signingReference?.startsWith('ton-boc:') ? request.signingReference.slice('ton-boc:'.length) : null);
+
     try {
+      // Official TonCenter API v3 standard broadcast
+      const body = boc
+        ? JSON.stringify({ boc })
+        : JSON.stringify({
+            idempotency_key: request.idempotencyKey,
+            from: this.#config.payoutWalletAddress,
+            to: request.to,
+            value: request.amountAtomic.toString(),
+            asset: this.#config.gramAsset,
+            decimals: this.#config.gramDecimals,
+            send_mode: 'PAY_GAS_SEPARATELY',
+            bounce: false,
+            signer_reference: request.signingReference ?? this.#config.signerReference,
+          });
+
       const res = await this.#rpc('/api/v3/message', {
         method: 'POST',
-        body: JSON.stringify({
-          idempotency_key: request.idempotencyKey,
-          from: this.#config.payoutWalletAddress,
-          to: request.to,
-          // Native value transfer: nanogram carried by the message itself.
-          value: request.amountAtomic.toString(),
-          asset: this.#config.gramAsset,
-          decimals: this.#config.gramDecimals,
-          // The sender pays the network fee out of its own GRAM balance, so the
-          // recipient receives exactly the quoted amount (SPEC 97.117).
-          send_mode: 'PAY_GAS_SEPARATELY',
-          bounce: false,
-          signer_reference: this.#config.signerReference,
-        }),
+        body,
       });
 
       const hash =
-        typeof res['hash'] === 'string'
-          ? res['hash']
-          : typeof res['message_hash'] === 'string'
-            ? res['message_hash']
-            : null;
+        typeof res['message_hash'] === 'string'
+          ? res['message_hash']
+          : typeof res['hash'] === 'string'
+            ? res['hash']
+            : typeof res['result'] === 'string'
+              ? res['result']
+              : null;
 
       if (!hash) {
         // Accepted-but-unidentifiable is indeterminate, not a success.
@@ -125,6 +137,37 @@ export class TonAdapter implements BlockchainPayoutPort {
       const success = tx['success'] === true || tx['description'] === 'ok';
       const confirmations = typeof tx['mc_block_seqno'] === 'number' ? 1 : 0;
       if (!success) return { state: 'FAILED', txHash: request.txHash };
+
+      // In TON, if send_mode=3 (IGNORE_ACTION_ERRORS) is used:
+      // The wallet transaction may succeed at top level, but we must verify:
+      // 1. Action phase succeeded (if action_phase present, action_phase.success === true and action_phase.result_code === 0)
+      // 2. Outgoing message exists with matching recipient and amount
+      const actionPhase = tx['action_phase'] as Record<string, unknown> | undefined;
+      if (actionPhase && (actionPhase['success'] === false || actionPhase['result_code'] !== 0)) {
+        return { state: 'FAILED', txHash: request.txHash };
+      }
+
+      const outMsgs = Array.isArray(tx['out_msgs']) ? (tx['out_msgs'] as Record<string, unknown>[]) : [];
+      let outMsg = outMsgs[0];
+      if (request.to && outMsgs.length > 0) {
+        const match = outMsgs.find((m) => m['destination'] === request.to);
+        if (match) outMsg = match;
+      }
+
+      const onChainDest =
+        outMsg && typeof outMsg['destination'] === 'string'
+          ? outMsg['destination']
+          : typeof tx['destination'] === 'string'
+            ? tx['destination']
+            : typeof tx['account'] === 'string'
+              ? tx['account']
+              : undefined;
+
+      const onChainAmount =
+        outMsg && (outMsg['value'] || outMsg['amount'])
+          ? parseAtomic(outMsg['value'] ?? outMsg['amount'])
+          : parseAtomic(tx['amount']);
+
       if (confirmations < this.#config.minConfirmations) {
         return { state: 'PENDING', txHash: request.txHash, confirmations };
       }
@@ -132,13 +175,8 @@ export class TonAdapter implements BlockchainPayoutPort {
         state: 'CONFIRMED',
         txHash: request.txHash,
         confirmations,
-        onChainAmountAtomic: parseAtomic(tx['amount']),
-        onChainDestination:
-          typeof tx['destination'] === 'string'
-            ? tx['destination']
-            : typeof tx['account'] === 'string'
-              ? tx['account']
-              : undefined,
+        onChainAmountAtomic: onChainAmount,
+        onChainDestination: onChainDest,
         networkFeeAtomic: parseAtomic(tx['total_fees'] ?? tx['fee']),
       };
     }
@@ -146,6 +184,24 @@ export class TonAdapter implements BlockchainPayoutPort {
     const found = await this.#lookupByKey(request.idempotencyKey);
     if (!found) return { state: 'NOT_FOUND' };
     return this.getTransferStatus({ ...request, txHash: found });
+  }
+
+  /**
+   * Current on-chain sequence number (seqno) of a wallet contract.
+   */
+  async getOnChainSeqno(address: string): Promise<number> {
+    try {
+      const res = await this.#rpc(
+        `/api/v3/wallet?address=${encodeURIComponent(address)}`,
+        { method: 'GET' },
+      );
+      if (typeof res['seqno'] === 'number') {
+        return res['seqno'];
+      }
+      return 0;
+    } catch {
+      return 0;
+    }
   }
 
   /**
@@ -170,7 +226,7 @@ export class TonAdapter implements BlockchainPayoutPort {
         `/api/v3/message?idempotency_key=${encodeURIComponent(key)}`,
         { method: 'GET' },
       );
-      const hash = res['hash'];
+      const hash = res['hash'] ?? res['message_hash'];
       return typeof hash === 'string' ? hash : null;
     } catch {
       // A failed lookup must not be read as "not sent".
@@ -230,11 +286,20 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
   /** Simulated gas, so settlement accounting can be exercised. */
   #networkFee = 1_000_000n;
   #balances = new Map<string, bigint>();
+  #walletSeqnos = new Map<string, number>();
   #nextOutcome: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN' = 'ACCEPTED';
   #autoConfirm: boolean;
 
   constructor(options: { autoConfirm?: boolean } = {}) {
     this.#autoConfirm = options.autoConfirm ?? true;
+  }
+
+  setWalletSeqno(address: string, seqno: number): void {
+    this.#walletSeqnos.set(address, seqno);
+  }
+
+  async getOnChainSeqno(address: string): Promise<number> {
+    return this.#walletSeqnos.get(address) ?? 0;
   }
 
   setNextOutcome(outcome: 'ACCEPTED' | 'REJECTED' | 'UNKNOWN'): void {
@@ -264,8 +329,6 @@ export class InMemoryTonAdapter implements BlockchainPayoutPort {
     if (outcome === 'REJECTED') return { status: 'REJECTED', error: 'SIMULATED_REJECTION' };
 
     const txHash = `tx_${Buffer.from(request.idempotencyKey).toString('hex').slice(0, 48)}`;
-    // An UNKNOWN result still records the send: that is exactly the ambiguity
-    // reconciliation has to resolve.
     this.#sent.set(request.idempotencyKey, {
       txHash,
       to: request.to,

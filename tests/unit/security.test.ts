@@ -18,10 +18,24 @@ import {
 } from '../../packages/crypto/src/index.ts';
 import { createHmac } from 'node:crypto';
 import { loadConfig, assertTreasuryManualOnly } from '../../packages/config/src/index.ts';
-import { SecurityError, ConfigError } from '../../packages/errors/src/index.ts';
+import { SecurityError, ConfigError, IntegrationError } from '../../packages/errors/src/index.ts';
 import { isPrivateAddress, assertSafeWebhookUrl } from '../../packages/core/src/webhooks.ts';
 import { TEST_ENV } from '../helpers/harness.ts';
-import { StubSigner } from '../../packages/ton/src/signer.ts';
+import { StubSigner, AwsKmsEd25519Signer } from '../../packages/ton/src/signer.ts';
+import {
+  buildCanonicalTonSigningPayload,
+  assembleSignedTonExternalMessage,
+  computeTonSigningIntentHash,
+  DEFAULT_WALLET_V4_ID,
+  DEFAULT_SEND_MODE,
+} from '../../packages/ton/src/ton-wallet-message.ts';
+import { TonSeqnoManager } from '../../packages/ton/src/seqno-manager.ts';
+import { keyPairFromSeed, sign, signVerify } from '@ton/crypto';
+import {
+  RateAggregator,
+  StaticCryptoMarketProvider,
+  StaticFxProvider,
+} from '../../packages/core/src/adapters/rate-aggregator.ts';
 import {
   TokenBucketRateLimiter,
   RedisRateLimiter,
@@ -244,7 +258,7 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
     payoutId: 'abc',
     asset: 'GRAM',
     network: 'TON_TESTNET',
-    destinationAddress: 'EQD__________________________________________1vo',
+    destinationAddress: 'UQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAZAm',
     amountAtomic: '10000000000',
     fromAddress: 'EQD__________________________________________0vo',
   };
@@ -257,7 +271,6 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
   });
 
   it('never produces a second signature for the same request id', async () => {
-    // Otherwise a retry could authorise the same funds twice.
     const signer = new StubSigner(tonConfig);
     await signer.sign(request);
     await expect(signer.sign(request)).rejects.toThrow(/already produced a signature/);
@@ -296,6 +309,363 @@ describe('SignerPort (SPEC 5485-5487 / 5569)', () => {
       /never be used in production/,
     );
   });
+
+  describe('Canonical TON Wallet Message Construction', () => {
+    it('builds canonical 32-byte representation hash and packages valid Ed25519 signature', () => {
+      const canonical = buildCanonicalTonSigningPayload({
+        walletAddress: 'EQD__________________________________________0vo',
+        destinationAddress: 'UQABAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAZAm',
+        amountNanograms: 10_000_000_000n,
+        seqno: 5,
+        validUntil: 1800000000,
+      });
+
+      expect(canonical.digest).toHaveLength(32);
+      expect(canonical.digestHex).toHaveLength(64);
+
+      // Verify Ed25519 signature verification against the representation hash
+      const seed = Buffer.alloc(32, 0x55);
+      const keyPair = keyPairFromSeed(seed);
+      const realSig = sign(Buffer.from(canonical.digest), keyPair.secretKey);
+      expect(realSig).toHaveLength(64);
+
+      const isValid = signVerify(Buffer.from(canonical.digest), realSig, keyPair.publicKey);
+      expect(isValid).toBe(true);
+
+      const assembled = assembleSignedTonExternalMessage(canonical, realSig);
+      expect(assembled.signatureHex).toHaveLength(128);
+      expect(assembled.bocBase64.length).toBeGreaterThan(50);
+      expect(assembled.signingReference).toMatch(/^ton-boc:/);
+    });
+  });
+
+  describe('TonSeqnoManager sequence reservation', () => {
+    it('allocates strictly monotonic sequence numbers starting from current on-chain seqno N', async () => {
+      const dbSequences = new Map<string, any>();
+      const dbAllocations = new Map<string, any>();
+
+      const mockDb: any = {
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string, params?: any[]) => {
+              if (sql.includes('FROM finance.payout_seqno_allocations')) {
+                const row = dbAllocations.get(params?.[0]);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('FROM finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                const row = dbSequences.get(addr);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('INSERT INTO finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                if (!dbSequences.has(addr)) {
+                  dbSequences.set(addr, {
+                    current_onchain_seqno: params?.[1],
+                    next_allocated_seqno: params?.[1],
+                    confirmed_seqno: params?.[2],
+                  });
+                }
+                return { rowCount: 1 };
+              }
+              if (sql.includes('UPDATE finance.treasury_wallet_sequences')) {
+                const addr = params?.[0];
+                const allocated = params?.[1];
+                const row = dbSequences.get(addr);
+                if (row) row.next_allocated_seqno = allocated + 1;
+                return { rowCount: 1 };
+              }
+              if (sql.includes('INSERT INTO finance.payout_seqno_allocations')) {
+                const payoutId = params?.[1];
+                dbAllocations.set(payoutId, {
+                  allocated_seqno: params?.[3],
+                  status: params?.[4],
+                });
+                return { rowCount: 1 };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async () => {
+          return { rows: [] };
+        },
+      };
+
+      const wallet = 'EQD__________________________________________0vo';
+      // First allocation starts at exact on-chain seqno N = 10
+      const seq1 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
+      const seq2 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-2', 10);
+      const seq3 = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-3', 10);
+
+      expect(seq1).toBe(10);
+      expect(seq2).toBe(11);
+      expect(seq3).toBe(12);
+
+      // Repeated call for payout-1 returns identical allocated seqno (10)
+      const seq1Repeat = await TonSeqnoManager.allocate(mockDb, wallet, 'payout-1', 10);
+      expect(seq1Repeat).toBe(10);
+    });
+  });
+
+  describe('AwsKmsEd25519Signer', () => {
+    let capturedKmsParams: any = null;
+    const mockKmsClient = {
+      sign: async (params: { KeyId: string; Message: Uint8Array; MessageType: string; SigningAlgorithm: string }) => {
+        capturedKmsParams = params;
+        if (params.SigningAlgorithm !== 'ED25519_SHA_512') {
+          throw new Error(`Invalid KMS algorithm: ${params.SigningAlgorithm}`);
+        }
+        if (params.MessageType !== 'RAW') {
+          throw new Error(`Invalid KMS messageType: ${params.MessageType}`);
+        }
+        return {
+          Signature: new Uint8Array(64).fill(0xab),
+          KeyId: params.KeyId,
+          SigningAlgorithm: params.SigningAlgorithm,
+        };
+      },
+    };
+
+    it('signs canonical TON payload with official AWS algorithm ED25519_SHA_512 and MessageType RAW', async () => {
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        kmsClient: mockKmsClient,
+        region: 'us-east-1',
+      });
+
+      const signed = await signer.sign(request);
+      expect(signed.signer).toBe('AWS_KMS_ED25519');
+      expect(signed.signingReference).toMatch(/^ton-boc:/);
+      expect(signed.bocBase64).toBeDefined();
+      expect(signed.unsignedHash).toBeDefined();
+
+      expect(capturedKmsParams).toMatchObject({
+        KeyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        MessageType: 'RAW',
+        SigningAlgorithm: 'ED25519_SHA_512',
+      });
+      expect(capturedKmsParams.Message).toHaveLength(32);
+    });
+
+    it('persists and returns identical signature evidence on retry with DB idempotency', async () => {
+      const mockDbRecords = new Map<string, any>();
+      const mockDb: any = {
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string, params?: any[]) => {
+              if (sql.includes('SELECT') && sql.includes('finance.payout_seqno_allocations')) {
+                return { rows: [{ allocated_seqno: 10, status: 'RESERVED' }] };
+              }
+              if (sql.includes('SELECT') && sql.includes('system.signing_requests')) {
+                const row = mockDbRecords.get(params?.[0]);
+                return { rows: row ? [row] : [] };
+              }
+              if (sql.includes('INSERT INTO system.signing_requests')) {
+                const signReqId = params?.[1];
+                mockDbRecords.set(signReqId, {
+                  status: 'CLAIMED',
+                  network: params?.[5],
+                  asset: params?.[6],
+                  from_address: params?.[7],
+                  destination_address: params?.[8],
+                  amount_atomic: params?.[9],
+                  seqno: params?.[10],
+                  valid_until: params?.[11],
+                  wallet_id: params?.[12],
+                  send_mode: params?.[13],
+                  bounce: params?.[14],
+                  comment: params?.[15],
+                  unsigned_hash: params?.[16],
+                  intent_hash: params?.[17],
+                  created_at: new Date(),
+                });
+                return { rowCount: 1 };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async (sql: string, params?: any[]) => {
+          if (sql.includes('UPDATE system.signing_requests')) {
+            const signReqId = params?.[4];
+            const row = mockDbRecords.get(signReqId);
+            if (row) {
+              row.status = 'COMPLETED';
+              row.signing_reference = params?.[0];
+              row.raw_signature = params?.[1];
+              row.boc_base64 = params?.[2];
+              row.signed_at = params?.[3];
+            }
+            return { rowCount: 1 };
+          }
+          return { rows: [] };
+        },
+      };
+
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'arn:aws:kms:us-east-1:123456789012:key/test-ed25519',
+        kmsClient: mockKmsClient,
+        db: mockDb,
+      });
+
+      const first = await signer.sign(request);
+      const second = await signer.sign(request);
+
+      expect(first.signingReference).toBe(second.signingReference);
+      expect(first.unsignedHash).toBe(second.unsignedHash);
+      expect(first.bocBase64).toBe(second.bocBase64);
+    });
+
+    it('rejects duplicate signRequestId with mismatched payload intent', async () => {
+      const mockDbRecords = new Map<string, any>();
+      mockDbRecords.set(request.signRequestId, {
+        status: 'COMPLETED',
+        network: request.network,
+        asset: request.asset,
+        from_address: request.fromAddress,
+        destination_address: 'UQ_DIFFERENT_DESTINATION',
+        amount_atomic: request.amountAtomic,
+        seqno: 10,
+        valid_until: 1800000000,
+        unsigned_hash: 'different_hash_from_another_transaction',
+        intent_hash: 'intent_hash_for_other_destination',
+        signing_reference: 'ref-1',
+        signed_at: new Date(),
+      });
+
+      const mockDb: any = {
+        transaction: async (fn: any) => {
+          const tx = {
+            query: async (sql: string) => {
+              if (sql.includes('system.signing_requests')) {
+                return { rows: [mockDbRecords.get(request.signRequestId)] };
+              }
+              return { rows: [] };
+            },
+          };
+          return fn(tx);
+        },
+        query: async () => {
+          return { rows: [] };
+        },
+      };
+
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'test-key-id',
+        kmsClient: mockKmsClient,
+        db: mockDb,
+      });
+
+      await expect(signer.sign(request)).rejects.toThrow(/previously registered with different transaction intent parameters/);
+    });
+
+    it('handles KMS transient failures with retryable IntegrationError', async () => {
+      const failingKms = {
+        sign: async () => {
+          throw new Error('KMS service throttled');
+        },
+      };
+
+      const signer = new AwsKmsEd25519Signer({
+        config: tonConfig,
+        keyId: 'test-key-id',
+        kmsClient: failingKms,
+      });
+
+      await expect(signer.sign(request)).rejects.toThrow(/Failed to sign payload via AWS KMS/);
+    });
+  });
+
+  describe('RateAggregator multi-source consensus & quorum enforcement', () => {
+    it('calculates median when multiple crypto sources agree within threshold', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'COINGECKO' });
+      const sourceB = new StaticCryptoMarketProvider('1.52', { name: 'COINPAPRIKA' });
+      const fxSourceA = new StaticFxProvider('100000', { name: 'TINDEX' });
+      const fxSourceB = new StaticFxProvider('100500', { name: 'NOBITEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB],
+        fxSources: [fxSourceA, fxSourceB],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      const quote = await aggregator.getQuote();
+      expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeCloseTo(1.52, 2);
+      expect(quote.source).toContain('COINGECKO+COINPAPRIKA');
+    });
+
+    it('rejects quotes when one source in a 2-source setup fails (strict quorum requirement)', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'COINGECKO' });
+      const failingSourceB = {
+        name: 'COINPAPRIKA',
+        getGramUsd: async () => {
+          throw new Error('503 Service Unavailable');
+        },
+      };
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, failingSourceB],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/fewer than 2 independent sources reached consensus/);
+    });
+
+    it('rejects quotes when two sources diverge beyond the consensus threshold', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.00', { name: 'COINGECKO' });
+      const sourceB = new StaticCryptoMarketProvider('2.00', { name: 'DIVERGENT_SOURCE' });
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/cross-source divergence/);
+    });
+
+    it('filters out an extreme outlier when 3+ sources are available and 2+ agree', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.50', { name: 'SRC_A' });
+      const sourceB = new StaticCryptoMarketProvider('1.51', { name: 'SRC_B' });
+      const sourceOutlier = new StaticCryptoMarketProvider('5.00', { name: 'SRC_OUTLIER' });
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB, sourceOutlier],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      const quote = await aggregator.getQuote();
+      expect(Number.parseFloat(quote.legs?.cryptoUsd.value ?? '0')).toBeLessThan(2.0);
+      expect(quote.source).toContain('SRC_A+SRC_B');
+      expect(quote.source).not.toContain('SRC_OUTLIER');
+    });
+
+    it('rejects when 3 sources are all mutually divergent and no quorum is reached', async () => {
+      const sourceA = new StaticCryptoMarketProvider('1.00', { name: 'SRC_A' });
+      const sourceB = new StaticCryptoMarketProvider('1.80', { name: 'SRC_B' });
+      const sourceC = new StaticCryptoMarketProvider('3.00', { name: 'SRC_C' });
+      const fxSource = new StaticFxProvider('100000', { name: 'TINDEX' });
+
+      const aggregator = new RateAggregator({
+        cryptoSources: [sourceA, sourceB, sourceC],
+        fxSources: [fxSource],
+        maxCrossSourceDeviationPercent: 10,
+      });
+
+      await expect(aggregator.getQuote()).rejects.toThrow(/fewer than 2 independent sources reached consensus/);
+    });
+  });
 });
 
 describe('rate limiting (SPEC 253)', () => {
@@ -313,8 +683,6 @@ describe('rate limiting (SPEC 253)', () => {
   });
 
   it('refills continuously instead of resetting on a window edge', () => {
-    // A fixed window would let a caller spend the full budget twice across the
-    // boundary. A token bucket refills smoothly, so it cannot.
     let clock = 0;
     const limiter = new TokenBucketRateLimiter({ now: () => clock });
     const rule = { limit: 60, windowSeconds: 60 };
@@ -322,7 +690,6 @@ describe('rate limiting (SPEC 253)', () => {
     for (let i = 0; i < 60; i++) limiter.check('caller', rule);
     expect(limiter.check('caller', rule).allowed).toBe(false);
 
-    // One second later exactly one token is back.
     clock += 1000;
     expect(limiter.check('caller', rule).allowed).toBe(true);
     expect(limiter.check('caller', rule).allowed).toBe(false);
@@ -336,28 +703,24 @@ describe('rate limiting (SPEC 253)', () => {
     limiter.check('a', rule);
     limiter.check('a', rule);
     expect(limiter.check('a', rule).allowed).toBe(false);
-    // B is untouched by A exhausting its budget.
     expect(limiter.check('b', rule).allowed).toBe(true);
   });
 
   it('gives credential issuance the tightest budget', () => {
     expect(ruleFor('POST', '/v1/api-keys').name).toBe('SENSITIVE');
     expect(ruleFor('POST', '/v1/wallets').name).toBe('SENSITIVE');
-    // Reading wallets is not sensitive in the same way.
     expect(ruleFor('GET', '/v1/wallets').name).toBe('MERCHANT');
   });
 
   it('separates writes from reads, and provider callbacks from both', () => {
     expect(ruleFor('POST', '/v1/invoices').name).toBe('MERCHANT_WRITE');
     expect(ruleFor('GET', '/v1/invoices').name).toBe('MERCHANT');
-    // The provider retries legitimately, so its budget is generous.
     expect(ruleFor('POST', '/v1/webhooks/cubepay').name).toBe('WEBHOOK');
     expect(ruleFor('GET', '/health/live').name).toBe('PUBLIC');
   });
 });
 
 describe('distributed rate limiting', () => {
-  /** Minimal in-memory stand-in that executes the Lua contract faithfully. */
   function fakeRedis() {
     const store = new Map<string, { tokens: number; ts: number }>();
     let failing = false;
@@ -386,8 +749,6 @@ describe('distributed rate limiting', () => {
   }
 
   it('shares one budget across instances instead of multiplying it', async () => {
-    // Two API instances, one Redis. The whole point: five requests total, not
-    // five per instance.
     const redis = fakeRedis();
     let clock = 0;
     const rule = { limit: 5, windowSeconds: 60 };
@@ -419,9 +780,6 @@ describe('distributed rate limiting', () => {
   });
 
   it('keeps serving traffic when Redis is down', async () => {
-    // Rate limiting is a courtesy control, not a security boundary
-    // (SPEC 7245). Turning a Redis blip into a full outage would be worse than
-    // briefly not limiting.
     const redis = fakeRedis();
     const limiter = new RedisRateLimiter({ redis, now: () => 0 });
     redis.setFailing(true);

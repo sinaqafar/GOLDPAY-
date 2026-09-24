@@ -231,14 +231,20 @@ async function viewInvoices() {
     <div class="card">
       ${data
         .map(
-          (i) => `
-        <div class="row">
-          <div class="main">
+          (i) => {
+            const checkoutUrl = i.checkout_url || `${location.origin}/checkout/${i.id}`;
+            return `
+        <div class="row" style="align-items: center; justify-content: space-between;">
+          <div class="main" style="cursor: pointer;" data-action="open-url" data-url="${escapeHtml(checkoutUrl)}">
             <div class="title">${formatToman(i.customer_total)} تومان</div>
             <div class="sub">${escapeHtml(i.invoice_number)} · ${formatDate(i.created_at)}</div>
           </div>
-          <div class="end">${badge(INVOICE_STATUS, i.status)}</div>
-        </div>`,
+          <div style="display: flex; gap: 8px; align-items: center;">
+            <div class="end">${badge(INVOICE_STATUS, i.status)}</div>
+            ${i.status === 'CREATED' ? `<button class="ghost" style="padding: 6px 10px; font-size: 11px; margin: 0;" data-action="share" data-url="${escapeHtml(checkoutUrl)}">اشتراک</button>` : ''}
+          </div>
+        </div>`;
+          }
         )
         .join('')}
     </div>
@@ -359,6 +365,8 @@ async function submitInvoice(button) {
     });
     tg?.HapticFeedback?.notificationOccurred('success');
 
+    const checkoutUrl = invoice.checkout_url || `${location.origin}/checkout/${invoice.id}`;
+
     app.innerHTML = `
       <h2>فاکتور ساخته شد</h2>
       <div class="card">
@@ -369,11 +377,7 @@ async function submitInvoice(button) {
         <div class="row"><div class="main"><div class="sub">سهم شما</div>
           <div class="title">${formatToman(invoice.merchant_net)} تومان</div></div></div>
       </div>
-      ${
-        invoice.payment_url
-          ? `<button class="primary" data-action="share" data-url="${escapeHtml(invoice.payment_url)}">ارسال لینک پرداخت</button>`
-          : `<div class="notice">لینک پرداخت هنوز آماده نیست؛ چند لحظه بعد از بخش فاکتورها بررسی کنید.</div>`
-      }
+      <button class="primary" data-action="share" data-url="${escapeHtml(checkoutUrl)}">ارسال لینک پرداخت (Checkout)</button>
       <button class="ghost" data-action="back">بازگشت</button>`;
   } catch (e) {
     tg?.HapticFeedback?.notificationOccurred('error');
@@ -461,6 +465,11 @@ document.addEventListener('click', (ev) => {
       break;
     case 'submit-wallet':
       void submitWallet(btn);
+      break;
+    case 'open-url':
+      if (btn.dataset.url) {
+        window.open(btn.dataset.url, '_blank');
+      }
       break;
     case 'share':
       if (tg?.openTelegramLink) {

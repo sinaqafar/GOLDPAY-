@@ -2,26 +2,15 @@
  * SignerPort — the permanent boundary between this application and whatever
  * holds the payout wallet's private key.
  *
- * This is NOT a temporary abstraction to be collapsed once a real signer
- * exists. Key material must never enter this process (SPEC 5485-5487,
- * 118.37), so the application's side of the boundary is always: describe the
- * transfer, receive a signed payload, never see the key.
- *
- * Implementations, in order of what production requires:
- *
- *   KmsSigner / HsmSigner   the only acceptable production signers
- *   StubSigner              development and tests only
- *
- * A local mnemonic or keystore file is explicitly NOT production architecture:
- * it puts the key on the same disk as the application, which is the exact
- * failure the boundary exists to prevent.
+ * Key material must never enter this process (SPEC 5485-5487, 118.37).
+ * The application's side of the boundary: describe the transfer, receive a signed payload,
+ * never see the key.
  */
 
 export interface SignTransferRequest {
   /**
    * Unique per signing attempt. The signer must refuse to produce a second
-   * signature for an id it has already consumed (SPEC 5569/5570) — otherwise a
-   * retry could authorise the same funds twice.
+   * signature for an id it has already consumed (SPEC 5569/5570).
    */
   signRequestId: string;
   payoutId: string;
@@ -39,11 +28,13 @@ export interface SignTransferRequest {
 export interface SignedTransfer {
   /**
    * Opaque handle to the signed payload held by the signer.
-   * The application stores this reference, never the payload's key material.
+   * Formatted as "ton-boc:<base64_boc>" or persistent reference URI.
    */
   signingReference: string;
-  /** Present when the signer can report it before broadcast. */
+  /** Present when the signer can report it before broadcast (representation hash). */
   unsignedHash?: string;
+  /** Base64 serialized TON Bag of Cells external message for TonCenter broadcast. */
+  bocBase64?: string;
   signedAt: Date;
   /** Which signer produced this, for audit. */
   signer: string;
@@ -55,9 +46,7 @@ export interface SignerPort {
    * Sign a transfer.
    *
    * Defence in depth: however much the caller validated, the signer validates
-   * asset, network, destination and amount again independently (SPEC 5567,
-   * 7567). A signer that trusts its caller is only as safe as the weakest code
-   * path that can reach it.
+   * asset, network, destination and amount again independently (SPEC 5567, 7567).
    */
   sign(request: SignTransferRequest): Promise<SignedTransfer>;
 }

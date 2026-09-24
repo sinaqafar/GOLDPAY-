@@ -1,9 +1,10 @@
 /**
  * CreateInvoiceUseCase.
  *
- * SPEC 1243: Validate -> Snapshot -> Create internal invoice -> create provider invoice.
+ * SPEC 1243: Validate -> Snapshot -> Create internal invoice -> create payment intent.
  * SPEC 1232: the customer's final amount is fully determined before payment.
  * SPEC 4335: the fee snapshot is frozen onto the invoice at creation.
+ * SPEC v3.3: Canonical PaymentIntent lifecycle and DB-backed provider mode resolution.
  */
 
 import { randomUUID } from 'node:crypto';
@@ -27,16 +28,22 @@ export interface CreateInvoiceInput {
   expiresInSeconds?: number;
   /** Provided by the caller; also used for HTTP-level idempotency. */
   invoiceNumber?: string;
+  /** Optional override for provider mode (default comes from config.cubepay.activeMode). */
+  providerMode?: 'VIP' | 'STANDARD';
 }
 
 export interface CreateInvoiceResult {
   invoiceId: string;
+  paymentIntentId: string;
   invoiceNumber: string;
   baseAmount: string;
   customerTotal: string;
   platformFee: string;
   merchantNet: string;
   feeMode: FeeMode;
+  provider: string;
+  providerMode: 'VIP' | 'STANDARD';
+  providerVersion: string;
   status: 'CREATED';
   expiresAt: string | null;
   checkoutPath: string;
@@ -56,8 +63,6 @@ export async function createInvoice(
   config: Config,
   input: CreateInvoiceInput,
 ): Promise<CreateInvoiceResult> {
-  // A malformed amount is a caller error (400), not an internal fault: Money
-  // throws its own low-level error type, so translate it at the boundary.
   let baseAmount: Money;
   try {
     baseAmount = Money.toman(input.baseAmount);
@@ -71,19 +76,13 @@ export async function createInvoice(
   if (!baseAmount.isPositive()) {
     throw new ValidationError('INVALID_AMOUNT', 'base amount must be greater than zero');
   }
-  // Toman columns are NUMERIC(30,0). Reject anything that cannot fit BEFORE it
-  // reaches SQL, otherwise the driver raises a numeric overflow and the caller
-  // sees a 500 for what is plainly bad input. The ceiling is applied to the
-  // customer total, which is the largest derived figure (up to 115% of base).
+
   if (baseAmount.atomic > MAX_TOMAN_AMOUNT) {
     throw new ValidationError('AMOUNT_TOO_LARGE', 'amount exceeds the maximum supported value', {
       maximum: MAX_TOMAN_AMOUNT.toString(),
     });
   }
 
-  // An explicitly requested mode is validated here; when it is absent the
-  // merchant's own default is read inside the transaction below, because a
-  // per-merchant setting must outrank the platform-wide default.
   if (input.feeMode !== undefined && !isFeeMode(input.feeMode)) {
     throw new ValidationError('INVALID_FEE_MODE', `unknown fee mode: ${String(input.feeMode)}`);
   }
@@ -106,8 +105,7 @@ export async function createInvoice(
   }
 
   return db.transaction(async (tx) => {
-    // Only an ACTIVE merchant may issue invoices, and the row is locked so a
-    // concurrent suspension cannot slip past this check.
+    // 1. Lock merchant and verify status
     const merchant = await tx.query<{ id: string; status: string; default_fee_mode: string }>(
       'SELECT id, status, default_fee_mode FROM core.merchants WHERE id = $1 FOR UPDATE',
       [input.merchantId],
@@ -120,23 +118,40 @@ export async function createInvoice(
       });
     }
 
-    // Precedence: explicit request > the merchant's configured default >
-    // the platform default. SPEC 2386 keeps fee behaviour per merchant, so
-    // reading only the global config would ignore their setting entirely.
     const merchantDefault = isFeeMode(m.default_fee_mode) ? m.default_fee_mode : undefined;
     const feeMode: FeeMode = input.feeMode ?? merchantDefault ?? config.fees.defaultFeeMode;
 
-    // The fee snapshot is computed once, here, and never recomputed downstream
-    // (SPEC 4335): a later change to the merchant's default or to the platform
-    // rate must not alter an invoice that already exists.
     const breakdown: FeeBreakdown = calculateFees(baseAmount, feeMode, {
       rate: config.fees.platformFeePercent,
       version: config.fees.policyVersion,
     });
 
     const invoiceId = randomUUID();
+    const paymentIntentId = randomUUID();
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
+    const provider = 'CUBEPAY';
 
+    // 2. Query authoritative DB runtime state for active mode if not explicitly overridden
+    let activeMode = input.providerMode;
+    if (!activeMode) {
+      if (config.cubepay?.activeMode === 'STANDARD') {
+        activeMode = 'STANDARD';
+      } else {
+        const modeRes = await tx.query<{ active_mode: string }>(
+          `SELECT active_mode FROM core.provider_runtime_state WHERE provider_name = 'CUBEPAY'`,
+        );
+        if (modeRes.rows.length > 0 && modeRes.rows[0]?.active_mode) {
+          activeMode = modeRes.rows[0].active_mode.toUpperCase() as 'VIP' | 'STANDARD';
+        } else {
+          activeMode = config.cubepay.activeMode ?? 'VIP';
+        }
+      }
+    }
+    const providerMode: 'VIP' | 'STANDARD' = activeMode === 'STANDARD' ? 'STANDARD' : 'VIP';
+    const providerVersion = providerMode === 'VIP' ? '2026-09-VIP' : '2026-09-STANDARD';
+    const providerConfigRef = `${provider}_${providerMode}_${config.fees.policyVersion}`;
+
+    // 3. Insert internal invoice with immutable provider snapshot
     const inserted = await tx.query<{ id: string }>(
       `INSERT INTO core.invoices (
          id, merchant_id, invoice_number,
@@ -145,7 +160,8 @@ export async function createInvoice(
          platform_fee_amount, customer_fee_share, merchant_fee_share,
          customer_total_amount, merchant_net_amount,
          description, customer_reference,
-         status, expires_at
+         provider, provider_mode, provider_version, provider_config_ref,
+         status, provider_create_status, expires_at
        ) VALUES (
          $1, $2, $3,
          $4, 'TOMAN',
@@ -153,7 +169,8 @@ export async function createInvoice(
          $8, $9, $10,
          $11, $12,
          $13, $14,
-         'CREATED', $15
+         $15, $16, $17, $18,
+         'CREATED', 'PENDING_PROVIDER_CREATE', $19
        )
        ON CONFLICT (merchant_id, invoice_number) DO NOTHING
        RETURNING id`,
@@ -172,6 +189,10 @@ export async function createInvoice(
         breakdown.merchantNet.toAtomicString(),
         input.description ?? null,
         input.customerReference ?? null,
+        provider,
+        providerMode,
+        providerVersion,
+        providerConfigRef,
         expiresAt.toISOString(),
       ],
     );
@@ -183,6 +204,19 @@ export async function createInvoice(
         { invoiceNumber },
       );
     }
+
+    // 4. Create canonical PaymentIntent
+    await tx.query(
+      `INSERT INTO core.payment_intents (
+         id, invoice_id, merchant_id, amount_toman, currency, status
+       ) VALUES ($1, $2, $3, $4, 'TOMAN', 'REQUIRES_PAYMENT')`,
+      [
+        paymentIntentId,
+        invoiceId,
+        input.merchantId,
+        breakdown.customerTotal.toAtomicString(),
+      ],
+    );
 
     await recordTransition(tx, {
       entityType: 'INVOICE',
@@ -200,21 +234,28 @@ export async function createInvoice(
       aggregateId: invoiceId,
       payload: {
         invoice_id: invoiceId,
+        payment_intent_id: paymentIntentId,
         merchant_id: input.merchantId,
         base_amount: breakdown.baseAmount.toAtomicString(),
         customer_total: breakdown.customerTotal.toAtomicString(),
         fee_mode: breakdown.feeMode,
+        provider,
+        provider_mode: providerMode,
       },
     });
 
     return {
       invoiceId,
+      paymentIntentId,
       invoiceNumber,
       baseAmount: breakdown.baseAmount.toAtomicString(),
       customerTotal: breakdown.customerTotal.toAtomicString(),
       platformFee: breakdown.platformFee.toAtomicString(),
       merchantNet: breakdown.merchantNet.toAtomicString(),
       feeMode: breakdown.feeMode,
+      provider,
+      providerMode,
+      providerVersion,
       status: 'CREATED' as const,
       expiresAt: expiresAt.toISOString(),
       checkoutPath: `/checkout/${invoiceId}`,
@@ -235,15 +276,7 @@ export async function expireStaleInvoices(db: Database): Promise<number> {
 }
 
 /**
- * Cancel an invoice — SPEC 124 (invoice lifecycle).
- *
- * Only an invoice that has not been paid may be cancelled. A verified payment
- * is a financial fact: cancelling the invoice it belongs to must never unwind
- * it, so a PAID invoice is refused and the caller is pointed at refunds
- * instead.
- *
- * The row is locked and the status re-checked inside the transaction, because a
- * callback can arrive between reading and writing.
+ * Cancel an invoice.
  */
 export async function cancelInvoice(
   db: Database,
@@ -257,13 +290,10 @@ export async function cancelInvoice(
     const invoice = r.rows[0];
     if (!invoice) throw new NotFoundError('invoice', params.invoiceId);
 
-    // Tenant check inside the lock: never leak another merchant's invoice,
-    // and never let one cancel it either.
     if (invoice.merchant_id !== params.merchantId) {
       throw new NotFoundError('invoice', params.invoiceId);
     }
 
-    // Idempotent: cancelling twice is not an error.
     if (invoice.status === 'CANCELLED') {
       return { invoiceId: invoice.id, status: 'CANCELLED' as const, alreadyCancelled: true };
     }
@@ -276,8 +306,6 @@ export async function cancelInvoice(
       );
     }
 
-    // A payment may have arrived and be mid-verification even though the
-    // invoice still reads CREATED. Refuse rather than race it.
     const payment = await tx.query<{ id: string }>(
       `SELECT id FROM core.payments
         WHERE invoice_id = $1 AND status IN ('VERIFIED','PENDING','REVIEW')`,
@@ -293,6 +321,12 @@ export async function cancelInvoice(
     await tx.query(
       `UPDATE core.invoices SET status = 'CANCELLED', updated_at = NOW()
         WHERE id = $1 AND status = 'CREATED'`,
+      [params.invoiceId],
+    );
+
+    await tx.query(
+      `UPDATE core.payment_intents SET status = 'CANCELLED', updated_at = NOW()
+        WHERE invoice_id = $1`,
       [params.invoiceId],
     );
 

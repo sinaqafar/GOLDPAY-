@@ -227,6 +227,7 @@ describe('RateAggregator (GRAM/USD × USD/TOMAN)', () => {
     const aggregator = new RateAggregator({
       cryptoSources: [broken, new StaticCryptoMarketProvider('3', { name: 'BACKUP', now: at(NOW) })],
       fxSources: [new StaticFxProvider('100000', { now: at(NOW) })],
+      minQuorum: 1,
       now: at(NOW),
     });
 

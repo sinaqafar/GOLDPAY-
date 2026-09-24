@@ -27,6 +27,7 @@ function container(h: Harness) {
     config: h.config,
     logger: silentLogger,
     provider: h.cubepay,
+    providerResolver: h.cubepayResolver,
     chain: h.chain,
     rates: h.rates,
     signer: h.signer,
