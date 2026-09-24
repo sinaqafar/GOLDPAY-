@@ -1050,7 +1050,7 @@ export function buildRouter(container: Container): Router {
         targetAdapter.name,
         parsed.externalEventId,
         parsed.eventType,
-        isVip,
+        true,
         ctx.rawBody || '{}',
         hashRequest(ctx.rawBody),
       ],
@@ -1256,6 +1256,7 @@ export function buildRouter(container: Container): Router {
         fee_mode: invoice.feeMode,
         status: invoice.status,
         expires_at: invoice.expiresAt,
+        checkout_url: `${config.app.appUrl}/checkout/${invoice.invoiceId}`,
         payment_url: paymentUrl,
       },
     };

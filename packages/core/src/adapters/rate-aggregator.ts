@@ -312,8 +312,8 @@ export class RateAggregator implements RateProvider {
           details: {
             previous: fromScaled(previous),
             derived: fromScaled(derived),
-            moveBps: moveBps.toString(),
-            allowedBps: allowedBps.toString(),
+            movePercent: movePercent.toString(),
+            maxDeviationPercent: this.#maxDeviationPercent.toString(),
           },
         });
       }

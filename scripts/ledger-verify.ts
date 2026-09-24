@@ -6,18 +6,26 @@
  * 2. Balance projection agreement with immutable journal entries for all accounts.
  * 3. Monotonic sequence continuity in finance.journals and finance.journal_entries.
  * 4. Zero negative bucket violations across finance.balances.
- * 5. Ledger block hash integrity.
+ * 5. Ledger block hash and Merkle root integrity.
  */
 
-import { createDatabase } from '../packages/database/src/client.ts';
+import { createDatabase, type Database, type ConcreteDatabase } from '../packages/database/src/client.ts';
 import { migrate } from '../packages/database/src/migrator.ts';
 import { loadConfig } from '../packages/config/src/index.ts';
 import { verifyGlobalBalance, verifyProjection } from '../packages/ledger/src/ledger-service.ts';
+import { verifySequenceContinuity, verifyLedgerBlocks } from '../packages/ledger/src/ledger-blocks.ts';
 
-async function runLedgerVerification(): Promise<void> {
-  const config = loadConfig();
-  const db = await createDatabase({ url: config.database.url });
-  await migrate(db);
+export async function runLedgerVerification(customDb?: Database): Promise<boolean> {
+  const shouldClose = !customDb;
+  let db: Database;
+  if (customDb) {
+    db = customDb;
+  } else {
+    const config = loadConfig();
+    const concreteDb = (await createDatabase({ url: config.database.url })) as ConcreteDatabase;
+    await migrate(concreteDb);
+    db = concreteDb;
+  }
 
   console.log('================================================================');
   console.log('         GOLDPAY PRODUCTION LEDGER INTEGRITY VERIFIER           ');
@@ -77,37 +85,57 @@ async function runLedgerVerification(): Promise<void> {
 
     // 4. Sequence Continuity & Monotonicity
     console.log('\n[4/5] Checking Sequence Monotonicity & Record Integrity...');
-    const journalSeq = await db.query<{ min_seq: string; max_seq: string; count: string }>(
-      `SELECT MIN(journal_sequence)::text AS min_seq,
-              MAX(journal_sequence)::text AS max_seq,
-              COUNT(*)::text AS count
-         FROM finance.journals`,
-    );
-    const jCount = Number.parseInt(journalSeq.rows[0]?.count ?? '0', 10);
-    console.log(`  - Total Journals: ${jCount}`);
-    console.log('  -> PASS: Journal sequence monotonic integrity verified.');
+    const seqResult = await verifySequenceContinuity(db);
+    console.log(`  - Total Journals: ${seqResult.journalCount} | Total Entries: ${seqResult.entryCount}`);
+    if (seqResult.valid) {
+      console.log('  -> PASS: Journal sequence monotonic integrity verified.');
+    } else {
+      console.error('  -> FAIL: Sequence continuity violations detected:');
+      for (const err of seqResult.errors) {
+        console.error(`     - ${err}`);
+      }
+      allChecksPassed = false;
+    }
 
     // 5. Ledger Blocks Merkle Verification
     console.log('\n[5/5] Checking Ledger Blocks Merkle Consistency...');
-    const blocks = await db.query<{ count: string }>(
-      'SELECT COUNT(*)::text AS count FROM finance.ledger_blocks',
-    );
-    console.log(`  - Verified Blocks: ${blocks.rows[0]?.count ?? '0'}`);
-    console.log('  -> PASS: Ledger blocks chain verified.');
+    const blocksResult = await verifyLedgerBlocks(db);
+    console.log(`  - Verified Blocks: ${blocksResult.blockCount}`);
+    if (blocksResult.valid) {
+      console.log('  -> PASS: Ledger blocks chain verified.');
+    } else {
+      console.error('  -> FAIL: Ledger block integrity violations detected:');
+      for (const err of blocksResult.errors) {
+        console.error(`     - ${err}`);
+      }
+      allChecksPassed = false;
+    }
 
     console.log('\n================================================================');
     if (allChecksPassed) {
       console.log('              FINAL RESULT: LEDGER STATUS: HEALTHY              ');
       console.log('================================================================');
-      process.exit(0);
     } else {
       console.error('             FINAL RESULT: LEDGER STATUS: UNHEALTHY             ');
       console.error('================================================================');
-      process.exit(1);
     }
+
+    return allChecksPassed;
   } finally {
-    await db.close();
+    if (shouldClose) {
+      await db.close();
+    }
   }
 }
 
-void runLedgerVerification();
+// Run directly if invoked from CLI
+if (process.argv[1]?.endsWith('ledger-verify.ts') || process.argv[1]?.endsWith('ledger-verify.js')) {
+  runLedgerVerification()
+    .then((healthy) => {
+      process.exit(healthy ? 0 : 1);
+    })
+    .catch((err) => {
+      console.error('Fatal verifier error:', err);
+      process.exit(1);
+    });
+}

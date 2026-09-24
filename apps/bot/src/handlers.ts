@@ -424,6 +424,8 @@ async function continueConversation(
         baseAmount: normalised,
       });
 
+      const checkoutUrl = `${deps.config.app.appUrl}/checkout/${invoice.invoiceId}`;
+
       await deps.telegram.sendMessage({
         chatId,
         text:
@@ -432,7 +434,18 @@ async function continueConversation(
           `مبلغ پایه: ${toman(invoice.baseAmount)}\n` +
           `پرداختی مشتری: <b>${toman(invoice.customerTotal)}</b>\n` +
           `سهم شما: ${toman(invoice.merchantNet)}\n` +
-          `کارمزد: ${toman(invoice.platformFee)} (${invoice.feeMode})`,
+          `کارمزد: ${toman(invoice.platformFee)} (${invoice.feeMode})\n\n` +
+          `🔗 <b>لینک صفحه پرداخت GOLDPAY:</b>\n${checkoutUrl}`,
+        replyMarkup: {
+          inline_keyboard: [
+            [
+              { text: '💳 پرداخت درگاه (Checkout)', url: checkoutUrl },
+            ],
+            [
+              { text: '📤 اشتراک فاکتور', url: `https://t.me/share/url?url=${encodeURIComponent(checkoutUrl)}&text=${encodeURIComponent(`فاکتور ${invoice.invoiceNumber}`)}` },
+            ],
+          ],
+        },
       });
       return;
     }

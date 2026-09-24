@@ -98,16 +98,6 @@ export interface CubePayModeConfig {
   readonly sandbox: boolean;
 }
 
-export type CubePayMode = 'VIP' | 'STANDARD';
-
-export interface CubePayModeConfig {
-  readonly baseUrl: string;
-  readonly apiToken: string | null;
-  readonly webhookSecret: string | null;
-  readonly timeoutMs: number;
-  readonly sandbox: boolean;
-}
-
 export interface ProviderConfig {
   readonly activeMode: CubePayMode;
   readonly vip: CubePayModeConfig;

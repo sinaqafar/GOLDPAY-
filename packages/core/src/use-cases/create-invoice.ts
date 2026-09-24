@@ -130,9 +130,6 @@ export async function createInvoice(
     const paymentIntentId = randomUUID();
     const expiresAt = new Date(Date.now() + expiresIn * 1000);
     const provider = 'CUBEPAY';
-    const providerMode = input.providerMode ?? config.cubepay.activeMode ?? 'VIP';
-    const providerVersion = providerMode === 'VIP' ? '2026-09-VIP' : '2026-09-STANDARD';
-    const providerConfigRef = `${provider}_${providerMode}_${config.fees.policyVersion}`;
 
     // 2. Query authoritative DB runtime state for active mode if not explicitly overridden
     let activeMode = input.providerMode;
