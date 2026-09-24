@@ -1,16 +1,11 @@
 /**
- * PollPendingInvoicesUseCase — Independent Status Polling for Pending Invoices.
+ * PollPendingInvoicesUseCase — Independent Status Polling & Recovery for Invoices.
  *
- * Official CubePay Documentation Requirement:
- * In CubePay Standard, webhooks are not guaranteed to retry upon network failure.
- * GOLDPAY implements an independent, distributed-safe, idempotent polling engine
- * that discovers completed payments even when webhook delivery fails.
- *
- * Polling Architecture:
- *   Pending Invoices -> Resolve Mode Adapter -> verifyPayment(authority) ->
- *   if PAID -> finalizePayment (Atomic Double-Entry Ledger) ->
- *   if EXPIRED -> Mark EXPIRED ->
- *   if PENDING -> Keep PENDING with backoff.
+ * SPEC v3.3:
+ * - Provider-Creation Recovery (P1.4): Retries failed provider checkout creations using the SAME invoice ID.
+ * - Expiry Reconciliation Ordering (P1.8): Never marks EXPIRED solely on local clock without first verifying provider status.
+ * - Resolves matching provider mode per invoice's immutable snapshot.
+ * - Finalizes double-entry ledger atomically with full structured evidence.
  */
 
 import type { Database } from '../../../database/src/client.ts';
@@ -21,6 +16,7 @@ import { finalizePayment, type FinalizePaymentResult } from './finalize-payment.
 export interface PollPendingInvoicesResult {
   polled: number;
   verified: number;
+  recovered: number;
   expired: number;
   failed: number;
   skipped: number;
@@ -36,6 +32,75 @@ export async function pollPendingInvoices(
   const limit = options.limit ?? 50;
   const now = options.now ?? new Date();
 
+  // 1. Recover uncreated provider invoices (P1.4)
+  const uncreated = await db.query<{
+    id: string;
+    merchant_id: string;
+    customer_total_amount: string;
+    description: string | null;
+    provider_mode: string | null;
+    provider_create_attempts: number;
+  }>(
+    `SELECT id, merchant_id, customer_total_amount::text, description,
+            provider_mode, provider_create_attempts
+       FROM core.invoices
+      WHERE status = 'CREATED'
+        AND provider_invoice_id IS NULL
+        AND provider_create_attempts < 5
+        AND created_at > NOW() - INTERVAL '24 hours'
+      ORDER BY created_at ASC
+      LIMIT $1`,
+    [limit],
+  );
+
+  let recoveredCount = 0;
+  for (const inv of uncreated.rows) {
+    try {
+      const adapter = resolver.resolveForInvoice({ providerMode: inv.provider_mode });
+      const provInv = await adapter.createInvoice({
+        internalInvoiceId: inv.id,
+        amount: inv.customer_total_amount,
+        description: inv.description ?? undefined,
+        callbackUrl: `${config.app.appUrl}/v1/webhooks/cubepay`,
+      });
+
+      await db.query(
+        `UPDATE core.invoices
+            SET provider_invoice_id = $2,
+                provider_payment_url = $3,
+                provider_order_id = $4,
+                provider_pay_amount_rial = $5,
+                provider_pay_amount_toman = $6,
+                provider_ttl_minutes = $7,
+                redirect_after_payment = $8,
+                provider_create_status = 'PROVIDER_CREATED',
+                updated_at = NOW()
+          WHERE id = $1`,
+        [
+          inv.id,
+          provInv.externalInvoiceId,
+          provInv.paymentUrl,
+          inv.id,
+          provInv.providerPayAmountRial ?? null,
+          provInv.providerPayAmountToman ?? null,
+          provInv.providerTtlMinutes ?? null,
+          provInv.redirectAfterPayment ?? true,
+        ],
+      );
+      recoveredCount++;
+    } catch (e) {
+      await db.query(
+        `UPDATE core.invoices
+            SET provider_create_attempts = provider_create_attempts + 1,
+                last_provider_error = $2,
+                updated_at = NOW()
+          WHERE id = $1`,
+        [inv.id, e instanceof Error ? e.message : String(e)],
+      ).catch(() => undefined);
+    }
+  }
+
+  // 2. Poll pending provider invoices (P1.8)
   const res = await db.query<{
     id: string;
     merchant_id: string;
@@ -63,28 +128,16 @@ export async function pollPendingInvoices(
   let errorCount = 0;
 
   for (const inv of res.rows) {
-    // 1. Check TTL Expiry
-    if (inv.expires_at && now > new Date(inv.expires_at)) {
-      const expRes = await db.query(
-        `UPDATE core.invoices
-            SET status = 'EXPIRED', updated_at = NOW()
-          WHERE id = $1 AND status = 'CREATED'`,
-        [inv.id],
-      );
-      if (expRes.rowCount === 1) {
-        expiredCount++;
-      }
-      continue;
-    }
-
     if (!inv.provider_invoice_id) {
       skippedCount++;
       continue;
     }
 
     try {
-      // 2. Resolve adapter matching the invoice's immutable mode snapshot
+      // Resolve adapter matching the invoice's immutable mode snapshot
       const adapter = resolver.resolveForInvoice({ providerMode: inv.provider_mode });
+
+      // CRITICAL (P1.8): Verify provider status FIRST before evaluating local expiry
       const status = await adapter.verifyPayment(inv.provider_invoice_id);
 
       if (status.status === 'PAID') {
@@ -122,7 +175,23 @@ export async function pollPendingInvoices(
         });
         failedCount++;
       } else {
-        skippedCount++;
+        // Status is PENDING or UNKNOWN: Check if local expiry + 5 minute grace window has elapsed
+        const graceWindowMs = 5 * 60 * 1000;
+        const expiryTime = inv.expires_at ? new Date(inv.expires_at).getTime() : null;
+
+        if (expiryTime && now.getTime() > expiryTime + graceWindowMs) {
+          const expRes = await db.query(
+            `UPDATE core.invoices
+                SET status = 'EXPIRED', updated_at = NOW()
+              WHERE id = $1 AND status = 'CREATED'`,
+            [inv.id],
+          );
+          if (expRes.rowCount === 1) {
+            expiredCount++;
+          }
+        } else {
+          skippedCount++;
+        }
       }
     } catch {
       errorCount++;
@@ -132,6 +201,7 @@ export async function pollPendingInvoices(
   return {
     polled: res.rows.length,
     verified: verifiedCount,
+    recovered: recoveredCount,
     expired: expiredCount,
     failed: failedCount,
     skipped: skippedCount,

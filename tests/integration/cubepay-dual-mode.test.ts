@@ -886,4 +886,137 @@ describe('CubePay Dual-Mode: VIP & Standard Official Contract Integration', () =
     )).rows[0]!;
     expect(invRow.status).toBe('EXPIRED');
   });
+
+  // 28. Standard create-payment contract strictly includes type: "card"
+  it('28. Standard create-payment contract strictly includes type: "card"', async () => {
+    const resolver = new CubePayProviderResolver(loadConfig({ CUBEPAY_ACTIVE_MODE: 'STANDARD' } as any));
+    const stdAdapter = resolver.resolveForMode('STANDARD') as CubePayStandardAdapter;
+
+    const invoice = await stdAdapter.createInvoice({
+      internalInvoiceId: 'inv_wire_test_card_1',
+      amount: '100000',
+      callbackUrl: 'https://gateway.goldpay.ir/v1/webhooks/cubepay',
+      description: 'card wire validation test',
+    });
+
+    expect(invoice.externalInvoiceId).toBeTruthy();
+    expect(invoice.providerPayAmountRial).toBe('1000000');
+    expect(invoice.providerPayAmountToman).toBe('100000');
+    expect(invoice.redirectAfterPayment).toBe(false);
+  });
+
+  // 29. Four-Eyes Mode Switching: Propose by Admin A, Approve by Admin B updates DB runtime state
+  it('29. Four-Eyes Mode Switching: Propose by Admin A, Approve by Admin B updates DB runtime state', async () => {
+    const resolver = new CubePayProviderResolver(h.config);
+    expect(resolver.getActiveModeSync()).toBe('VIP');
+
+    // Step 1: Admin A proposes switch to STANDARD
+    const proposal = await resolver.proposeSwitch({
+      proposedBy: 'admin_alice',
+      targetMode: 'STANDARD',
+      reason: 'Migrate to standard gateway',
+      db: h.db,
+    });
+
+    expect(proposal.id).toBeTruthy();
+    expect(proposal.status).toBe('PENDING');
+    expect(proposal.current_mode).toBe('VIP');
+    expect(proposal.requested_mode).toBe('STANDARD');
+
+    // Active mode is still VIP before approval
+    expect(resolver.getActiveModeSync()).toBe('VIP');
+
+    // Step 2: Admin B approves the proposal
+    const result = await resolver.approveSwitch({
+      requestId: proposal.id,
+      approvedBy: 'admin_bob',
+      db: h.db,
+    });
+
+    expect(result.previousMode).toBe('VIP');
+    expect(result.newMode).toBe('STANDARD');
+    expect(result.version).toBe(2);
+    expect(result.approvedBy).toBe('admin_bob');
+    expect(resolver.getActiveModeSync()).toBe('STANDARD');
+
+    // DB state must be updated
+    const dbState = (await h.db.query<{ active_mode: string; version: number }>(
+      `SELECT active_mode, version FROM core.provider_runtime_state WHERE provider_name = 'CUBEPAY'`,
+    )).rows[0]!;
+    expect(dbState.active_mode).toBe('STANDARD');
+    expect(dbState.version).toBe(2);
+  });
+
+  // 30. Four-Eyes Mode Switching: Self-approval by proposer is rejected with SecurityError
+  it('30. Four-Eyes Mode Switching: Self-approval by proposer is rejected with SecurityError', async () => {
+    const resolver = new CubePayProviderResolver(h.config);
+
+    const proposal = await resolver.proposeSwitch({
+      proposedBy: 'admin_alice',
+      targetMode: 'STANDARD',
+      reason: 'Self approval test',
+      db: h.db,
+    });
+
+    await expect(
+      resolver.approveSwitch({
+        requestId: proposal.id,
+        approvedBy: 'admin_alice', // Same admin -> Four-Eyes violation!
+        db: h.db,
+      }),
+    ).rejects.toThrow('Four-Eyes');
+  });
+
+  // 31. Multi-instance visibility: Second resolver instance observes DB runtime state
+  it('31. Multi-instance visibility: Second resolver instance observes DB runtime state', async () => {
+    const instanceA = new CubePayProviderResolver(h.config);
+    const instanceB = new CubePayProviderResolver(h.config);
+
+    // Instance A executes Four-Eyes switch to STANDARD
+    await instanceA.directSwitch({
+      actor: 'admin_alice',
+      approver: 'admin_bob',
+      newMode: 'STANDARD',
+      reason: 'multi-instance sync test',
+      db: h.db,
+    });
+
+    expect(instanceA.getActiveModeSync()).toBe('STANDARD');
+
+    // Instance B synchronizes and observes STANDARD
+    expect(await instanceB.getActiveMode(h.db)).toBe('STANDARD');
+  });
+
+  // 32. Invoice Provider Creation Recovery (P1.4): Poller retries uncreated invoices with same ID
+  it('32. Invoice Provider Creation Recovery (P1.4): Poller retries uncreated invoices with same ID', async () => {
+    const { merchantId } = await createMerchant(h.db);
+    const resolver = new CubePayProviderResolver(h.config);
+
+    // Create an invoice directly with provider_invoice_id = null (simulating provider outage at creation)
+    const inv = await createInvoice(h.db, h.config, {
+      merchantId,
+      baseAmount: '100000',
+    });
+
+    const checkRow = (await h.db.query<{ provider_create_status: string; provider_invoice_id: string | null }>(
+      `SELECT provider_create_status, provider_invoice_id FROM core.invoices WHERE id = $1`,
+      [inv.invoiceId],
+    )).rows[0]!;
+    expect(checkRow.provider_create_status).toBe('PENDING_PROVIDER_CREATE');
+    expect(checkRow.provider_invoice_id).toBeNull();
+
+    // Run recovery poller
+    const { pollPendingInvoices } = await import('../../packages/core/src/use-cases/poll-pending-invoices.ts');
+    const pollResult = await pollPendingInvoices(h.db, h.config, resolver);
+
+    expect(pollResult.recovered).toBe(1);
+
+    // Verify invoice now has provider_invoice_id populated
+    const recoveredRow = (await h.db.query<{ provider_create_status: string; provider_invoice_id: string | null }>(
+      `SELECT provider_create_status, provider_invoice_id FROM core.invoices WHERE id = $1`,
+      [inv.invoiceId],
+    )).rows[0]!;
+    expect(recoveredRow.provider_create_status).toBe('PROVIDER_CREATED');
+    expect(recoveredRow.provider_invoice_id).toBeTruthy();
+  });
 });

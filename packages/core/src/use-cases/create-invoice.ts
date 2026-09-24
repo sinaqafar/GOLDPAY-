@@ -161,7 +161,7 @@ export async function createInvoice(
          customer_total_amount, merchant_net_amount,
          description, customer_reference,
          provider, provider_mode, provider_version, provider_config_ref,
-         status, expires_at
+         status, provider_create_status, expires_at
        ) VALUES (
          $1, $2, $3,
          $4, 'TOMAN',
@@ -170,7 +170,7 @@ export async function createInvoice(
          $11, $12,
          $13, $14,
          $15, $16, $17, $18,
-         'CREATED', $19
+         'CREATED', 'PENDING_PROVIDER_CREATE', $19
        )
        ON CONFLICT (merchant_id, invoice_number) DO NOTHING
        RETURNING id`,

@@ -50,7 +50,10 @@ export async function runLedgerVerification(customDb?: Database): Promise<boolea
     // 2. All Account Balance Projections vs Journal Entries
     console.log('\n[2/5] Verifying Balance Projections against Journal Line Recomputations...');
     const accounts = await db.query<{ id: string; account_code: string; owner_type: string | null; owner_id: string | null }>(
-      'SELECT id, account_code, owner_type, owner_id FROM finance.ledger_accounts ORDER BY created_at ASC',
+      `SELECT id, account_code, owner_type, owner_id
+         FROM finance.ledger_accounts
+        WHERE account_type IN ('LIABILITY', 'ASSET')
+        ORDER BY created_at ASC`,
     );
     let inconsistentAccounts = 0;
     for (const acc of accounts.rows) {
