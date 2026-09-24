@@ -85,6 +85,17 @@ export interface SecurityConfig {
   readonly webhookTimeoutMs: number;
   readonly webhookMaxRetries: number;
   readonly allowedWebhookSchemes: readonly string[];
+  readonly metricsAuthToken: string | null;
+}
+
+export type CubePayMode = 'VIP' | 'STANDARD';
+
+export interface CubePayModeConfig {
+  readonly baseUrl: string;
+  readonly apiToken: string | null;
+  readonly webhookSecret: string | null;
+  readonly timeoutMs: number;
+  readonly sandbox: boolean;
 }
 
 export type CubePayMode = 'VIP' | 'STANDARD';
@@ -358,6 +369,7 @@ export function loadConfig(env: Env = process.env): Config {
         .split(',')
         .map((s) => s.trim().toLowerCase())
         .filter(Boolean),
+      metricsAuthToken: optional(env, 'METRICS_AUTH_TOKEN'),
     },
     cubepay: {
       activeMode,

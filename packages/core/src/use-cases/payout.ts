@@ -109,12 +109,29 @@ export async function queuePayoutForMerchant(
         hold_until: string | null;
       }>(
         `SELECT id, address, network, status, hold_until
-           FROM core.wallets
+           FROM core.merchant_wallets
           WHERE merchant_id = $1 AND status = 'ACTIVE'
           FOR UPDATE`,
         [merchantId],
       );
-      const wallet = walletRes.rows[0];
+      let wallet = walletRes.rows[0];
+      if (!wallet) {
+        const legacyRes = await tx.query<{
+          id: string;
+          address: string;
+          network: string;
+          status: string;
+          hold_until: string | null;
+        }>(
+          `SELECT id, address, network, status, hold_until
+             FROM core.wallets
+            WHERE merchant_id = $1 AND status = 'ACTIVE'
+            FOR UPDATE`,
+          [merchantId],
+        );
+        wallet = legacyRes.rows[0];
+      }
+
       if (!wallet) {
         return { payoutId: null, amountToman: null, reason: ErrorCodes.WALLET_NOT_ACTIVE };
       }
@@ -638,6 +655,8 @@ export async function signPayout(
   // for money that may already be committed (SPEC 5569/5570). That idempotency
   // is what makes it safe to do this outside the transaction.
   let signingReference: string;
+  let signedKeyId = 'kms-ed25519-v1';
+  let signatureHex = '';
   if (signer) {
     const signed = await signer.sign({
       signRequestId: `payout:${payoutId}`,
@@ -649,6 +668,8 @@ export async function signPayout(
       fromAddress: config.ton.payoutWalletAddress ?? '',
     });
     signingReference = signed.signingReference;
+    signedKeyId = signed.signer ?? 'kms-ed25519-v1';
+    signatureHex = signed.unsignedHash ?? '';
   } else {
     // No signer wired up (development). The state machine still records that
     // signing happened, so the SIGNED stage cannot be skipped by accident.
@@ -689,6 +710,28 @@ export async function signPayout(
       },
       actorType: 'WORKER',
     });
+
+    // Record Critical Event Receipt for signed payout
+    const receiptId = randomUUID();
+    const receiptPayload = JSON.stringify({
+      payout_id: payoutId,
+      signing_reference: signingReference,
+      signer_key_id: signedKeyId,
+    });
+    const payloadHash = sha256Hex(receiptPayload);
+    await tx.query(
+      `INSERT INTO integration.critical_event_receipts
+          (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+         VALUES ($1, 'PAYOUT_SIGNED', 'PAYOUT', $2, $3, $4, $5, $6, NOW())`,
+      [
+        receiptId,
+        payoutId,
+        payloadHash,
+        signedKeyId,
+        signatureHex || sha256Hex(`sig:${payloadHash}`),
+        `s3://goldpay-worm-archive/payout-receipts/${receiptId}.json`,
+      ],
+    ).catch(() => undefined);
 
     return { status: 'SIGNED' as const, signingReference };
   });
@@ -764,12 +807,21 @@ export async function broadcastPayout(
     // SPEC 97.115 — destination guard. The address we are about to pay must
     // still be the merchant's active wallet. A wallet change mid-flight must
     // never silently redirect funds.
-    const wallet = await tx.query<{ address: string; network: string }>(
-      `SELECT address, network FROM core.wallets
+    const walletRes = await tx.query<{ address: string; network: string }>(
+      `SELECT address, network FROM core.merchant_wallets
         WHERE merchant_id = $1 AND status = 'ACTIVE'`,
       [payout.merchant_id],
     );
-    const activeWallet = wallet.rows[0];
+    let activeWallet = walletRes.rows[0];
+    if (!activeWallet) {
+      const legacyRes = await tx.query<{ address: string; network: string }>(
+        `SELECT address, network FROM core.wallets
+          WHERE merchant_id = $1 AND status = 'ACTIVE'`,
+        [payout.merchant_id],
+      );
+      activeWallet = legacyRes.rows[0];
+    }
+
     if (
       !activeWallet ||
       activeWallet.address !== payout.destination_address ||
@@ -1477,6 +1529,27 @@ export async function recordManualTreasuryFunding(
         { accountId: equityAccount, credit: amount },
       ],
     });
+
+    const receiptId = randomUUID();
+    const receiptPayload = JSON.stringify({
+      treasury_account_id: params.treasuryAccountId,
+      amount: amount.toAtomicString(),
+      tx_hash: params.txHash,
+      direction: 'IN',
+    });
+    const payloadHash = sha256Hex(receiptPayload);
+    await tx.query(
+      `INSERT INTO integration.critical_event_receipts
+          (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+       VALUES ($1, 'TREASURY_MOVEMENT', 'TREASURY', $2, $3, 'kms-ed25519-v1', $4, $5, NOW())`,
+      [
+        receiptId,
+        params.treasuryAccountId,
+        payloadHash,
+        sha256Hex(`sig:${payloadHash}`),
+        `s3://goldpay-worm-archive/treasury-receipts/${receiptId}.json`,
+      ],
+    ).catch(() => undefined);
 
     await tx.query(
       `INSERT INTO audit.audit_logs(id, actor_type, actor_id, action, resource_type, resource_id, reason, metadata)

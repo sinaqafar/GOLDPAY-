@@ -13,7 +13,7 @@ x-app: &app
   restart: unless-stopped
   environment: &app-env
     NODE_ENV: production
-    APP_ENV: ${APP_ENV:-staging}
+    APP_ENV: ${APP_ENV:-production}
     DATABASE_URL: postgres://gram:${POSTGRES_PASSWORD:-devpassword}@postgres:5432/gram
     REDIS_URL: redis://redis:6379
 

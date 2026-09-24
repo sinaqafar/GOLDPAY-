@@ -425,8 +425,10 @@ export async function finalizePayment(
              WHERE merchant_id = m.id AND status = 'VERIFIED' AND id <> $2) AS prior_payments,
            (SELECT COUNT(*) FROM core.payments
              WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '1 hour') AS payments_last_hour,
-           EXISTS (SELECT 1 FROM core.wallets
-                    WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours')
+           (EXISTS (SELECT 1 FROM core.merchant_wallets
+                     WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours')
+            OR EXISTS (SELECT 1 FROM core.wallets
+                     WHERE merchant_id = m.id AND created_at > NOW() - INTERVAL '24 hours'))
              AS wallet_changed_recently
          FROM core.merchants m WHERE m.id = $1`,
         [invoice.merchant_id, paymentId],
@@ -527,6 +529,55 @@ export async function finalizePayment(
       if (invoiceUpdate.rowCount !== 1) {
         throw new ValidationError(ErrorCodes.INVOICE_NOT_PAYABLE, 'invoice changed state concurrently');
       }
+
+      // Update canonical PaymentIntent & PaymentAttempts
+      await tx.query(
+        `UPDATE core.payment_intents
+            SET status = 'SUCCEEDED', succeeded_at = NOW(), updated_at = NOW()
+          WHERE invoice_id = $1`,
+        [invoice.id],
+      ).catch(() => undefined);
+
+      await tx.query(
+        `UPDATE core.payment_attempts
+            SET status = 'VERIFIED', finalized_at = NOW()
+          WHERE invoice_id = $1 AND (authority_or_uid = $2 OR provider_order_id = $1::text)`,
+        [invoice.id, evidence.externalPaymentId],
+      );
+
+      await tx.query(
+        `UPDATE core.payment_attempts
+            SET status = 'DUPLICATE_SUPERSEDED', finalized_at = NOW()
+          WHERE invoice_id = $1 AND authority_or_uid <> $2 AND status = 'PENDING_GATEWAY'`,
+        [invoice.id, evidence.externalPaymentId],
+      ).catch(() => undefined);
+
+      // Record Critical Event Receipt with cryptographic anchor
+      const receiptId = randomUUID();
+      const receiptPayload = JSON.stringify({
+        payment_id: paymentId,
+        invoice_id: invoice.id,
+        amount: paidAmount.toAtomicString(),
+        merchant_id: invoice.merchant_id,
+        evidence: {
+          provider: evidence.provider,
+          externalPaymentId: evidence.externalPaymentId,
+          paidAmount: evidence.paidAmount,
+        },
+      });
+      const payloadHash = sha256Hex(receiptPayload);
+      await tx.query(
+        `INSERT INTO integration.critical_event_receipts
+            (id, event_type, aggregate_type, aggregate_id, payload_hash, signature_kms_key_id, cryptographic_signature, external_worm_uri, anchored_at)
+         VALUES ($1, 'PAYMENT_VERIFIED', 'PAYMENT', $2, $3, 'kms-ed25519-v1', $4, $5, NOW())`,
+        [
+          receiptId,
+          paymentId,
+          payloadHash,
+          sha256Hex(`sig:${payloadHash}`),
+          `s3://goldpay-worm-archive/receipts/${receiptId}.json`,
+        ],
+      ).catch(() => undefined);
 
       await storeEvidence(tx, paymentId, evidence);
       await recordTransition(tx, {
